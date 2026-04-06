@@ -246,23 +246,39 @@ impl eframe::App for MeshcastApp {
 }
 
 /// Background task: manages gossip connection and stream lifecycle.
+/// Restarts the loop when config changes (e.g. after linking).
 async fn daemon_task(
     mut config: AppConfig,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     mut cmd_rx: mpsc::UnboundedReceiver<DaemonCmd>,
     state: Arc<Mutex<AppState>>,
 ) {
-    if let Err(e) = daemon_loop(&mut config, &ui_tx, &mut cmd_rx, &state).await {
-        tracing::error!("Daemon error: {e}");
+    loop {
+        match daemon_loop(&mut config, &ui_tx, &mut cmd_rx, &state).await {
+            Ok(restart) => {
+                if restart {
+                    // Reload config and restart
+                    config = AppConfig::load().await.unwrap_or(config.clone());
+                    tracing::info!("Restarting daemon loop with updated config");
+                    continue;
+                }
+                break;
+            }
+            Err(e) => {
+                tracing::error!("Daemon error: {e}");
+                break;
+            }
+        }
     }
 }
 
+/// Returns Ok(true) to restart, Ok(false) to exit.
 async fn daemon_loop(
     config: &mut AppConfig,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     cmd_rx: &mut mpsc::UnboundedReceiver<DaemonCmd>,
     state: &Arc<Mutex<AppState>>,
-) -> Result<()> {
+) -> Result<bool> {
     let link_state = config.link_state();
     let secret_key = link_state.as_ref().map(|l| l.secret_key());
 
@@ -394,14 +410,15 @@ async fn daemon_loop(
                 match cmd {
                     Some(DaemonCmd::Link { token }) => {
                         match do_link(&node, &token, config, ui_tx).await {
-                            Ok(_) => tracing::info!("Link successful"),
+                            Ok(_) => {
+                                tracing::info!("Link successful, restarting daemon loop");
+                                return Ok(true); // restart with new config
+                            }
                             Err(e) => {
                                 tracing::error!("Link failed: {e}");
                                 state.lock().expect("poisoned").status_msg = format!("Link failed: {e}");
                             }
                         }
-                        // Restart the loop to pick up new gossip connection
-                        // For now just log — full restart would require restructuring
                     }
                     Some(DaemonCmd::StopStream) => {
                         if let Some((l, _bc)) = live.take() {
@@ -419,7 +436,7 @@ async fn daemon_loop(
         }
     }
 
-    Ok(())
+    Ok(false)
 }
 
 async fn do_link(
