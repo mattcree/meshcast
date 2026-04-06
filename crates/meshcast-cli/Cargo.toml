@@ -11,7 +11,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "io-util"] }
+iroh-live = { git = "https://github.com/n0-computer/iroh-live", branch = "main", features = ["h264", "opus", "capture-screen"] }
+moq-media = { git = "https://github.com/n0-computer/iroh-live", branch = "main" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

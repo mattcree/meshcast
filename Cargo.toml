@@ -10,9 +10,9 @@ license = "MIT"
 noq = { git = "https://github.com/n0-computer/noq", branch = "main" }
 noq-proto = { git = "https://github.com/n0-computer/noq", branch = "main" }
 noq-udp = { git = "https://github.com/n0-computer/noq", branch = "main" }
-iroh = { git = "https://github.com/n0-computer/iroh", branch = "main" }
-iroh-base = { git = "https://github.com/n0-computer/iroh", branch = "main" }
-iroh-relay = { git = "https://github.com/n0-computer/iroh", branch = "main" }
+iroh = { git = "https://github.com/n0-computer/iroh", rev = "8af8370b567d9e9a89aaf25929b327a6a5b96de1" }
+iroh-base = { git = "https://github.com/n0-computer/iroh", rev = "8af8370b567d9e9a89aaf25929b327a6a5b96de1" }
+iroh-relay = { git = "https://github.com/n0-computer/iroh", rev = "8af8370b567d9e9a89aaf25929b327a6a5b96de1" }
 iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", branch = "deps/iroh-main" }
 web-transport-iroh = { git = "https://github.com/Frando/web-transport", branch = "deps/iroh-main" }
 web-transport-noq = { git = "https://github.com/Frando/web-transport", branch = "deps/iroh-main" }
