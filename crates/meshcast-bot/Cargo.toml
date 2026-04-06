@@ -1,0 +1,16 @@
+[package]
+name = "meshcast-bot"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "meshcast-bot"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+poise = "0.6"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
