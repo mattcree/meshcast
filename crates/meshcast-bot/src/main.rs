@@ -304,10 +304,11 @@ async fn handle_event(
     if let serenity::FullEvent::InteractionCreate { interaction } = event {
         if let Some(component) = interaction.as_message_component() {
             if component.data.custom_id == "watch" {
+                tracing::info!(user = %component.user.name, "Watch button clicked");
+
                 let user_id = component.user.id;
                 let channel_id = component.channel_id;
 
-                // Get the ticket for this channel's active stream
                 let ticket = data
                     .active_streams
                     .lock()
@@ -315,61 +316,52 @@ async fn handle_event(
                     .get(&channel_id)
                     .map(|(_, t)| t.clone());
 
-                let ticket = match ticket {
-                    Some(t) => t,
-                    None => {
-                        component
-                            .create_response(
-                                ctx,
-                                serenity::all::CreateInteractionResponse::Message(
-                                    serenity::all::CreateInteractionResponseMessage::new()
-                                        .content("No active stream in this channel.")
-                                        .ephemeral(true),
-                                ),
-                            )
-                            .await?;
-                        return Ok(());
+                let reply = match ticket {
+                    None => "No active stream in this channel.".to_string(),
+                    Some(ticket) => {
+                        let sender = data.links.lock().unwrap().get(&user_id).cloned();
+                        match sender {
+                            Some(sender) => {
+                                let signal = Signal::WatchStream { ticket };
+                                let msg = signal.encode()?;
+                                // Retry up to 3 times with short delay
+                                let mut sent = false;
+                                for attempt in 0..3 {
+                                    match sender.broadcast_neighbors(msg.clone()).await {
+                                        Ok(_) => {
+                                            tracing::info!("Sent WatchStream (attempt {})", attempt + 1);
+                                            sent = true;
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Send attempt {} failed: {e}", attempt + 1);
+                                            tokio::time::sleep(Duration::from_millis(200)).await;
+                                        }
+                                    }
+                                }
+                                if sent {
+                                    "Opening stream in your Meshcast app...".to_string()
+                                } else {
+                                    "Failed to reach your app. Is the daemon running?".to_string()
+                                }
+                            }
+                            None => {
+                                "Your app isn't linked. Run `/link` first, then `meshcast link <token>` and `meshcast daemon`.".to_string()
+                            }
+                        }
                     }
                 };
 
-                // Send ticket to viewer's linked app via gossip
-                let sender = data.links.lock().unwrap().get(&user_id).cloned();
-                match sender {
-                    Some(sender) => {
-                        let signal = Signal::WatchStream {
-                            ticket: ticket.clone(),
-                        };
-                        sender
-                            .broadcast(signal.encode()?)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-                        component
-                            .create_response(
-                                ctx,
-                                serenity::all::CreateInteractionResponse::Message(
-                                    serenity::all::CreateInteractionResponseMessage::new()
-                                        .content("Opening stream in your Meshcast app...")
-                                        .ephemeral(true),
-                                ),
-                            )
-                            .await?;
-                    }
-                    None => {
-                        component
-                            .create_response(
-                                ctx,
-                                serenity::all::CreateInteractionResponse::Message(
-                                    serenity::all::CreateInteractionResponseMessage::new()
-                                        .content(
-                                            "Your app isn't linked. Run `/link` first, then `meshcast link <token>` and `meshcast daemon`.",
-                                        )
-                                        .ephemeral(true),
-                                ),
-                            )
-                            .await?;
-                    }
-                }
+                component
+                    .create_response(
+                        ctx,
+                        serenity::all::CreateInteractionResponse::Message(
+                            serenity::all::CreateInteractionResponseMessage::new()
+                                .content(reply)
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await?;
             }
         }
     }

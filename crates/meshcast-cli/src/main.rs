@@ -212,7 +212,7 @@ async fn cmd_daemon() -> Result<()> {
     println!("Daemon running. Waiting for commands from Discord bot...");
     println!("Press Ctrl+C to stop.\n");
 
-    let mut live: Option<Live> = None;
+    let mut live: Option<(Live, LocalBroadcast)> = None;
 
     loop {
         tokio::select! {
@@ -228,15 +228,16 @@ async fn cmd_daemon() -> Result<()> {
 
                 match event {
                     Event::Received(msg) => {
+                        tracing::info!("Received gossip message ({} bytes)", msg.content.len());
                         match Signal::decode(&msg.content) {
                             Ok(Signal::StartStream { title }) => {
                                 tracing::info!("Bot requested stream start: {title}");
                                 match start_stream("meshcast".to_string()).await {
-                                    Ok((l, ticket)) => {
+                                    Ok((l, bc, ticket)) => {
                                         tracing::info!("Streaming! Ticket: {ticket}");
                                         let signal = Signal::StreamReady { ticket };
                                         let _ = sender.broadcast(signal.encode()?).await;
-                                        live = Some(l);
+                                        live = Some((l, bc));
                                     }
                                     Err(e) => {
                                         tracing::error!("Failed to start stream: {e}");
@@ -245,7 +246,7 @@ async fn cmd_daemon() -> Result<()> {
                             }
                             Ok(Signal::StopStream) => {
                                 tracing::info!("Bot requested stream stop");
-                                if let Some(l) = live.take() {
+                                if let Some((l, _bc)) = live.take() {
                                     l.shutdown().await;
                                     let _ = sender.broadcast(Signal::StreamStopped.encode()?).await;
                                     tracing::info!("Stream stopped");
@@ -253,14 +254,18 @@ async fn cmd_daemon() -> Result<()> {
                             }
                             Ok(Signal::WatchStream { ticket }) => {
                                 tracing::info!("Bot requested watch: {ticket}");
-                                // Spawn viewer in a separate process so the daemon keeps running
+                                // Fully detach viewer process so it doesn't share
+                                // iroh endpoint resources with the daemon
                                 let exe = std::env::current_exe()
                                     .unwrap_or_else(|_| "meshcast".into());
-                                match tokio::process::Command::new(&exe)
-                                    .args(["watch", &ticket])
+                                match std::process::Command::new("setsid")
+                                    .args([exe.as_os_str(), std::ffi::OsStr::new("watch"), std::ffi::OsStr::new(&ticket)])
+                                    .stdin(std::process::Stdio::null())
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
                                     .spawn()
                                 {
-                                    Ok(_) => tracing::info!("Viewer launched"),
+                                    Ok(_) => tracing::info!("Viewer launched (detached)"),
                                     Err(e) => tracing::error!("Failed to launch viewer: {e}"),
                                 }
                             }
@@ -288,7 +293,7 @@ async fn cmd_daemon() -> Result<()> {
             }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("Shutting down daemon...");
-                if let Some(l) = live.take() {
+                if let Some((l, _bc)) = live.take() {
                     l.shutdown().await;
                 }
                 break;
@@ -299,8 +304,8 @@ async fn cmd_daemon() -> Result<()> {
     Ok(())
 }
 
-/// Start a stream and return the Live handle + ticket string.
-async fn start_stream(name: String) -> Result<(Live, String)> {
+/// Start a stream and return the Live handle, broadcast (must stay alive!), and ticket.
+async fn start_stream(name: String) -> Result<(Live, LocalBroadcast, String)> {
     let l = Live::from_env()
         .await
         .context("Failed to initialize iroh-live")?
@@ -328,7 +333,7 @@ async fn start_stream(name: String) -> Result<(Live, String)> {
         .context("Failed to publish broadcast")?;
 
     let ticket = LiveTicket::new(l.endpoint().addr(), &name);
-    Ok((l, ticket.to_string()))
+    Ok((l, broadcast, ticket.to_string()))
 }
 
 async fn cmd_unlink() -> Result<()> {
