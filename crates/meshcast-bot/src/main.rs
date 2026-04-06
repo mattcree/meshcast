@@ -14,13 +14,6 @@ use tokio::sync::broadcast;
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
-const DOWNLOAD_PORT: u16 = 3829;
-
-fn download_base_url() -> String {
-    std::env::var("MESHCAST_URL")
-        .unwrap_or_else(|_| format!("http://localhost:{DOWNLOAD_PORT}"))
-}
-
 fn downloads_dir() -> std::path::PathBuf {
     dirs_next::home_dir()
         .unwrap_or_default()
@@ -188,14 +181,13 @@ async fn stream(
     };
 
     let avatar_url = user.avatar_url().unwrap_or_default();
-    let base = download_base_url();
 
     let embed = CreateEmbed::new()
         .title(&title)
-        .description(format!(
+        .description(
             "Click **Watch** to view this stream.\n\
-             Need the app? Download for your platform below."
-        ))
+             Need the app? Click your platform to download."
+        )
         .color(0x5865F2)
         .author(CreateEmbedAuthor::new(display_name).icon_url(&avatar_url))
         .footer(serenity::all::CreateEmbedFooter::new("Started streaming"))
@@ -203,19 +195,18 @@ async fn stream(
 
     let watch_btn =
         CreateButton::new("watch").label("Watch").style(serenity::all::ButtonStyle::Primary);
-    let watch_row = CreateActionRow::Buttons(vec![watch_btn]);
+    let linux_btn =
+        CreateButton::new("dl-linux").label("Linux").style(serenity::all::ButtonStyle::Secondary);
+    let mac_btn =
+        CreateButton::new("dl-macos").label("macOS").style(serenity::all::ButtonStyle::Secondary);
+    let win_btn =
+        CreateButton::new("dl-windows").label("Windows").style(serenity::all::ButtonStyle::Secondary);
 
-    let linux_btn = CreateButton::new_link(format!("{base}/download/linux"))
-        .label("Linux");
-    let mac_btn = CreateButton::new_link(format!("{base}/download/macos"))
-        .label("macOS");
-    let win_btn = CreateButton::new_link(format!("{base}/download/windows"))
-        .label("Windows");
-    let download_row = CreateActionRow::Buttons(vec![linux_btn, mac_btn, win_btn]);
+    let row1 = CreateActionRow::Buttons(vec![watch_btn, linux_btn, mac_btn, win_btn]);
 
     let reply = poise::CreateReply::default()
         .embed(embed)
-        .components(vec![watch_row, download_row]);
+        .components(vec![row1]);
 
     let handle = ctx.send(reply).await?;
     let message = handle.message().await?;
@@ -387,9 +378,6 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Downloads dir: {}", dl_dir.display());
     tracing::info!("Place binaries as: linux/meshcast-app, macos/meshcast-app, windows/meshcast-app.exe");
 
-    // Spawn download file server
-    tokio::spawn(run_download_server());
-
     let intents = serenity::GatewayIntents::non_privileged();
     let mut client = serenity::ClientBuilder::new(&token, intents)
         .framework(framework)
@@ -400,92 +388,78 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// HTTP file server for distributing meshcast binaries.
-/// Serves files from ~/.config/meshcast-bot/downloads/<platform>/
-async fn run_download_server() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    let addr = format!("0.0.0.0:{DOWNLOAD_PORT}");
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(l) => {
-            tracing::info!("Download server listening on {addr}");
-            l
-        }
-        Err(e) => {
-            tracing::warn!("Failed to start download server on {addr}: {e}");
-            return;
+/// Send a platform binary as a Discord file attachment.
+async fn handle_download(
+    ctx: &serenity::Context,
+    component: &serenity::all::ComponentInteraction,
+    platform: &str,
+) -> Result<(), Error> {
+    let (subdir, filename) = match platform {
+        "linux" => ("linux", "meshcast-app"),
+        "macos" => ("macos", "meshcast-app"),
+        "windows" => ("windows", "meshcast-app.exe"),
+        _ => {
+            component
+                .create_response(
+                    ctx,
+                    serenity::all::CreateInteractionResponse::Message(
+                        serenity::all::CreateInteractionResponseMessage::new()
+                            .content("Unknown platform.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await?;
+            return Ok(());
         }
     };
 
-    let dl_dir = downloads_dir();
+    let path = downloads_dir().join(subdir).join(filename);
 
-    loop {
-        let (mut stream, peer) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(_) => continue,
-        };
-
-        let dl_dir = dl_dir.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            let n = match stream.read(&mut buf).await {
-                Ok(n) if n > 0 => n,
-                _ => return,
-            };
-            let request = String::from_utf8_lossy(&buf[..n]);
-            let path = request
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .unwrap_or("/");
-
-            tracing::info!(peer = %peer, "HTTP request: {path}");
-
-            let (status, content_type, body) = match path {
-                "/download/linux" => serve_file(&dl_dir.join("linux/meshcast-app")).await,
-                "/download/macos" => serve_file(&dl_dir.join("macos/meshcast-app")).await,
-                "/download/windows" => serve_file(&dl_dir.join("windows/meshcast-app.exe")).await,
-                "/" => {
-                    let html = format!(
-                        "<html><body><h1>Meshcast Downloads</h1>\
-                         <ul>\
-                         <li><a href=\"/download/linux\">Linux (Flatpak/Bluefin)</a></li>\
-                         <li><a href=\"/download/macos\">macOS</a></li>\
-                         <li><a href=\"/download/windows\">Windows</a></li>\
-                         </ul></body></html>"
-                    );
-                    ("200 OK", "text/html", html.into_bytes())
-                }
-                _ => ("404 Not Found", "text/plain", b"Not found".to_vec()),
-            };
-
-            let header = format!(
-                "HTTP/1.1 {status}\r\n\
-                 Content-Type: {content_type}\r\n\
-                 Content-Length: {}\r\n\
-                 Content-Disposition: attachment\r\n\
-                 Connection: close\r\n\r\n",
-                body.len()
-            );
-
-            let _ = stream.write_all(header.as_bytes()).await;
-            let _ = stream.write_all(&body).await;
-        });
+    if !path.exists() {
+        component
+            .create_response(
+                ctx,
+                serenity::all::CreateInteractionResponse::Message(
+                    serenity::all::CreateInteractionResponseMessage::new()
+                        .content(format!(
+                            "No {platform} build available yet. Ask the streamer to add it to `{}`.",
+                            downloads_dir().join(subdir).display()
+                        ))
+                        .ephemeral(true),
+                ),
+            )
+            .await?;
+        return Ok(());
     }
+
+    // Defer first — file read + upload may take a moment
+    component
+        .create_response(
+            ctx,
+            serenity::all::CreateInteractionResponse::Defer(
+                serenity::all::CreateInteractionResponseMessage::new().ephemeral(true),
+            ),
+        )
+        .await?;
+
+    let data = tokio::fs::read(&path).await?;
+    tracing::info!("Sending {filename} ({} bytes) to {}", data.len(), component.user.name);
+
+    let attachment = serenity::all::CreateAttachment::bytes(data, filename);
+
+    component
+        .create_followup(
+            ctx,
+            serenity::all::CreateInteractionResponseFollowup::new()
+                .content(format!("Here's Meshcast for {platform}! Run it, then use `/link` to connect."))
+                .add_file(attachment)
+                .ephemeral(true),
+        )
+        .await?;
+
+    Ok(())
 }
 
-async fn serve_file(path: &std::path::Path) -> (&'static str, &'static str, Vec<u8>) {
-    match tokio::fs::read(path).await {
-        Ok(data) => ("200 OK", "application/octet-stream", data),
-        Err(_) => (
-            "404 Not Found",
-            "text/plain",
-            format!("Binary not available yet. Ask the streamer to build for this platform.")
-                .into_bytes(),
-        ),
-    }
-}
 
 /// Handle component interactions (Watch button clicks)
 async fn handle_event(
@@ -495,7 +469,16 @@ async fn handle_event(
 ) -> Result<(), Error> {
     if let serenity::FullEvent::InteractionCreate { interaction } = event {
         if let Some(component) = interaction.as_message_component() {
-            if component.data.custom_id == "watch" {
+            let id = component.data.custom_id.as_str();
+
+            // Handle download buttons
+            if let Some(platform) = id.strip_prefix("dl-") {
+                tracing::info!(user = %component.user.name, platform, "Download requested");
+                handle_download(ctx, component, platform).await?;
+                return Ok(());
+            }
+
+            if id == "watch" {
                 tracing::info!(user = %component.user.name, "Watch button clicked");
 
                 let user_id = component.user.id;
