@@ -4054,6 +4054,7 @@ dependencies = [
  "anyhow",
  "eframe",
  "futures-lite",
+ "gtk",
  "iroh",
  "iroh-live",
  "meshcast-signal",

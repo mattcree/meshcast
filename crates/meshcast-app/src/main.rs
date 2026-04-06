@@ -13,6 +13,41 @@ use moq_media::publish::LocalBroadcast;
 use moq_media::AudioBackend;
 use tokio::sync::mpsc;
 
+fn create_tray_icon() -> Option<tray_icon::TrayIcon> {
+    use tray_icon::menu::{Menu, MenuItemBuilder};
+    use tray_icon::TrayIconBuilder;
+
+    let menu = Menu::new();
+    let show_item = MenuItemBuilder::new()
+        .text("Show")
+        .id(tray_icon::menu::MenuId("show".into()))
+        .build();
+    let quit_item = MenuItemBuilder::new()
+        .text("Quit")
+        .id(tray_icon::menu::MenuId("quit".into()))
+        .build();
+    menu.append(&show_item).ok();
+    menu.append(&quit_item).ok();
+
+    // Simple 16x16 green square icon (RGBA)
+    let size = 16u32;
+    let mut rgba = vec![0u8; (size * size * 4) as usize];
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel[0] = 0x58; // R
+        pixel[1] = 0x65; // G
+        pixel[2] = 0xF2; // B (Discord blurple)
+        pixel[3] = 0xFF; // A
+    }
+    let icon = tray_icon::Icon::from_rgba(rgba, size, size).ok()?;
+
+    TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("Meshcast")
+        .with_icon(icon)
+        .build()
+        .ok()
+}
+
 /// Messages from the gossip background task to the UI.
 #[derive(Debug)]
 enum UiEvent {
@@ -103,14 +138,24 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
+    // Initialize GTK on Linux (required for tray-icon)
+    #[cfg(target_os = "linux")]
+    gtk::init().ok();
+
     eframe::run_native(
         "Meshcast",
         native_options,
         Box::new(move |_cc| {
+            // Create tray icon
+            let tray = create_tray_icon();
+
             Ok(Box::new(MeshcastApp {
                 state,
                 ui_rx,
                 cmd_tx,
+                visible: true,
+                quit: false,
+                _tray: tray,
             }))
         }),
     )
@@ -123,10 +168,41 @@ struct MeshcastApp {
     state: Arc<Mutex<AppState>>,
     ui_rx: mpsc::UnboundedReceiver<UiEvent>,
     cmd_tx: mpsc::UnboundedSender<DaemonCmd>,
+    visible: bool,
+    quit: bool,
+    _tray: Option<tray_icon::TrayIcon>,
 }
 
 impl eframe::App for MeshcastApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Handle window close → minimize to tray instead of quitting
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            self.visible = false;
+        }
+
+        // Check tray icon events — show window on click
+        if let Ok(tray_icon::TrayIconEvent::Click { .. }) = tray_icon::TrayIconEvent::receiver().try_recv() {
+            self.visible = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+            match event.id().0.as_str() {
+                "show" => {
+                    self.visible = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                "quit" => {
+                    self.quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                _ => {}
+            }
+        }
+
         // Drain UI events from background task
         while let Ok(event) = self.ui_rx.try_recv() {
             let mut s = self.state.lock().expect("poisoned");
