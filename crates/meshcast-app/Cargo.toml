@@ -1,0 +1,23 @@
+[package]
+name = "meshcast-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "meshcast-app"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+eframe = { version = "0.33.0", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+futures-lite = "2"
+iroh = { git = "https://github.com/n0-computer/iroh", rev = "8af8370b567d9e9a89aaf25929b327a6a5b96de1" }
+iroh-live = { git = "https://github.com/n0-computer/iroh-live", branch = "main", features = ["h264", "opus", "capture-screen"] }
+meshcast-signal = { path = "../meshcast-signal" }
+moq-media = { git = "https://github.com/n0-computer/iroh-live", branch = "main" }
+moq-media-egui = { git = "https://github.com/n0-computer/iroh-live", branch = "main" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tray-icon = "0.19"

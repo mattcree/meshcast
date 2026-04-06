@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/meshcast-bot", "crates/meshcast-cli", "crates/meshcast-signal"]
+members = ["crates/meshcast-bot", "crates/meshcast-cli", "crates/meshcast-signal", "crates/meshcast-app"]
 resolver = "2"
 
 [workspace.package]

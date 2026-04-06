@@ -160,6 +160,128 @@ impl BotLinkStore {
     }
 }
 
+/// Shared app configuration — used by both CLI and GUI app.
+/// Stored at `~/.config/meshcast/config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    #[serde(default)]
+    pub video: VideoConfig,
+    #[serde(default)]
+    pub audio: AudioConfig,
+    #[serde(default)]
+    pub link: Option<LinkConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoConfig {
+    #[serde(default = "default_quality")]
+    pub quality: String,
+    #[serde(default = "default_fps")]
+    pub fps: u32,
+    #[serde(default = "default_codec")]
+    pub codec: String,
+}
+
+fn default_quality() -> String { "720p".into() }
+fn default_fps() -> u32 { 30 }
+fn default_codec() -> String { "h264".into() }
+
+impl Default for VideoConfig {
+    fn default() -> Self {
+        Self {
+            quality: default_quality(),
+            fps: default_fps(),
+            codec: default_codec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool { true }
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkConfig {
+    pub topic: [u8; 32],
+    pub secret_key: [u8; 32],
+    pub peer_id: [u8; 32],
+}
+
+impl From<LinkState> for LinkConfig {
+    fn from(state: LinkState) -> Self {
+        Self {
+            topic: state.topic,
+            secret_key: state.secret_key,
+            peer_id: state.peer_id,
+        }
+    }
+}
+
+impl From<LinkConfig> for LinkState {
+    fn from(cfg: LinkConfig) -> Self {
+        Self {
+            topic: cfg.topic,
+            secret_key: cfg.secret_key,
+            peer_id: cfg.peer_id,
+        }
+    }
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            video: VideoConfig::default(),
+            audio: AudioConfig::default(),
+            link: None,
+        }
+    }
+}
+
+impl AppConfig {
+    pub fn config_dir() -> std::path::PathBuf {
+        dirs_next::home_dir()
+            .unwrap_or_default()
+            .join(".config/meshcast")
+    }
+
+    pub fn config_path() -> std::path::PathBuf {
+        Self::config_dir().join("config.toml")
+    }
+
+    pub async fn load() -> Result<Self> {
+        let path = Self::config_path();
+        match tokio::fs::read_to_string(&path).await {
+            Ok(data) => Ok(toml::from_str(&data)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).context("Failed to read config"),
+        }
+    }
+
+    pub async fn save(&self) -> Result<()> {
+        let path = Self::config_path();
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let data = toml::to_string_pretty(self)?;
+        tokio::fs::write(&path, data).await?;
+        Ok(())
+    }
+
+    pub fn link_state(&self) -> Option<LinkState> {
+        self.link.clone().map(LinkState::from)
+    }
+}
+
 /// Lightweight iroh node for gossip-only communication.
 pub struct SignalNode {
     pub endpoint: Endpoint,
