@@ -21,6 +21,7 @@ pub enum Signal {
     StopStream,
     StreamStopped,
     WatchStream { ticket: String },
+    ViewerUpdate { count: u32 },
     Ping,
     Pong,
 }

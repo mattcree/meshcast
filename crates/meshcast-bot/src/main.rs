@@ -15,7 +15,8 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
 struct Data {
-    active_streams: Mutex<HashMap<ChannelId, (MessageId, String)>>,
+    active_streams: Mutex<HashMap<ChannelId, (MessageId, String, UserId)>>, // channel → (msg_id, ticket, streamer)
+    viewers: Mutex<HashMap<ChannelId, std::collections::HashSet<UserId>>>,
     signal_node: SignalNode,
     links: Mutex<HashMap<UserId, iroh_gossip::api::GossipSender>>,
     signal_tx: broadcast::Sender<(UserId, Signal)>,
@@ -198,7 +199,12 @@ async fn stream(
         .active_streams
         .lock()
         .expect("poisoned")
-        .insert(ctx.channel_id(), (message.id, ticket));
+        .insert(ctx.channel_id(), (message.id, ticket, user_id));
+    ctx.data()
+        .viewers
+        .lock()
+        .expect("poisoned")
+        .insert(ctx.channel_id(), std::collections::HashSet::new());
 
     Ok(())
 }
@@ -220,8 +226,9 @@ async fn handle_stop(ctx: Context<'_>) -> Result<(), Error> {
         .lock()
         .expect("poisoned")
         .remove(&channel_id);
+    ctx.data().viewers.lock().expect("poisoned").remove(&channel_id);
 
-    let (message_id, _) = match entry {
+    let (message_id, _, _) = match entry {
         Some(e) => e,
         None => {
             ctx.say("No active stream in this channel.").await?;
@@ -331,6 +338,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("Bot is ready");
                 Ok(Data {
                     active_streams: Mutex::new(HashMap::new()),
+                    viewers: Mutex::new(HashMap::new()),
                     signal_node,
                     signal_tx,
                     links: Mutex::new(links),
@@ -372,16 +380,16 @@ async fn handle_event(
                 let user_id = component.user.id;
                 let channel_id = component.channel_id;
 
-                let ticket = data
+                let stream_info = data
                     .active_streams
                     .lock()
                     .expect("poisoned")
                     .get(&channel_id)
-                    .map(|(_, t)| t.clone());
+                    .map(|(_, t, streamer)| (t.clone(), *streamer));
 
-                let reply = match ticket {
+                let reply = match stream_info {
                     None => "No active stream in this channel.".to_string(),
-                    Some(ticket) => {
+                    Some((ticket, streamer_id)) => {
                         let sender = data.links.lock().expect("poisoned").get(&user_id).cloned();
                         match sender {
                             Some(sender) => {
@@ -408,7 +416,19 @@ async fn handle_event(
                                     }
                                 }
                                 if sent {
-                                    "Opening stream in your Meshcast app...".to_string()
+                                    // Track viewer and notify streamer
+                                    let count = {
+                                        let mut viewers = data.viewers.lock().expect("poisoned");
+                                        let set = viewers.entry(channel_id).or_default();
+                                        set.insert(user_id);
+                                        set.len() as u32
+                                    };
+                                    let streamer_sender = data.links.lock().expect("poisoned").get(&streamer_id).cloned();
+                                    if let Some(ss) = streamer_sender {
+                                        let update = Signal::ViewerUpdate { count };
+                                        let _ = ss.broadcast_neighbors(update.encode()?).await;
+                                    }
+                                    format!("Opening stream... ({count} viewer{})", if count == 1 { "" } else { "s" })
                                 } else {
                                     "Failed to reach your app. Is the daemon running?".to_string()
                                 }

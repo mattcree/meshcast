@@ -22,6 +22,7 @@ enum UiEvent {
     StreamStarted { ticket: String },
     StreamFailed { error: String },
     WatchRequested { ticket: String },
+    ViewerCount(u32),
     Linked,
 }
 
@@ -38,6 +39,7 @@ struct AppState {
     is_linked: bool,
     is_connected: bool,
     is_streaming: bool,
+    viewer_count: u32,
     stream_ticket: Option<String>,
     status_msg: String,
     link_token_input: String,
@@ -50,6 +52,7 @@ impl Default for AppState {
             is_linked: false,
             is_connected: false,
             is_streaming: false,
+            viewer_count: 0,
             stream_ticket: None,
             status_msg: "Starting...".into(),
             link_token_input: String::new(),
@@ -150,6 +153,9 @@ impl eframe::App for MeshcastApp {
                 UiEvent::WatchRequested { ticket: _ } => {
                     s.status_msg = "Opening viewer...".into();
                 }
+                UiEvent::ViewerCount(count) => {
+                    s.viewer_count = count;
+                }
                 UiEvent::Linked => {
                     s.is_linked = true;
                     s.status_msg = "Linked! Connecting to bot...".into();
@@ -232,9 +238,11 @@ impl eframe::App for MeshcastApp {
 
                 // Stream controls
                 if s.is_streaming {
-                    if let Some(ticket) = &s.stream_ticket {
-                        ui.label(format!("Ticket: {}...", &ticket[..ticket.len().min(40)]));
-                    }
+                    let vc = s.viewer_count;
+                    ui.label(format!(
+                        "{vc} viewer{}",
+                        if vc == 1 { "" } else { "s" }
+                    ));
                     drop(s);
                     if ui.button("Stop Stream").clicked() {
                         let _ = self.cmd_tx.send(DaemonCmd::StopStream);
@@ -383,6 +391,10 @@ async fn daemon_loop(
                                     Ok(_) => tracing::info!("Viewer launched"),
                                     Err(e) => tracing::error!("Failed to launch viewer: {e}"),
                                 }
+                            }
+                            Ok(Signal::ViewerUpdate { count }) => {
+                                tracing::info!("Viewer count: {count}");
+                                let _ = ui_tx.send(UiEvent::ViewerCount(count));
                             }
                             Ok(Signal::Ping) => {
                                 if let Some(ref s) = sender {
