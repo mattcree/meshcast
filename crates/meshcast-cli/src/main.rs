@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use futures_lite::StreamExt;
 use iroh_live::ticket::LiveTicket;
 use iroh_live::Live;
+use meshcast_signal::{Event, LinkState, PairToken, Signal, SignalNode};
 use moq_media::capture::ScreenCapturer;
 use moq_media::codec::{AudioCodec, VideoCodec};
 use moq_media::format::{AudioPreset, DecoderBackend, PlaybackConfig, VideoPreset};
@@ -37,6 +39,18 @@ enum Commands {
         /// Ticket string or meshcast://watch/<ticket> URI
         ticket: String,
     },
+
+    /// Link this machine to the Discord bot for remote stream control
+    Link {
+        /// Pairing token from `/link` command in Discord
+        token: String,
+    },
+
+    /// Run as a daemon, waiting for the bot to signal stream start/stop
+    Daemon,
+
+    /// Remove the link to the Discord bot
+    Unlink,
 }
 
 fn main() -> Result<()> {
@@ -61,6 +75,9 @@ fn main() -> Result<()> {
             quality,
         } => rt.block_on(cmd_stream(name, no_audio, quality)),
         Commands::Watch { ticket } => cmd_watch(ticket, &rt),
+        Commands::Link { token } => rt.block_on(cmd_link(token)),
+        Commands::Daemon => rt.block_on(cmd_daemon()),
+        Commands::Unlink => rt.block_on(cmd_unlink()),
     }
 }
 
@@ -124,6 +141,197 @@ async fn cmd_stream(name: String, no_audio: bool, quality: String) -> Result<()>
     tracing::info!("Shutting down...");
     live.shutdown().await;
 
+    Ok(())
+}
+
+fn link_path() -> std::path::PathBuf {
+    dirs_next::home_dir()
+        .unwrap_or_default()
+        .join(".config/meshcast/link.json")
+}
+
+async fn cmd_link(token: String) -> Result<()> {
+    let pair = PairToken::from_str(&token).context("Invalid pairing token")?;
+    tracing::info!("Linking to bot...");
+
+    let node = SignalNode::new(None).await?;
+
+    // Add bot's addresses so we can find it
+    let memory_lookup = iroh::address_lookup::memory::MemoryLookup::new();
+    for peer in &pair.peers {
+        memory_lookup.add_endpoint_info(peer.clone());
+    }
+    if let Ok(lookup) = node.endpoint.address_lookup() {
+        lookup.add(memory_lookup);
+    }
+
+    let peer_ids: Vec<_> = pair.peers.iter().map(|p| p.id).collect();
+    let gossip_topic = node
+        .gossip
+        .subscribe_and_join(pair.topic, peer_ids.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let (_, mut receiver) = gossip_topic.split();
+
+    // Wait for connection confirmation
+    tracing::info!("Waiting for bot connection...");
+    let connected = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while let Some(event) = receiver.next().await {
+            if let Ok(Event::NeighborUp(_)) = event {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+
+    if !connected {
+        anyhow::bail!("Failed to connect to bot. Is the bot running?");
+    }
+
+    // Save link state
+    let state = LinkState::new(pair.topic, &node.endpoint.secret_key(), peer_ids[0]);
+    state.save(&link_path()).await?;
+
+    println!("Linked! Run `meshcast daemon` to start listening for stream commands.");
+    Ok(())
+}
+
+async fn cmd_daemon() -> Result<()> {
+    let state = LinkState::load(&link_path())
+        .await
+        .context("Not linked. Run `meshcast link <TOKEN>` first.")?;
+
+    let node = SignalNode::new(Some(state.secret_key())).await?;
+    let peer_id = state.peer_endpoint_id();
+
+    let gossip_topic = node
+        .gossip
+        .subscribe_and_join(state.topic_id(), vec![peer_id])
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let (sender, mut receiver) = gossip_topic.split();
+
+    println!("Daemon running. Waiting for commands from Discord bot...");
+    println!("Press Ctrl+C to stop.\n");
+
+    let mut live: Option<Live> = None;
+
+    loop {
+        tokio::select! {
+            event = receiver.next() => {
+                let event = match event {
+                    Some(Ok(e)) => e,
+                    Some(Err(e)) => {
+                        tracing::error!("Gossip error: {e}");
+                        break;
+                    }
+                    None => break,
+                };
+
+                match event {
+                    Event::Received(msg) => {
+                        match Signal::decode(&msg.content) {
+                            Ok(Signal::StartStream { title }) => {
+                                tracing::info!("Bot requested stream start: {title}");
+                                match start_stream("meshcast".to_string()).await {
+                                    Ok((l, ticket)) => {
+                                        tracing::info!("Streaming! Ticket: {ticket}");
+                                        let signal = Signal::StreamReady { ticket };
+                                        let _ = sender.broadcast(signal.encode()?).await;
+                                        live = Some(l);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to start stream: {e}");
+                                    }
+                                }
+                            }
+                            Ok(Signal::StopStream) => {
+                                tracing::info!("Bot requested stream stop");
+                                if let Some(l) = live.take() {
+                                    l.shutdown().await;
+                                    let _ = sender.broadcast(Signal::StreamStopped.encode()?).await;
+                                    tracing::info!("Stream stopped");
+                                }
+                            }
+                            Ok(Signal::Ping) => {
+                                let _ = sender.broadcast(Signal::Pong.encode()?).await;
+                            }
+                            Ok(other) => {
+                                tracing::debug!("Ignoring signal: {other:?}");
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to decode signal: {e}");
+                            }
+                        }
+                    }
+                    Event::NeighborUp(id) => {
+                        tracing::info!(peer = %id.fmt_short(), "Bot connected");
+                    }
+                    Event::NeighborDown(id) => {
+                        tracing::warn!(peer = %id.fmt_short(), "Bot disconnected");
+                    }
+                    Event::Lagged => {
+                        tracing::warn!("Signal receiver lagged");
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Shutting down daemon...");
+                if let Some(l) = live.take() {
+                    l.shutdown().await;
+                }
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Start a stream and return the Live handle + ticket string.
+async fn start_stream(name: String) -> Result<(Live, String)> {
+    let l = Live::from_env()
+        .await
+        .context("Failed to initialize iroh-live")?
+        .with_router()
+        .spawn();
+
+    let broadcast = LocalBroadcast::new();
+
+    let screen = ScreenCapturer::new().context("Failed to initialize screen capture")?;
+    broadcast
+        .video()
+        .set_source(screen, VideoCodec::H264, [VideoPreset::P720])
+        .context("Failed to set video source")?;
+
+    // Try audio but don't fail if unavailable
+    let audio_backend = AudioBackend::default();
+    if let Ok(mic) = audio_backend.default_input().await {
+        let _ = broadcast
+            .audio()
+            .set(mic, AudioCodec::Opus, [AudioPreset::Hq]);
+    }
+
+    l.publish(&name, &broadcast)
+        .await
+        .context("Failed to publish broadcast")?;
+
+    let ticket = LiveTicket::new(l.endpoint().addr(), &name);
+    Ok((l, ticket.to_string()))
+}
+
+async fn cmd_unlink() -> Result<()> {
+    let path = link_path();
+    if path.exists() {
+        tokio::fs::remove_file(&path).await?;
+        println!("Unlinked.");
+    } else {
+        println!("Not linked.");
+    }
     Ok(())
 }
 
