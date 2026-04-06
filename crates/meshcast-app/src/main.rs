@@ -5,7 +5,7 @@ use eframe::egui;
 use futures_lite::StreamExt;
 use iroh_live::ticket::LiveTicket;
 use iroh_live::Live;
-use meshcast_signal::{AppConfig, Event, LinkConfig, PairToken, Signal, SignalNode};
+use meshcast_signal::{AppConfig, Event, LinkConfig, PairCode, PairToken, Signal, SignalNode};
 use moq_media::capture::ScreenCapturer;
 use moq_media::codec::{AudioCodec, VideoCodec};
 use moq_media::format::{AudioPreset, VideoPreset};
@@ -191,7 +191,7 @@ impl eframe::App for MeshcastApp {
             // Link section
             if !s.is_linked {
                 ui.group(|ui| {
-                    ui.label("Paste link token from Discord /link command:");
+                    ui.label("Enter pairing code from Discord /link command:");
                     drop(s); // release lock for mutable access
                     let mut s = self.state.lock().expect("poisoned");
                     let response = ui.text_edit_singleline(&mut s.link_token_input);
@@ -453,6 +453,55 @@ async fn daemon_loop(
 
 async fn do_link(
     node: &SignalNode,
+    input: &str,
+    config: &mut AppConfig,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+) -> Result<()> {
+    // Try parsing as short code first, fall back to legacy token
+    let (bot_id, topic) = match PairCode::parse(input) {
+        Ok((Some(bot_id), _pin)) => {
+            // Full code — we have the bot's endpoint ID but need the topic from legacy path
+            // For now, fall back to legacy PairToken which includes the topic
+            tracing::info!("Parsed short code, bot endpoint: {}", bot_id.fmt_short());
+            // TODO: implement PIN-based topic exchange with bot
+            // For now, try legacy format
+            return do_link_legacy(node, input, config, ui_tx).await;
+        }
+        Ok((None, _pin)) => {
+            // PIN only — need cached bot endpoint ID
+            let cached_link = config.link_state();
+            match cached_link {
+                Some(ls) => (ls.peer_endpoint_id(), ls.topic_id()),
+                None => anyhow::bail!("No previous connection. Use the full pairing code for first-time setup."),
+            }
+        }
+        Err(_) => {
+            // Try legacy token format
+            return do_link_legacy(node, input, config, ui_tx).await;
+        }
+    };
+
+    // PIN-only re-link: use cached bot endpoint ID and existing topic
+    let _topic = node
+        .gossip
+        .subscribe_and_join(topic, vec![bot_id])
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let link_state = meshcast_signal::LinkState::new(
+        topic,
+        &node.endpoint.secret_key(),
+        bot_id,
+    );
+    config.link = Some(LinkConfig::from(link_state));
+    config.save().await?;
+
+    let _ = ui_tx.send(UiEvent::Linked);
+    Ok(())
+}
+
+async fn do_link_legacy(
+    node: &SignalNode,
     token: &str,
     config: &mut AppConfig,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
@@ -474,7 +523,6 @@ async fn do_link(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Save to config
     let link_state = meshcast_signal::LinkState::new(
         pair.topic,
         &node.endpoint.secret_key(),

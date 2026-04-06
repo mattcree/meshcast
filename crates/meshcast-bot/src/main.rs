@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use futures_lite::StreamExt;
-use meshcast_signal::{BotLinkStore, Event, LinkState, PairToken, Signal, SignalNode};
+use meshcast_signal::{BotLinkStore, Event, LinkState, PairCode, PairToken, Signal, SignalNode};
 use poise::serenity_prelude as serenity;
 use serenity::all::{
     ChannelId, CreateActionRow, CreateButton, CreateEmbed, CreateEmbedAuthor, MessageId, UserId,
@@ -15,10 +15,12 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
 struct Data {
-    active_streams: Mutex<HashMap<ChannelId, (MessageId, String, UserId)>>, // channel → (msg_id, ticket, streamer)
+    active_streams: Mutex<HashMap<ChannelId, (MessageId, String, UserId)>>,
     viewers: Mutex<HashMap<ChannelId, std::collections::HashSet<UserId>>>,
     signal_node: SignalNode,
     links: Mutex<HashMap<UserId, iroh_gossip::api::GossipSender>>,
+    /// Pending pairing PINs: PIN → (topic, user_id, created_at)
+    pending_pins: Mutex<HashMap<String, (iroh_gossip::proto::TopicId, UserId, std::time::Instant)>>,
     signal_tx: broadcast::Sender<(UserId, Signal)>,
     store_path: std::path::PathBuf,
     store: Mutex<BotLinkStore>,
@@ -69,7 +71,10 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
 
     let topic = iroh_gossip::proto::TopicId::from_bytes(rand::random());
     let addr = data.signal_node.addr();
-    let token = PairToken::new(topic, vec![addr]).to_string()?;
+    let pin = PairCode::generate_pin();
+    let full_code = PairCode::encode_full(data.signal_node.endpoint.id(), &pin);
+    // Keep legacy token as fallback
+    let _legacy_token = PairToken::new(topic, vec![addr]).to_string()?;
 
     let gossip_topic = data
         .signal_node
@@ -81,6 +86,12 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
 
     data.links.lock().expect("poisoned").insert(user_id, sender);
     spawn_receiver(user_id, receiver, data.signal_tx.clone());
+
+    // Store PIN for pairing exchange
+    data.pending_pins.lock().expect("poisoned").insert(
+        pin.clone(),
+        (topic, user_id, std::time::Instant::now()),
+    );
 
     // Persist the link
     let link_state = LinkState::new(
@@ -98,7 +109,10 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
     }
 
     ctx.say(format!(
-        "Link token (paste into `meshcast link`):\n```\n{token}\n```"
+        "**Your pairing code:**\n\
+         ```\n{full_code}\n```\n\
+         Enter this in the Meshcast app to connect.\n\n\
+         *Already paired before?* Just use the PIN: **{pin}**"
     ))
     .await?;
     Ok(())
@@ -350,6 +364,7 @@ async fn main() -> anyhow::Result<()> {
                     signal_node,
                     signal_tx,
                     links: Mutex::new(links),
+                    pending_pins: Mutex::new(HashMap::new()),
                     store_path: path,
                     store: Mutex::new(store),
                 })

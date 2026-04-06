@@ -49,14 +49,14 @@ impl PairToken {
         Self { topic, peers }
     }
 
-    /// Encode as "meshcast1<BASE32>" string.
+    /// Encode as "meshcast1<BASE32>" string (legacy format).
     pub fn to_string(&self) -> Result<String> {
         let bytes = postcard::to_allocvec(self)?;
         let encoded = data_encoding::BASE32_NOPAD.encode(&bytes);
         Ok(format!("meshcast1{encoded}"))
     }
 
-    /// Decode from "meshcast1<BASE32>" string.
+    /// Decode from "meshcast1<BASE32>" string (legacy format).
     pub fn from_str(s: &str) -> Result<Self> {
         let s = s.trim();
         let encoded = s
@@ -67,6 +67,83 @@ impl PairToken {
             .context("Invalid base32 in token")?;
         Ok(postcard::from_bytes(&bytes)?)
     }
+}
+
+/// Short pairing code — contains bot's endpoint ID + 6-digit PIN.
+/// Format: "XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXXXX"
+/// (32 bytes endpoint ID as base32 = 52 chars, then dash, then 6-digit PIN)
+pub struct PairCode;
+
+impl PairCode {
+    /// Generate a 6-digit PIN.
+    pub fn generate_pin() -> String {
+        let n: u32 = rand::random::<u32>() % 1_000_000;
+        format!("{n:06}")
+    }
+
+    /// Encode a full pairing code from bot endpoint ID + PIN.
+    pub fn encode_full(bot_endpoint_id: EndpointId, pin: &str) -> String {
+        let id_bytes = bot_endpoint_id.as_bytes();
+        let id_base32 = data_encoding::BASE32_NOPAD.encode(id_bytes);
+        // Format with dashes every 4 chars for readability
+        let chunked: Vec<&str> = id_base32.as_bytes().chunks(4)
+            .map(|c| std::str::from_utf8(c).unwrap_or(""))
+            .collect();
+        format!("{}-{pin}", chunked.join("-"))
+    }
+
+    /// Parse a pairing code. Returns (bot_endpoint_id, pin).
+    /// Accepts either:
+    /// - Full code: "XXXX-XXXX-...-XXXXXX" (base32 endpoint ID with dashes + PIN)
+    /// - PIN only: "123456" (6 digits, requires cached bot endpoint ID)
+    pub fn parse(input: &str) -> Result<(Option<EndpointId>, String)> {
+        let input = input.trim().to_uppercase();
+
+        // Check if it's just a 6-digit PIN
+        if input.len() == 6 && input.chars().all(|c| c.is_ascii_digit()) {
+            return Ok((None, input));
+        }
+
+        // Full code: strip dashes, split into endpoint ID + PIN
+        let parts: Vec<&str> = input.split('-').collect();
+        if parts.len() < 2 {
+            anyhow::bail!("Invalid pairing code format");
+        }
+
+        // Last part is the PIN (6 digits)
+        let pin = parts.last().unwrap().to_string();
+        if pin.len() != 6 || !pin.chars().all(|c| c.is_ascii_digit()) {
+            anyhow::bail!("Pairing code must end with a 6-digit PIN");
+        }
+
+        // Everything before the last dash is the base32 endpoint ID
+        let id_base32: String = parts[..parts.len() - 1].join("");
+        let id_bytes = data_encoding::BASE32_NOPAD
+            .decode(id_base32.as_bytes())
+            .context("Invalid pairing code")?;
+
+        if id_bytes.len() != 32 {
+            anyhow::bail!("Invalid endpoint ID in pairing code (expected 32 bytes, got {})", id_bytes.len());
+        }
+
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&id_bytes);
+        let endpoint_id = EndpointId::from_bytes(&arr)
+            .map_err(|e| anyhow::anyhow!("Invalid endpoint ID: {e}"))?;
+
+        Ok((Some(endpoint_id), pin))
+    }
+}
+
+/// Add a new signal for the PIN exchange during pairing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PairSignal {
+    /// App sends PIN to bot to request pairing.
+    PairRequest { pin: String },
+    /// Bot responds with the gossip topic if PIN is valid.
+    PairAccepted { topic: [u8; 32] },
+    /// Bot rejects the PIN.
+    PairRejected { reason: String },
 }
 
 /// Persisted link state — survives restarts.
