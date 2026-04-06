@@ -349,9 +349,7 @@ async fn cmd_unlink() -> Result<()> {
 
 /// Watch command — sets up async connection, then runs eframe on the main thread.
 fn cmd_watch(raw: String, rt: &tokio::runtime::Runtime) -> Result<()> {
-    use eframe::egui;
     use moq_media_egui::{VideoTrackView, create_egui_wgpu_config};
-    use std::time::Duration;
 
     let ticket_str = parse_ticket_uri(&raw);
     let ticket: LiveTicket = ticket_str
@@ -408,7 +406,7 @@ fn cmd_watch(raw: String, rt: &tokio::runtime::Runtime) -> Result<()> {
                 _audio: tracks.audio,
                 _broadcast: tracks.broadcast,
                 sub,
-                live,
+                _live: live,
             }))
         }),
     )
@@ -422,7 +420,7 @@ struct WatchApp {
     _audio: Option<moq_media::subscribe::AudioTrack>,
     _broadcast: moq_media::subscribe::RemoteBroadcast,
     sub: iroh_live::Subscription,
-    live: Live,
+    _live: Live,
 }
 
 impl eframe::App for WatchApp {

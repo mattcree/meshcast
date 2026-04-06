@@ -21,7 +21,7 @@ enum UiEvent {
     StreamRequested { title: String },
     StreamStarted { ticket: String },
     StreamFailed { error: String },
-    WatchRequested { ticket: String },
+    WatchRequested,
     ViewerCount(u32),
     Linked,
 }
@@ -150,7 +150,7 @@ impl eframe::App for MeshcastApp {
                 UiEvent::StreamFailed { error } => {
                     s.status_msg = format!("Stream failed: {error}");
                 }
-                UiEvent::WatchRequested { ticket: _ } => {
+                UiEvent::WatchRequested => {
                     s.status_msg = "Opening viewer...".into();
                 }
                 UiEvent::ViewerCount(count) => {
@@ -375,7 +375,7 @@ async fn daemon_loop(
                             }
                             Ok(Signal::WatchStream { ticket }) => {
                                 tracing::info!("Watch: {ticket}");
-                                let _ = ui_tx.send(UiEvent::WatchRequested { ticket: ticket.clone() });
+                                let _ = ui_tx.send(UiEvent::WatchRequested);
                                 let exe = std::env::current_exe().unwrap_or_else(|_| "meshcast".into());
                                 // Use meshcast CLI for viewer (it has the egui viewer)
                                 let meshcast_cli = exe.parent()

@@ -8,37 +8,36 @@ Meshcast — a Discord-integrated P2P screen streaming tool built on top of **ir
 
 **iroh-live already exists** and handles the entire capture → encode → transport → decode → render pipeline. Do NOT build a custom streaming protocol, frame packetiser, encoder abstraction, or screen capture layer. The project scope is:
 
-1. A Discord bot (post stream tickets as rich embeds)
-2. A thin CLI wrapper (URI scheme handler + convenience around `irl`)
-3. Optionally a Tauri GUI later
+1. A Discord bot (post stream tickets as rich embeds with Watch button)
+2. A desktop app (tray icon + config UI + daemon that responds to bot signals)
+3. A CLI for headless/manual use
 
-## iroh-live Reference
+## Architecture
 
-- **Repo**: https://github.com/n0-computer/iroh-live
-- **CLI binary**: `irl` (in `iroh-live-cli` crate)
-- **Key commands**: `irl publish --video screen`, `irl play <TICKET>`, `irl room`, `irl relay`
-- **High-level API crate**: `iroh-live` — provides `Live`, `LocalBroadcast`, `LiveTicket`, capture sources
-- **Transport**: MoQ (Media over QUIC) via `iroh-moq` + `moq-rs`
-- **Codecs**: H.264 (openh264), AV1 (rav1e/rav1d), Opus — all software, with VA-API HW accel optional
-- **Screen capture**: `xcap` crate + PipeWire on Linux, ScreenCaptureKit on macOS
-- **Status**: Experimental but actively developed by n0 (the iroh company)
-- **Windows**: Viewer/playback should work. Capture/publish is mostly missing. Audio (callme) works on all platforms.
-- **Note**: Uses unreleased crate versions — build from git, copy their `[patch.crates-io]` section
-
-### iroh-live API (publisher example from their docs)
-```rust
-let live = Live::from_env().await?.with_router().spawn();
-let broadcast = LocalBroadcast::new();
-// For screen capture, use the screen capture source instead of camera
-let camera = CameraCapturer::new()?;
-broadcast.video().set_source(camera, VideoCodec::H264, [VideoPreset::P720])?;
-let audio = AudioBackend::default();
-let mic = audio.default_input().await?;
-broadcast.audio().set(mic, AudioCodec::Opus, [AudioPreset::Hq])?;
-live.publish("hello", &broadcast).await?;
-let ticket = LiveTicket::new(live.endpoint().addr(), "hello");
-println!("{ticket}");
 ```
+Discord         Bot (homelab)              Desktop App / CLI Daemon
+  │                │                            │
+  │ /link          │                            │
+  ├───────────────►│ generate gossip topic      │
+  │◄───token───────┤                            │
+  │                │                            │
+  │   (user pastes token into app or CLI)       │
+  │                │◄────gossip connected───────►│
+  │                │                            │
+  │ /stream        │                            │
+  ├───────────────►│──StartStream──────────────►│ captures screen
+  │                │◄─StreamReady{ticket}───────┤
+  │◄──embed+Watch──┤                            │
+  │                │                            │
+  │ click Watch    │                            │
+  ├───────────────►│──WatchStream{ticket}──────►│ opens viewer
+  │                │◄─ViewerUpdate{count}───────┤
+  │                │                            │
+  │ /stream stop   │──StopStream───────────────►│
+  │◄──"Ended"──────│◄─StreamStopped────────────┤
+```
+
+All signaling uses **iroh-gossip** over QUIC with NAT traversal. Discord buttons are interactive (not URL-based — Discord rejects custom URI schemes).
 
 ## Workspace Layout
 
@@ -46,106 +45,97 @@ println!("{ticket}");
 meshcast/
 ├── CLAUDE.md
 ├── SPEC.md
-├── Cargo.toml              # workspace root
+├── Cargo.toml              # workspace root (4 crates)
 ├── crates/
-│   ├── meshcast-bot/        # Discord bot — slash commands, embeds
-│   │   ├── src/
-│   │   │   └── main.rs
-│   │   └── Cargo.toml
-│   └── meshcast-cli/        # Wrapper CLI — URI handler, ticket management
-│       ├── src/
-│       │   └── main.rs
-│       └── Cargo.toml
-├── meshcast.desktop         # Linux URI scheme handler
+│   ├── meshcast-signal/     # Shared types: Signal enum, PairToken, LinkState, AppConfig, SignalNode
+│   ├── meshcast-bot/        # Discord bot — /link, /stream, Watch button handler
+│   ├── meshcast-cli/        # CLI — stream, watch, link, daemon, unlink
+│   └── meshcast-app/        # Desktop app — egui config UI + merged daemon
+├── meshcast.desktop         # Linux URI scheme handler (fallback)
 └── scripts/
-    └── install-uri.sh       # Registers meshcast:// URI scheme
+    └── install-uri.sh
 ```
 
 ## Tech Stack
 
-- **Streaming**: `iroh-live` (git dependency) — does all the hard work
-- **Discord bot**: `poise` (ergonomic framework on top of serenity)
-- **CLI**: `clap` for argument parsing
-- **Async runtime**: `tokio` (required by both iroh and serenity)
+- **Streaming**: `iroh-live` (git dependency) — capture, encode, transport, decode, render
+- **Signaling**: `iroh-gossip` — bot-to-app communication
+- **Discord bot**: `poise` 0.6 (on serenity 0.12)
+- **Desktop app**: `eframe`/`egui` + `tray-icon`
+- **CLI**: `clap` 4
+- **Config**: TOML (`~/.config/meshcast/config.toml`)
+- **Async runtime**: `tokio`
 - **Logging**: `tracing`
 
-## meshcast-bot Design
+## meshcast-signal (shared crate)
 
-The bot has one slash command. A stream *is* a room — no separate concepts.
+- `Signal` enum: `StartStream`, `StreamReady`, `StopStream`, `StreamStopped`, `WatchStream`, `ViewerUpdate`, `Ping`, `Pong`
+- `PairToken`: gossip topic + endpoint address, base32-encoded with `meshcast1` prefix
+- `LinkState`: persisted topic/secret_key/peer_id for reconnection
+- `AppConfig`: video quality/fps/codec, audio toggle, link config — stored as TOML
+- `BotLinkStore`: bot's persisted links + secret key
+- `SignalNode`: lightweight iroh Endpoint + Gossip + Router wrapper
 
-```
-/stream [title]
-  → User starts streaming from the meshcast app (or provides a ticket)
-  → Bot posts embed with:
-    - Title (default: "{user}'s Stream")
-    - "Watch" button → meshcast://watch/<ticket>
-    - Streamer's avatar
-    - Timestamp footer
-  → If another participant wants to publish into the same room, they can
-  → /stream stop → updates embed to "Stream ended"
-```
+## meshcast-bot
 
-The bot needs: `SEND_MESSAGES`, `EMBED_LINKS` permissions. No voice permissions — streaming is entirely outside Discord.
+Single binary, runs on homelab. Slash commands:
+- `/link` — generates pairing token, subscribes to gossip topic
+- `/stream [title] [ticket] [stop]` — signals linked app to start capture, or accepts manual ticket
+- Watch button (interactive) — sends `WatchStream` to viewer's linked app via gossip
 
-## meshcast-cli Design
+Persists links to `~/.config/meshcast-bot/state.json`. Restores on startup.
 
-Two subcommands:
+## meshcast-cli
 
-```bash
-# Start streaming (wraps irl publish / irl room)
-meshcast stream [--title "My Stream"] [--post-to-discord <webhook-url>]
-  → Launches irl publish --video screen
-  → Captures the ticket from stdout
-  → Optionally POSTs ticket to bot's webhook endpoint
-  → Prints ticket + URI
+Five subcommands:
+- `meshcast stream [--name] [--no-audio] [--quality]` — direct screen capture + publish
+- `meshcast watch <ticket-or-uri>` — egui viewer with software H.264 decode
+- `meshcast link <token>` — pair with Discord bot
+- `meshcast daemon` — long-running gossip listener, responds to bot signals
+- `meshcast unlink` — remove pairing
 
-# Watch a stream (wraps irl play, also handles URI scheme)
-meshcast watch <ticket-or-uri>
-  → Parses meshcast://watch/<ticket> URIs
-  → Launches irl play <ticket>
-```
+## meshcast-app
+
+Desktop application (egui window). Merges daemon + config UI:
+- Status indicator (streaming/connected/linked/unlinked)
+- Link token input for pairing
+- Quality selector (360p/720p/1080p), FPS (30/60), audio toggle
+- Viewer count display
+- Background gossip listener handles all signals
 
 ## Build Prerequisites (Bluefin / Fedora)
 
-iroh-live has native dependencies for screen capture and encoding:
-
 ```bash
-# In a toolbox (recommended for Bluefin)
+# In a toolbox (required for Bluefin)
 toolbox create meshcast && toolbox enter meshcast
 
-# iroh-live build deps
-sudo dnf install pipewire-devel libspa-devel clang-devel libva-devel nasm pkg-config
+sudo dnf install -y \
+  pipewire-devel clang-devel libva-devel nasm pkg-config cmake \
+  alsa-lib-devel mesa-libgbm-devel mesa-vulkan-drivers \
+  libxkbcommon libxkbcommon-devel gtk3-devel atk-devel
+
+# Build
+cargo build --workspace --release
 ```
+
+## Key Dependencies (pinned)
+
+- `iroh` pinned to rev `8af8370` (main branch had hickory API breakage)
+- `iroh-gossip` on branch `deps/iroh-main`
+- `iroh-live` on branch `main`
+- Full `[patch.crates-io]` section in workspace Cargo.toml
 
 ## Code Style
 
-- Use `anyhow` for error handling (this is a thin application layer, not a library)
-- Use `tracing` for logging
-- Keep it simple — the bot is < 200 lines, the CLI wrapper is < 200 lines
-- Don't over-abstract. This is glue code.
+- `anyhow` for error handling
+- `tracing` for logging
+- Keep it simple — this is glue code
+- Don't over-abstract
 
 ## What NOT to Do
 
-- **Don't build a streaming protocol.** iroh-live + MoQ handles this.
-- **Don't build an encoder/decoder.** iroh-live wraps openh264/rav1e/opus.
-- **Don't build a screen capture abstraction.** iroh-live wraps xcap + PipeWire.
-- **Don't build NAT traversal.** iroh handles this.
-- **Don't add WebRTC.** The whole point is using iroh/QUIC instead.
-- **Don't try to stream through Discord's voice infrastructure.** Bot video streaming is not officially supported. We stream outside Discord and use Discord only for discovery.
-- **Don't create separate /stream and /room commands.** A stream is a room. One command.
-
-## Phase 1: Just Test iroh-live First
-
-Before writing any code, validate that iroh-live actually works:
-
-```bash
-# Terminal 1: publish screen
-irl publish --video screen
-
-# Terminal 2 (different machine): watch
-irl play <TICKET>
-```
-
-Check: Does PipeWire capture work? Is latency acceptable? Is text readable? Does it work across NATs? Can a Windows friend run `irl play`?
-
-**Only proceed to building meshcast-bot and meshcast-cli once Phase 1 passes.**
+- Don't build a streaming protocol — iroh-live + MoQ handles this
+- Don't build an encoder/decoder — iroh-live wraps openh264/rav1e/opus
+- Don't build a screen capture abstraction — iroh-live wraps xcap + PipeWire
+- Don't use URL buttons in Discord — they reject custom URI schemes
+- Don't create separate /stream and /room commands — a stream is a room
