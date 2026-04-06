@@ -177,13 +177,13 @@ async fn stream(
         match ticket {
             Some(t) => t,
             None => {
-                ctx.say("Timed out waiting for desktop app. Is `meshcast daemon` running?")
+                ctx.say("Your Meshcast app doesn't seem to be running. Open it and try again.")
                     .await?;
                 return Ok(());
             }
         }
     } else {
-        ctx.say("Provide a ticket: `/stream ticket:<ticket>`\nOr link your app first with `/link`")
+        ctx.say("Connect your app first with `/link`, or pass a stream code: `/stream ticket:<code>`")
             .await?;
         return Ok(());
     };
@@ -264,9 +264,14 @@ async fn handle_stop(ctx: Context<'_>) -> Result<(), Error> {
         .await
         .context("Failed to fetch stream message")?;
 
+    let display_name = ctx.author().global_name.as_deref().unwrap_or(&ctx.author().name);
+    let avatar_url = ctx.author().avatar_url().unwrap_or_default();
+
     let ended_embed = CreateEmbed::new()
-        .title("Stream Ended")
+        .title(format!("{display_name}'s Stream"))
+        .description("This stream has ended.")
         .color(0x99AAB5)
+        .author(CreateEmbedAuthor::new(display_name).icon_url(&avatar_url))
         .footer(serenity::all::CreateEmbedFooter::new("Stream ended"))
         .timestamp(serenity::model::Timestamp::now());
 
@@ -455,11 +460,11 @@ async fn handle_event(
                                     }
                                     format!("Opening stream... ({count} viewer{})", if count == 1 { "" } else { "s" })
                                 } else {
-                                    "Failed to reach your app. Is the daemon running?".to_string()
+                                    "Couldn't reach your app. Make sure Meshcast is open and try again.".to_string()
                                 }
                             }
                             None => {
-                                "Your app isn't linked. Run `/link` first, then `meshcast link <token>` and `meshcast daemon`.".to_string()
+                                "You haven't set up Meshcast yet. Click **Download App** to get started, then use `/link` to connect.".to_string()
                             }
                         }
                     }
