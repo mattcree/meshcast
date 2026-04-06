@@ -121,6 +121,45 @@ impl LinkState {
     }
 }
 
+/// Bot-side persistent link store.
+/// Stores multiple user links keyed by Discord user ID, plus the bot's own secret key.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BotLinkStore {
+    /// Bot's secret key (hex-encoded 32 bytes) for stable endpoint identity.
+    pub bot_secret_key: Option<[u8; 32]>,
+    /// Per-user link states keyed by Discord user ID string.
+    pub links: std::collections::HashMap<String, LinkState>,
+}
+
+impl BotLinkStore {
+    pub async fn load(path: &Path) -> Result<Self> {
+        match tokio::fs::read_to_string(path).await {
+            Ok(data) => Ok(serde_json::from_str(&data)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).context("Failed to read bot link store"),
+        }
+    }
+
+    pub async fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let data = serde_json::to_string_pretty(self)?;
+        tokio::fs::write(path, data).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+        Ok(())
+    }
+
+    pub fn bot_secret_key(&self) -> Option<SecretKey> {
+        self.bot_secret_key.map(|b| SecretKey::from_bytes(&b))
+    }
+}
+
 /// Lightweight iroh node for gossip-only communication.
 pub struct SignalNode {
     pub endpoint: Endpoint,

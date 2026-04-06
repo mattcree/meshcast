@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use futures_lite::StreamExt;
-use meshcast_signal::{Event, LinkState, PairToken, Signal, SignalNode};
+use meshcast_signal::{BotLinkStore, Event, LinkState, PairToken, Signal, SignalNode};
 use poise::serenity_prelude as serenity;
 use serenity::all::{
     ChannelId, CreateActionRow, CreateButton, CreateEmbed, CreateEmbedAuthor, MessageId, UserId,
@@ -14,19 +14,50 @@ use tokio::sync::broadcast;
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
-const LINKS_PATH: &str = ".config/meshcast-bot/links.json";
-
 struct Data {
-    active_streams: Mutex<HashMap<ChannelId, (MessageId, String)>>, // channel → (msg_id, ticket)
+    active_streams: Mutex<HashMap<ChannelId, (MessageId, String)>>,
     signal_node: SignalNode,
     links: Mutex<HashMap<UserId, iroh_gossip::api::GossipSender>>,
     signal_tx: broadcast::Sender<(UserId, Signal)>,
+    store_path: std::path::PathBuf,
+    store: Mutex<BotLinkStore>,
 }
 
-fn links_path() -> std::path::PathBuf {
+fn store_path() -> std::path::PathBuf {
     dirs_next::home_dir()
         .unwrap_or_default()
-        .join(LINKS_PATH)
+        .join(".config/meshcast-bot/state.json")
+}
+
+/// Spawn a gossip receiver task that routes signals to the broadcast channel.
+fn spawn_receiver(
+    user_id: UserId,
+    mut receiver: iroh_gossip::api::GossipReceiver,
+    signal_tx: broadcast::Sender<(UserId, Signal)>,
+) {
+    tokio::spawn(async move {
+        while let Some(event) = receiver.next().await {
+            match event {
+                Ok(Event::Received(msg)) => {
+                    if let Ok(signal) = Signal::decode(&msg.content) {
+                        tracing::info!(?signal, user = %user_id, "Signal from app");
+                        let _ = signal_tx.send((user_id, signal));
+                    }
+                }
+                Ok(Event::NeighborUp(id)) => {
+                    tracing::info!(peer = %id.fmt_short(), user = %user_id, "App connected");
+                }
+                Ok(Event::NeighborDown(id)) => {
+                    tracing::warn!(peer = %id.fmt_short(), user = %user_id, "App disconnected");
+                }
+                Err(e) => {
+                    tracing::error!(user = %user_id, "Gossip error: {e}");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
 }
 
 /// Link your desktop app to this bot for remote stream control.
@@ -45,41 +76,25 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
         .subscribe(topic, vec![])
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let (sender, mut receiver) = gossip_topic.split();
+    let (sender, receiver) = gossip_topic.split();
 
-    data.links.lock().unwrap().insert(user_id, sender);
+    data.links.lock().expect("poisoned").insert(user_id, sender);
+    spawn_receiver(user_id, receiver, data.signal_tx.clone());
 
+    // Persist the link
     let link_state = LinkState::new(
         topic,
-        &iroh::SecretKey::from_bytes(&[0; 32]),
+        &data.signal_node.endpoint.secret_key(),
         data.signal_node.endpoint.id(),
     );
-    let _ = link_state.save(&links_path()).await;
-
-    let signal_tx = data.signal_tx.clone();
-    tokio::spawn(async move {
-        while let Some(event) = receiver.next().await {
-            match event {
-                Ok(Event::Received(msg)) => {
-                    if let Ok(signal) = Signal::decode(&msg.content) {
-                        tracing::info!(?signal, "Signal from app");
-                        let _ = signal_tx.send((user_id, signal));
-                    }
-                }
-                Ok(Event::NeighborUp(id)) => {
-                    tracing::info!(peer = %id.fmt_short(), "App connected");
-                }
-                Ok(Event::NeighborDown(id)) => {
-                    tracing::warn!(peer = %id.fmt_short(), "App disconnected");
-                }
-                Err(e) => {
-                    tracing::error!("Gossip error: {e}");
-                    break;
-                }
-                _ => {}
-            }
-        }
-    });
+    {
+        let mut store = data.store.lock().expect("poisoned");
+        store.links.insert(user_id.to_string(), link_state);
+    }
+    let store_snapshot = data.store.lock().expect("poisoned").clone();
+    if let Err(e) = store_snapshot.save(&data.store_path).await {
+        tracing::error!("Failed to save link store: {e}");
+    }
 
     ctx.say(format!(
         "Link token (paste into `meshcast link`):\n```\n{token}\n```"
@@ -105,12 +120,12 @@ async fn stream(
     let display_name = user.global_name.as_deref().unwrap_or(&user.name);
     let title = title.unwrap_or_else(|| format!("{display_name}'s Stream"));
 
-    let has_link = ctx.data().links.lock().unwrap().contains_key(&user_id);
+    let has_link = ctx.data().links.lock().expect("poisoned").contains_key(&user_id);
 
     let ticket = if let Some(t) = ticket {
         t
     } else if has_link {
-        let sender = ctx.data().links.lock().unwrap().get(&user_id).cloned();
+        let sender = ctx.data().links.lock().expect("poisoned").get(&user_id).cloned();
         let sender = match sender {
             Some(s) => s,
             None => {
@@ -121,11 +136,9 @@ async fn stream(
 
         ctx.defer().await?;
 
-        let signal = Signal::StartStream {
-            title: title.clone(),
-        };
+        let signal = Signal::StartStream { title: title.clone() };
         sender
-            .broadcast(signal.encode()?)
+            .broadcast_neighbors(signal.encode()?)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -170,8 +183,8 @@ async fn stream(
         .footer(serenity::all::CreateEmbedFooter::new("Started streaming"))
         .timestamp(serenity::model::Timestamp::now());
 
-    // Interactive button — triggers component interaction, not a URL
-    let button = CreateButton::new("watch").label("Watch").style(serenity::all::ButtonStyle::Primary);
+    let button =
+        CreateButton::new("watch").label("Watch").style(serenity::all::ButtonStyle::Primary);
     let row = CreateActionRow::Buttons(vec![button]);
 
     let reply = poise::CreateReply::default()
@@ -184,7 +197,7 @@ async fn stream(
     ctx.data()
         .active_streams
         .lock()
-        .unwrap()
+        .expect("poisoned")
         .insert(ctx.channel_id(), (message.id, ticket));
 
     Ok(())
@@ -194,16 +207,18 @@ async fn handle_stop(ctx: Context<'_>) -> Result<(), Error> {
     let user_id = ctx.author().id;
     let channel_id = ctx.channel_id();
 
-    let sender = ctx.data().links.lock().unwrap().get(&user_id).cloned();
+    let sender = ctx.data().links.lock().expect("poisoned").get(&user_id).cloned();
     if let Some(sender) = sender {
-        let _ = sender.broadcast(Signal::StopStream.encode()?).await;
+        let _ = sender
+            .broadcast_neighbors(Signal::StopStream.encode()?)
+            .await;
     }
 
     let entry = ctx
         .data()
         .active_streams
         .lock()
-        .unwrap()
+        .expect("poisoned")
         .remove(&channel_id);
 
     let (message_id, _) = match entry {
@@ -252,19 +267,65 @@ async fn main() -> anyhow::Result<()> {
     let token =
         std::env::var("DISCORD_TOKEN").context("DISCORD_TOKEN environment variable required")?;
 
+    // Load persisted state
+    let path = store_path();
+    let mut store = BotLinkStore::load(&path)
+        .await
+        .context("Failed to load link store")?;
+
+    // Use persisted secret key or generate + save a new one
+    let secret_key = match store.bot_secret_key() {
+        Some(key) => {
+            tracing::info!("Loaded persisted bot identity");
+            key
+        }
+        None => {
+            let key = iroh::SecretKey::from_bytes(&rand::random::<[u8; 32]>());
+            store.bot_secret_key = Some(key.to_bytes());
+            store.save(&path).await?;
+            tracing::info!("Generated new bot identity");
+            key
+        }
+    };
+
     tracing::info!("Starting signal node...");
-    let signal_node = SignalNode::new(None)
+    let signal_node = SignalNode::new(Some(secret_key))
         .await
         .context("Failed to start signal node")?;
     tracing::info!("Signal node ready");
 
     let (signal_tx, _) = broadcast::channel(64);
+    let mut links: HashMap<UserId, iroh_gossip::api::GossipSender> = HashMap::new();
 
-    // Clone for the event handler
-    let signal_tx_for_handler = signal_tx.clone();
+    // Restore saved links
+    for (user_id_str, link_state) in &store.links {
+        let user_id: UserId = match user_id_str.parse() {
+            Ok(id) => UserId::new(id),
+            Err(_) => {
+                tracing::warn!("Invalid user ID in store: {user_id_str}");
+                continue;
+            }
+        };
+
+        let topic = link_state.topic_id();
+        match signal_node.gossip.subscribe(topic, vec![]).await {
+            Ok(gossip_topic) => {
+                let (sender, receiver) = gossip_topic.split();
+                links.insert(user_id, sender);
+                spawn_receiver(user_id, receiver, signal_tx.clone());
+                tracing::info!(user = %user_id, "Restored link");
+            }
+            Err(e) => {
+                tracing::warn!(user = %user_id, "Failed to restore link: {e}");
+            }
+        }
+    }
+
+    let restored_count = links.len();
+    tracing::info!("Restored {restored_count} link(s)");
 
     let framework = poise::Framework::builder()
-        .setup(|ctx, _ready, framework| {
+        .setup(move |ctx, _ready, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
                 tracing::info!("Bot is ready");
@@ -272,7 +333,9 @@ async fn main() -> anyhow::Result<()> {
                     active_streams: Mutex::new(HashMap::new()),
                     signal_node,
                     signal_tx,
-                    links: Mutex::new(HashMap::new()),
+                    links: Mutex::new(links),
+                    store_path: path,
+                    store: Mutex::new(store),
                 })
             })
         })
@@ -312,29 +375,34 @@ async fn handle_event(
                 let ticket = data
                     .active_streams
                     .lock()
-                    .unwrap()
+                    .expect("poisoned")
                     .get(&channel_id)
                     .map(|(_, t)| t.clone());
 
                 let reply = match ticket {
                     None => "No active stream in this channel.".to_string(),
                     Some(ticket) => {
-                        let sender = data.links.lock().unwrap().get(&user_id).cloned();
+                        let sender = data.links.lock().expect("poisoned").get(&user_id).cloned();
                         match sender {
                             Some(sender) => {
                                 let signal = Signal::WatchStream { ticket };
                                 let msg = signal.encode()?;
-                                // Retry up to 3 times with short delay
                                 let mut sent = false;
                                 for attempt in 0..3 {
                                     match sender.broadcast_neighbors(msg.clone()).await {
                                         Ok(_) => {
-                                            tracing::info!("Sent WatchStream (attempt {})", attempt + 1);
+                                            tracing::info!(
+                                                "Sent WatchStream (attempt {})",
+                                                attempt + 1
+                                            );
                                             sent = true;
                                             break;
                                         }
                                         Err(e) => {
-                                            tracing::warn!("Send attempt {} failed: {e}", attempt + 1);
+                                            tracing::warn!(
+                                                "Send attempt {} failed: {e}",
+                                                attempt + 1
+                                            );
                                             tokio::time::sleep(Duration::from_millis(200)).await;
                                         }
                                     }
