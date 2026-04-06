@@ -14,6 +14,19 @@ use tokio::sync::broadcast;
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
+const DOWNLOAD_PORT: u16 = 3829;
+
+fn download_base_url() -> String {
+    std::env::var("MESHCAST_URL")
+        .unwrap_or_else(|_| format!("http://localhost:{DOWNLOAD_PORT}"))
+}
+
+fn downloads_dir() -> std::path::PathBuf {
+    dirs_next::home_dir()
+        .unwrap_or_default()
+        .join(".config/meshcast-bot/downloads")
+}
+
 struct Data {
     active_streams: Mutex<HashMap<ChannelId, (MessageId, String, UserId)>>, // channel → (msg_id, ticket, streamer)
     viewers: Mutex<HashMap<ChannelId, std::collections::HashSet<UserId>>>,
@@ -175,22 +188,34 @@ async fn stream(
     };
 
     let avatar_url = user.avatar_url().unwrap_or_default();
+    let base = download_base_url();
 
     let embed = CreateEmbed::new()
         .title(&title)
-        .description("Click **Watch** to start viewing this stream.")
+        .description(format!(
+            "Click **Watch** to view this stream.\n\
+             Need the app? Download for your platform below."
+        ))
         .color(0x5865F2)
         .author(CreateEmbedAuthor::new(display_name).icon_url(&avatar_url))
         .footer(serenity::all::CreateEmbedFooter::new("Started streaming"))
         .timestamp(serenity::model::Timestamp::now());
 
-    let button =
+    let watch_btn =
         CreateButton::new("watch").label("Watch").style(serenity::all::ButtonStyle::Primary);
-    let row = CreateActionRow::Buttons(vec![button]);
+    let watch_row = CreateActionRow::Buttons(vec![watch_btn]);
+
+    let linux_btn = CreateButton::new_link(format!("{base}/download/linux"))
+        .label("Linux");
+    let mac_btn = CreateButton::new_link(format!("{base}/download/macos"))
+        .label("macOS");
+    let win_btn = CreateButton::new_link(format!("{base}/download/windows"))
+        .label("Windows");
+    let download_row = CreateActionRow::Buttons(vec![linux_btn, mac_btn, win_btn]);
 
     let reply = poise::CreateReply::default()
         .embed(embed)
-        .components(vec![row]);
+        .components(vec![watch_row, download_row]);
 
     let handle = ctx.send(reply).await?;
     let message = handle.message().await?;
@@ -356,6 +381,15 @@ async fn main() -> anyhow::Result<()> {
         })
         .build();
 
+    // Ensure downloads directory exists
+    let dl_dir = downloads_dir();
+    tokio::fs::create_dir_all(&dl_dir).await.ok();
+    tracing::info!("Downloads dir: {}", dl_dir.display());
+    tracing::info!("Place binaries as: linux/meshcast-app, macos/meshcast-app, windows/meshcast-app.exe");
+
+    // Spawn download file server
+    tokio::spawn(run_download_server());
+
     let intents = serenity::GatewayIntents::non_privileged();
     let mut client = serenity::ClientBuilder::new(&token, intents)
         .framework(framework)
@@ -364,6 +398,93 @@ async fn main() -> anyhow::Result<()> {
 
     client.start().await.context("Client error")?;
     Ok(())
+}
+
+/// HTTP file server for distributing meshcast binaries.
+/// Serves files from ~/.config/meshcast-bot/downloads/<platform>/
+async fn run_download_server() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let addr = format!("0.0.0.0:{DOWNLOAD_PORT}");
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => {
+            tracing::info!("Download server listening on {addr}");
+            l
+        }
+        Err(e) => {
+            tracing::warn!("Failed to start download server on {addr}: {e}");
+            return;
+        }
+    };
+
+    let dl_dir = downloads_dir();
+
+    loop {
+        let (mut stream, peer) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(_) => continue,
+        };
+
+        let dl_dir = dl_dir.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let n = match stream.read(&mut buf).await {
+                Ok(n) if n > 0 => n,
+                _ => return,
+            };
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/");
+
+            tracing::info!(peer = %peer, "HTTP request: {path}");
+
+            let (status, content_type, body) = match path {
+                "/download/linux" => serve_file(&dl_dir.join("linux/meshcast-app")).await,
+                "/download/macos" => serve_file(&dl_dir.join("macos/meshcast-app")).await,
+                "/download/windows" => serve_file(&dl_dir.join("windows/meshcast-app.exe")).await,
+                "/" => {
+                    let html = format!(
+                        "<html><body><h1>Meshcast Downloads</h1>\
+                         <ul>\
+                         <li><a href=\"/download/linux\">Linux (Flatpak/Bluefin)</a></li>\
+                         <li><a href=\"/download/macos\">macOS</a></li>\
+                         <li><a href=\"/download/windows\">Windows</a></li>\
+                         </ul></body></html>"
+                    );
+                    ("200 OK", "text/html", html.into_bytes())
+                }
+                _ => ("404 Not Found", "text/plain", b"Not found".to_vec()),
+            };
+
+            let header = format!(
+                "HTTP/1.1 {status}\r\n\
+                 Content-Type: {content_type}\r\n\
+                 Content-Length: {}\r\n\
+                 Content-Disposition: attachment\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            );
+
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+        });
+    }
+}
+
+async fn serve_file(path: &std::path::Path) -> (&'static str, &'static str, Vec<u8>) {
+    match tokio::fs::read(path).await {
+        Ok(data) => ("200 OK", "application/octet-stream", data),
+        Err(_) => (
+            "404 Not Found",
+            "text/plain",
+            format!("Binary not available yet. Ask the streamer to build for this platform.")
+                .into_bytes(),
+        ),
+    }
 }
 
 /// Handle component interactions (Watch button clicks)
