@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: meshcast-app
+            archive: meshcast-linux-x86_64.tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: meshcast-app
+            archive: meshcast-macos-aarch64.tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: meshcast-app
+            archive: meshcast-macos-x86_64.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: meshcast-app.exe
+            archive: meshcast-windows-x86_64.zip
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libpipewire-0.3-dev libspa-0.2-dev \
+            libclang-dev libva-dev nasm pkg-config cmake \
+            libasound2-dev libgbm-dev libvulkan-dev \
+            libxkbcommon-dev libgtk-3-dev libatk1.0-dev
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install nasm cmake pkg-config
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p meshcast-app -p meshcast-cli
+
+      - name: Strip (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          strip target/${{ matrix.target }}/release/meshcast-app || true
+          strip target/${{ matrix.target }}/release/meshcast || true
+
+      - name: Package (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          tar czf ${{ matrix.archive }} \
+            -C target/${{ matrix.target }}/release \
+            meshcast-app meshcast
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/meshcast-app.exe","target/${{ matrix.target }}/release/meshcast.exe" -DestinationPath ${{ matrix.archive }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            meshcast-linux-x86_64.tar.gz/meshcast-linux-x86_64.tar.gz
+            meshcast-macos-aarch64.tar.gz/meshcast-macos-aarch64.tar.gz
+            meshcast-macos-x86_64.tar.gz/meshcast-macos-x86_64.tar.gz
+            meshcast-windows-x86_64.zip/meshcast-windows-x86_64.zip
+          generate_release_notes: true
