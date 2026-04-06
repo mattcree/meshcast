@@ -4,7 +4,7 @@ use iroh_live::ticket::LiveTicket;
 use iroh_live::Live;
 use moq_media::capture::ScreenCapturer;
 use moq_media::codec::{AudioCodec, VideoCodec};
-use moq_media::format::{AudioPreset, VideoPreset};
+use moq_media::format::{AudioPreset, DecoderBackend, PlaybackConfig, VideoPreset};
 use moq_media::publish::LocalBroadcast;
 use moq_media::AudioBackend;
 
@@ -39,8 +39,7 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -50,13 +49,18 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Failed to build tokio runtime")?;
+
     match cli.command {
         Commands::Stream {
             name,
             no_audio,
             quality,
-        } => cmd_stream(name, no_audio, quality).await,
-        Commands::Watch { ticket } => cmd_watch(ticket).await,
+        } => rt.block_on(cmd_stream(name, no_audio, quality)),
+        Commands::Watch { ticket } => cmd_watch(ticket, &rt),
     }
 }
 
@@ -116,7 +120,6 @@ async fn cmd_stream(name: String, no_audio: bool, quality: String) -> Result<()>
     println!("  meshcast://watch/{ticket_str}\n");
     println!("Press Ctrl+C to stop.\n");
 
-    // Wait for Ctrl+C
     tokio::signal::ctrl_c().await?;
     tracing::info!("Shutting down...");
     live.shutdown().await;
@@ -124,43 +127,110 @@ async fn cmd_stream(name: String, no_audio: bool, quality: String) -> Result<()>
     Ok(())
 }
 
-async fn cmd_watch(raw: String) -> Result<()> {
+/// Watch command — sets up async connection, then runs eframe on the main thread.
+fn cmd_watch(raw: String, rt: &tokio::runtime::Runtime) -> Result<()> {
+    use eframe::egui;
+    use moq_media_egui::{VideoTrackView, create_egui_wgpu_config};
+    use std::time::Duration;
+
     let ticket_str = parse_ticket_uri(&raw);
     let ticket: LiveTicket = ticket_str
         .parse()
         .context("Invalid ticket string")?;
 
-    tracing::info!("Connecting to stream '{}'...", ticket.broadcast_name);
+    // Async setup: connect and subscribe
+    let (live, sub, tracks) = rt.block_on(async {
+        tracing::info!("Connecting to stream '{}'...", ticket.broadcast_name);
 
-    let live = Live::from_env()
-        .await
-        .context("Failed to initialize iroh-live")?
-        .spawn();
+        let live = Live::from_env()
+            .await
+            .context("Failed to initialize iroh-live")?
+            .spawn();
 
-    let sub = live
-        .subscribe(ticket.endpoint, &ticket.broadcast_name)
-        .await
-        .context("Failed to subscribe to stream")?;
+        let sub = live
+            .subscribe(ticket.endpoint, &ticket.broadcast_name)
+            .await
+            .context("Failed to subscribe to stream")?;
 
-    let audio_backend = AudioBackend::default();
-    let tracks = sub
-        .media(&audio_backend, Default::default())
-        .await
-        .context("Failed to initialize media tracks")?;
+        let audio_backend = AudioBackend::default();
+        let playback_config = PlaybackConfig {
+            backend: DecoderBackend::Software,
+            ..Default::default()
+        };
+        let tracks = sub
+            .broadcast()
+            .media(&audio_backend, playback_config)
+            .await
+            .context("Failed to initialize media tracks")?;
 
-    tracing::info!("Connected. Rendering stream...");
+        tracing::info!("Connected.");
+        anyhow::Ok((live, sub, tracks))
+    })?;
 
-    if let Some(mut video) = tracks.video {
-        while let Some(_frame) = video.next_frame().await {
-            // Rendering is handled internally by iroh-live's wgpu integration
-        }
-    } else {
-        tracing::warn!("No video track in this stream");
-        tokio::signal::ctrl_c().await?;
+    // eframe must run on the main thread
+    let _guard = rt.enter();
+    let native_options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
+        wgpu_options: create_egui_wgpu_config(),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Meshcast",
+        native_options,
+        Box::new(move |cc| {
+            let video_view = tracks
+                .video
+                .map(|track| VideoTrackView::new(&cc.egui_ctx, "video", track));
+
+            Ok(Box::new(WatchApp {
+                video: video_view,
+                _audio: tracks.audio,
+                _broadcast: tracks.broadcast,
+                sub,
+                live,
+            }))
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
+
+    Ok(())
+}
+
+struct WatchApp {
+    video: Option<moq_media_egui::VideoTrackView>,
+    _audio: Option<moq_media::subscribe::AudioTrack>,
+    _broadcast: moq_media::subscribe::RemoteBroadcast,
+    sub: iroh_live::Subscription,
+    live: Live,
+}
+
+impl eframe::App for WatchApp {
+    fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
+        use eframe::egui;
+
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().inner_margin(0.0).fill(egui::Color32::BLACK))
+            .show(ctx, |ui| {
+                let avail = ui.available_size();
+                if let Some(video) = self.video.as_mut() {
+                    let (img, _) = video.render(ctx, avail);
+                    ui.add_sized(avail, img);
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("Audio only — no video track");
+                    });
+                }
+            });
     }
 
-    live.shutdown().await;
-    Ok(())
+    fn on_exit(&mut self) {
+        tracing::info!("Exiting viewer");
+        self.sub.session().close(0, b"bye");
+        // Can't block_on shutdown here cleanly, but dropping will clean up
+    }
 }
 
 /// Strips the `meshcast://watch/` prefix if present.

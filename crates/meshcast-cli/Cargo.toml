@@ -11,8 +11,10 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+eframe = { version = "0.33.0", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
 iroh-live = { git = "https://github.com/n0-computer/iroh-live", branch = "main", features = ["h264", "opus", "capture-screen"] }
 moq-media = { git = "https://github.com/n0-computer/iroh-live", branch = "main" }
+moq-media-egui = { git = "https://github.com/n0-computer/iroh-live", branch = "main" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
