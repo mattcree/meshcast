@@ -140,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
         .build();
 
     let intents = serenity::GatewayIntents::non_privileged();
-    let client = serenity::ClientBuilder::new(&token, intents)
+    let mut client = serenity::ClientBuilder::new(&token, intents)
         .framework(framework)
         .await
         .context("Failed to create Discord client")?;
