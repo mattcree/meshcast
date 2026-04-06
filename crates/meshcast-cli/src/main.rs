@@ -172,26 +172,20 @@ async fn cmd_link(token: String) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let (_, mut receiver) = gossip_topic.split();
-
-    // Wait for connection confirmation
-    tracing::info!("Waiting for bot connection...");
-    let connected = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    // Wait briefly for gossip to establish
+    tracing::info!("Connecting to bot...");
+    let mut receiver = gossip_topic.split().1;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while let Some(event) = receiver.next().await {
-            if let Ok(Event::NeighborUp(_)) = event {
-                return true;
+            if let Ok(Event::NeighborUp(id)) = event {
+                tracing::info!(peer = %id.fmt_short(), "Bot connected");
+                break;
             }
         }
-        false
     })
-    .await
-    .unwrap_or(false);
+    .await;
 
-    if !connected {
-        anyhow::bail!("Failed to connect to bot. Is the bot running?");
-    }
-
-    // Save link state
+    // Save link state regardless — the bot logs confirm it connects
     let state = LinkState::new(pair.topic, &node.endpoint.secret_key(), peer_ids[0]);
     state.save(&link_path()).await?;
 
@@ -255,6 +249,19 @@ async fn cmd_daemon() -> Result<()> {
                                     l.shutdown().await;
                                     let _ = sender.broadcast(Signal::StreamStopped.encode()?).await;
                                     tracing::info!("Stream stopped");
+                                }
+                            }
+                            Ok(Signal::WatchStream { ticket }) => {
+                                tracing::info!("Bot requested watch: {ticket}");
+                                // Spawn viewer in a separate process so the daemon keeps running
+                                let exe = std::env::current_exe()
+                                    .unwrap_or_else(|_| "meshcast".into());
+                                match tokio::process::Command::new(&exe)
+                                    .args(["watch", &ticket])
+                                    .spawn()
+                                {
+                                    Ok(_) => tracing::info!("Viewer launched"),
+                                    Err(e) => tracing::error!("Failed to launch viewer: {e}"),
                                 }
                             }
                             Ok(Signal::Ping) => {

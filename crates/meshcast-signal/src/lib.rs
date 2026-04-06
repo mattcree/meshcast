@@ -20,6 +20,7 @@ pub enum Signal {
     StreamReady { ticket: String },
     StopStream,
     StreamStopped,
+    WatchStream { ticket: String },
     Ping,
     Pong,
 }

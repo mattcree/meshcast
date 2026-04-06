@@ -17,11 +17,9 @@ type Context<'a> = poise::Context<'a, Data, Error>;
 const LINKS_PATH: &str = ".config/meshcast-bot/links.json";
 
 struct Data {
-    active_streams: Mutex<HashMap<ChannelId, MessageId>>,
+    active_streams: Mutex<HashMap<ChannelId, (MessageId, String)>>, // channel → (msg_id, ticket)
     signal_node: SignalNode,
-    /// Per-user gossip senders
     links: Mutex<HashMap<UserId, iroh_gossip::api::GossipSender>>,
-    /// Broadcasts received signals to waiting /stream handlers
     signal_tx: broadcast::Sender<(UserId, Signal)>,
 }
 
@@ -41,7 +39,6 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
     let addr = data.signal_node.addr();
     let token = PairToken::new(topic, vec![addr]).to_string()?;
 
-    // Subscribe to the gossip topic
     let gossip_topic = data
         .signal_node
         .gossip
@@ -50,41 +47,36 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let (sender, mut receiver) = gossip_topic.split();
 
-    // Store sender for this user
     data.links.lock().unwrap().insert(user_id, sender);
 
-    // Save link state
     let link_state = LinkState::new(
         topic,
-        &iroh::SecretKey::from_bytes(&[0; 32]), // placeholder — bot uses node's key
+        &iroh::SecretKey::from_bytes(&[0; 32]),
         data.signal_node.endpoint.id(),
     );
     let _ = link_state.save(&links_path()).await;
 
-    // Spawn receiver task
     let signal_tx = data.signal_tx.clone();
     tokio::spawn(async move {
         while let Some(event) = receiver.next().await {
             match event {
                 Ok(Event::Received(msg)) => {
                     if let Ok(signal) = Signal::decode(&msg.content) {
-                        tracing::info!(?signal, "Received signal from desktop app");
+                        tracing::info!(?signal, "Signal from app");
                         let _ = signal_tx.send((user_id, signal));
                     }
                 }
                 Ok(Event::NeighborUp(id)) => {
-                    tracing::info!(peer = %id.fmt_short(), "Desktop app connected");
+                    tracing::info!(peer = %id.fmt_short(), "App connected");
                 }
                 Ok(Event::NeighborDown(id)) => {
-                    tracing::warn!(peer = %id.fmt_short(), "Desktop app disconnected");
-                }
-                Ok(Event::Lagged) => {
-                    tracing::warn!("Signal receiver lagged");
+                    tracing::warn!(peer = %id.fmt_short(), "App disconnected");
                 }
                 Err(e) => {
                     tracing::error!("Gossip error: {e}");
                     break;
                 }
+                _ => {}
             }
         }
     });
@@ -113,13 +105,11 @@ async fn stream(
     let display_name = user.global_name.as_deref().unwrap_or(&user.name);
     let title = title.unwrap_or_else(|| format!("{display_name}'s Stream"));
 
-    // If we have a linked app, signal it to start
     let has_link = ctx.data().links.lock().unwrap().contains_key(&user_id);
 
     let ticket = if let Some(t) = ticket {
         t
     } else if has_link {
-        // Signal the desktop app
         let sender = ctx.data().links.lock().unwrap().get(&user_id).cloned();
         let sender = match sender {
             Some(s) => s,
@@ -139,7 +129,6 @@ async fn stream(
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        // Wait for StreamReady
         let mut rx = ctx.data().signal_tx.subscribe();
         let ticket: Option<String> =
             tokio::time::timeout(Duration::from_secs(30), async move {
@@ -160,7 +149,8 @@ async fn stream(
         match ticket {
             Some(t) => t,
             None => {
-                ctx.say("Timed out waiting for desktop app to start streaming. Is `meshcast daemon` running?").await?;
+                ctx.say("Timed out waiting for desktop app. Is `meshcast daemon` running?")
+                    .await?;
                 return Ok(());
             }
         }
@@ -171,17 +161,17 @@ async fn stream(
     };
 
     let avatar_url = user.avatar_url().unwrap_or_default();
-    let watch_uri = format!("meshcast://watch/{ticket}");
 
     let embed = CreateEmbed::new()
         .title(&title)
-        .description("Click **Watch** to open the stream in Meshcast.")
+        .description("Click **Watch** to start viewing this stream.")
         .color(0x5865F2)
         .author(CreateEmbedAuthor::new(display_name).icon_url(&avatar_url))
         .footer(serenity::all::CreateEmbedFooter::new("Started streaming"))
         .timestamp(serenity::model::Timestamp::now());
 
-    let button = CreateButton::new_link(&watch_uri).label("Watch (Native)");
+    // Interactive button — triggers component interaction, not a URL
+    let button = CreateButton::new("watch").label("Watch").style(serenity::all::ButtonStyle::Primary);
     let row = CreateActionRow::Buttons(vec![button]);
 
     let reply = poise::CreateReply::default()
@@ -195,7 +185,7 @@ async fn stream(
         .active_streams
         .lock()
         .unwrap()
-        .insert(ctx.channel_id(), message.id);
+        .insert(ctx.channel_id(), (message.id, ticket));
 
     Ok(())
 }
@@ -204,21 +194,20 @@ async fn handle_stop(ctx: Context<'_>) -> Result<(), Error> {
     let user_id = ctx.author().id;
     let channel_id = ctx.channel_id();
 
-    // Signal desktop app to stop
     let sender = ctx.data().links.lock().unwrap().get(&user_id).cloned();
     if let Some(sender) = sender {
         let _ = sender.broadcast(Signal::StopStream.encode()?).await;
     }
 
-    let message_id = ctx
+    let entry = ctx
         .data()
         .active_streams
         .lock()
         .unwrap()
         .remove(&channel_id);
 
-    let message_id = match message_id {
-        Some(id) => id,
+    let (message_id, _) = match entry {
+        Some(e) => e,
         None => {
             ctx.say("No active stream in this channel.").await?;
             return Ok(());
@@ -271,6 +260,9 @@ async fn main() -> anyhow::Result<()> {
 
     let (signal_tx, _) = broadcast::channel(64);
 
+    // Clone for the event handler
+    let signal_tx_for_handler = signal_tx.clone();
+
     let framework = poise::Framework::builder()
         .setup(|ctx, _ready, framework| {
             Box::pin(async move {
@@ -286,6 +278,9 @@ async fn main() -> anyhow::Result<()> {
         })
         .options(poise::FrameworkOptions {
             commands: vec![stream(), link()],
+            event_handler: |ctx, event, _framework_ctx, data| {
+                Box::pin(handle_event(ctx, event, data))
+            },
             ..Default::default()
         })
         .build();
@@ -297,5 +292,86 @@ async fn main() -> anyhow::Result<()> {
         .context("Failed to create Discord client")?;
 
     client.start().await.context("Client error")?;
+    Ok(())
+}
+
+/// Handle component interactions (Watch button clicks)
+async fn handle_event(
+    ctx: &serenity::Context,
+    event: &serenity::FullEvent,
+    data: &Data,
+) -> Result<(), Error> {
+    if let serenity::FullEvent::InteractionCreate { interaction } = event {
+        if let Some(component) = interaction.as_message_component() {
+            if component.data.custom_id == "watch" {
+                let user_id = component.user.id;
+                let channel_id = component.channel_id;
+
+                // Get the ticket for this channel's active stream
+                let ticket = data
+                    .active_streams
+                    .lock()
+                    .unwrap()
+                    .get(&channel_id)
+                    .map(|(_, t)| t.clone());
+
+                let ticket = match ticket {
+                    Some(t) => t,
+                    None => {
+                        component
+                            .create_response(
+                                ctx,
+                                serenity::all::CreateInteractionResponse::Message(
+                                    serenity::all::CreateInteractionResponseMessage::new()
+                                        .content("No active stream in this channel.")
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                };
+
+                // Send ticket to viewer's linked app via gossip
+                let sender = data.links.lock().unwrap().get(&user_id).cloned();
+                match sender {
+                    Some(sender) => {
+                        let signal = Signal::WatchStream {
+                            ticket: ticket.clone(),
+                        };
+                        sender
+                            .broadcast(signal.encode()?)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                        component
+                            .create_response(
+                                ctx,
+                                serenity::all::CreateInteractionResponse::Message(
+                                    serenity::all::CreateInteractionResponseMessage::new()
+                                        .content("Opening stream in your Meshcast app...")
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await?;
+                    }
+                    None => {
+                        component
+                            .create_response(
+                                ctx,
+                                serenity::all::CreateInteractionResponse::Message(
+                                    serenity::all::CreateInteractionResponseMessage::new()
+                                        .content(
+                                            "Your app isn't linked. Run `/link` first, then `meshcast link <token>` and `meshcast daemon`.",
+                                        )
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await?;
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
