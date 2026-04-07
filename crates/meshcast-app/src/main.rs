@@ -200,9 +200,16 @@ last_state = {}
 ind = AppIndicator3.Indicator.new("meshcast", "dialog-information", AppIndicator3.IndicatorCategory.APPLICATION_STATUS)
 ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
 
+cmd_path = os.path.expanduser("~/.config/meshcast/.tray-cmd")
+
+def write_cmd(cmd):
+    with open(cmd_path, "w") as f: f.write(cmd)
+
 menu = Gtk.Menu()
 show_item = Gtk.MenuItem(label="Show Meshcast")
+show_item.connect("activate", lambda _: write_cmd("show"))
 stop_item = Gtk.MenuItem(label="Stop Stream")
+stop_item.connect("activate", lambda _: write_cmd("stop"))
 stop_item.set_sensitive(False)
 sep = Gtk.SeparatorMenuItem()
 quit_item = Gtk.MenuItem(label="Quit Meshcast")
@@ -359,6 +366,27 @@ impl eframe::App for MeshcastApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 _ => {}
+            }
+        }
+
+        // Poll tray command file (Linux Python tray subprocess)
+        {
+            let cmd_path = std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default()
+                .join(".config/meshcast/.tray-cmd");
+            if let Ok(cmd) = std::fs::read_to_string(&cmd_path) {
+                let _ = std::fs::remove_file(&cmd_path);
+                match cmd.trim() {
+                    "show" => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    "stop" => {
+                        let _ = self.cmd_tx.send(DaemonCmd::StopStream);
+                    }
+                    _ => {}
+                }
             }
         }
 
