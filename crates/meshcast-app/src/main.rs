@@ -147,19 +147,26 @@ fn main() -> Result<()> {
 
     // Spawn tray icon as a Python subprocess (GTK requires main thread, conflicts with winit)
     #[cfg(target_os = "linux")]
-    std::process::Command::new("python3")
+    let tray_pid = std::process::Command::new("python3")
         .args(["-c", r#"
 import gi, os, signal
 gi.require_version("Gtk", "3.0")
 gi.require_version("AppIndicator3", "0.1")
 from gi.repository import Gtk, AppIndicator3
+ppid = os.getppid()
+def check_parent(*_):
+    try: os.kill(ppid, 0)  # check if parent is alive
+    except: Gtk.main_quit()
+    return True
+import gi.repository.GLib as GLib
+GLib.timeout_add_seconds(2, check_parent)  # auto-quit when parent dies
 ind = AppIndicator3.Indicator.new("meshcast", "dialog-information", AppIndicator3.IndicatorCategory.APPLICATION_STATUS)
 ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
 menu = Gtk.Menu()
 show = Gtk.MenuItem(label="Show Meshcast")
 stop = Gtk.MenuItem(label="Stop Stream")
 quit_item = Gtk.MenuItem(label="Quit Meshcast")
-quit_item.connect("activate", lambda _: os.kill(os.getppid(), signal.SIGUSR1))
+quit_item.connect("activate", lambda _: (os.kill(ppid, signal.SIGUSR1), Gtk.main_quit()))
 menu.append(show)
 menu.append(stop)
 menu.append(Gtk.SeparatorMenuItem())
@@ -172,7 +179,10 @@ Gtk.main()
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .ok();
+        .ok()
+        .map(|c| c.id());
+    #[cfg(not(target_os = "linux"))]
+    let tray_pid: Option<u32> = None;
 
     eframe::run_native(
         "Meshcast",
@@ -211,6 +221,11 @@ Gtk.main()
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
+
+    // Kill tray subprocess on exit
+    if let Some(pid) = tray_pid {
+        let _ = std::process::Command::new("kill").arg(pid.to_string()).spawn();
+    }
 
     Ok(())
 }
