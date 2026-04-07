@@ -15,7 +15,7 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
 struct Data {
-    active_streams: Mutex<HashMap<ChannelId, (MessageId, String, UserId)>>,
+    active_streams: Mutex<HashMap<ChannelId, (MessageId, String, UserId, String)>>, // (msg_id, ticket, streamer, title)
     viewers: Mutex<HashMap<ChannelId, std::collections::HashSet<UserId>>>,
     signal_node: SignalNode,
     links: Mutex<HashMap<UserId, iroh_gossip::api::GossipSender>>,
@@ -74,7 +74,7 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
     let pin = PairCode::generate_pin();
     let full_code = PairCode::encode_full(data.signal_node.endpoint.id(), &pin);
     // Keep legacy token as fallback
-    let _legacy_token = PairToken::new(topic, vec![addr]).to_string()?;
+    let _legacy_token = PairToken::new(topic, vec![addr]).encode()?;
 
     let gossip_topic = data
         .signal_node
@@ -222,7 +222,7 @@ async fn stream(
         .active_streams
         .lock()
         .expect("poisoned")
-        .insert(ctx.channel_id(), (message.id, ticket, user_id));
+        .insert(ctx.channel_id(), (message.id, ticket, user_id, title));
     ctx.data()
         .viewers
         .lock()
@@ -251,7 +251,7 @@ async fn handle_stop(ctx: Context<'_>) -> Result<(), Error> {
         .remove(&channel_id);
     ctx.data().viewers.lock().expect("poisoned").remove(&channel_id);
 
-    let (message_id, _, _) = match entry {
+    let (message_id, _, _, stream_title) = match entry {
         Some(e) => e,
         None => {
             ctx.say("No active stream in this channel.").await?;
@@ -269,7 +269,7 @@ async fn handle_stop(ctx: Context<'_>) -> Result<(), Error> {
     let avatar_url = ctx.author().avatar_url().unwrap_or_default();
 
     let ended_embed = CreateEmbed::new()
-        .title(format!("{display_name}'s Stream"))
+        .title(stream_title)
         .description("This stream has ended.")
         .color(0x99AAB5)
         .author(CreateEmbedAuthor::new(display_name).icon_url(&avatar_url))
@@ -416,7 +416,7 @@ async fn handle_event(
                     .lock()
                     .expect("poisoned")
                     .get(&channel_id)
-                    .map(|(_, t, streamer)| (t.clone(), *streamer));
+                    .map(|(_, t, streamer, _)| (t.clone(), *streamer));
 
                 let reply = match stream_info {
                     None => "No active stream in this channel.".to_string(),

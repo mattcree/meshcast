@@ -560,17 +560,10 @@ async fn daemon_loop(
                                 tracing::info!("Watch: {ticket}");
                                 let _ = ui_tx.send(UiEvent::WatchRequested);
                                 let exe = std::env::current_exe().unwrap_or_else(|_| "meshcast".into());
-                                // Use meshcast CLI for viewer (it has the egui viewer)
                                 let meshcast_cli = exe.parent()
                                     .map(|p| p.join("meshcast"))
                                     .unwrap_or_else(|| "meshcast".into());
-                                match std::process::Command::new("setsid")
-                                    .args([meshcast_cli.as_os_str(), std::ffi::OsStr::new("watch"), std::ffi::OsStr::new(&ticket)])
-                                    .stdin(std::process::Stdio::null())
-                                    .stdout(std::process::Stdio::null())
-                                    .stderr(std::process::Stdio::null())
-                                    .spawn()
-                                {
+                                match meshcast_signal::launch_viewer(&meshcast_cli, &ticket) {
                                     Ok(_) => tracing::info!("Viewer launched"),
                                     Err(e) => tracing::error!("Failed to launch viewer: {e}"),
                                 }
@@ -692,7 +685,7 @@ async fn do_link_legacy(
     config: &mut AppConfig,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
-    let pair = PairToken::from_str(token)?;
+    let pair = PairToken::decode(token)?;
 
     let memory_lookup = iroh::address_lookup::memory::MemoryLookup::new();
     for peer in &pair.peers {

@@ -151,7 +151,7 @@ fn link_path() -> std::path::PathBuf {
 }
 
 async fn cmd_link(token: String) -> Result<()> {
-    let pair = PairToken::from_str(&token).context("Invalid pairing token")?;
+    let pair = PairToken::decode(&token).context("Invalid pairing token")?;
     tracing::info!("Linking to bot...");
 
     let node = SignalNode::new(None).await?;
@@ -236,7 +236,7 @@ async fn cmd_daemon() -> Result<()> {
                                     Ok((l, bc, ticket)) => {
                                         tracing::info!("Streaming! Ticket: {ticket}");
                                         let signal = Signal::StreamReady { ticket };
-                                        let _ = sender.broadcast(signal.encode()?).await;
+                                        let _ = sender.broadcast_neighbors(signal.encode()?).await;
                                         live = Some((l, bc));
                                     }
                                     Err(e) => {
@@ -248,29 +248,21 @@ async fn cmd_daemon() -> Result<()> {
                                 tracing::info!("Bot requested stream stop");
                                 if let Some((l, _bc)) = live.take() {
                                     l.shutdown().await;
-                                    let _ = sender.broadcast(Signal::StreamStopped.encode()?).await;
+                                    let _ = sender.broadcast_neighbors(Signal::StreamStopped.encode()?).await;
                                     tracing::info!("Stream stopped");
                                 }
                             }
                             Ok(Signal::WatchStream { ticket }) => {
                                 tracing::info!("Bot requested watch: {ticket}");
-                                // Fully detach viewer process so it doesn't share
-                                // iroh endpoint resources with the daemon
                                 let exe = std::env::current_exe()
                                     .unwrap_or_else(|_| "meshcast".into());
-                                match std::process::Command::new("setsid")
-                                    .args([exe.as_os_str(), std::ffi::OsStr::new("watch"), std::ffi::OsStr::new(&ticket)])
-                                    .stdin(std::process::Stdio::null())
-                                    .stdout(std::process::Stdio::null())
-                                    .stderr(std::process::Stdio::null())
-                                    .spawn()
-                                {
-                                    Ok(_) => tracing::info!("Viewer launched (detached)"),
+                                match meshcast_signal::launch_viewer(&exe, &ticket) {
+                                    Ok(_) => tracing::info!("Viewer launched"),
                                     Err(e) => tracing::error!("Failed to launch viewer: {e}"),
                                 }
                             }
                             Ok(Signal::Ping) => {
-                                let _ = sender.broadcast(Signal::Pong.encode()?).await;
+                                let _ = sender.broadcast_neighbors(Signal::Pong.encode()?).await;
                             }
                             Ok(other) => {
                                 tracing::debug!("Ignoring signal: {other:?}");

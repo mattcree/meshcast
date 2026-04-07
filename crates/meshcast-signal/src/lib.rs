@@ -50,14 +50,14 @@ impl PairToken {
     }
 
     /// Encode as "meshcast1<BASE32>" string (legacy format).
-    pub fn to_string(&self) -> Result<String> {
+    pub fn encode(&self) -> Result<String> {
         let bytes = postcard::to_allocvec(self)?;
         let encoded = data_encoding::BASE32_NOPAD.encode(&bytes);
         Ok(format!("meshcast1{encoded}"))
     }
 
     /// Decode from "meshcast1<BASE32>" string (legacy format).
-    pub fn from_str(s: &str) -> Result<Self> {
+    pub fn decode(s: &str) -> Result<Self> {
         let s = s.trim();
         let encoded = s
             .strip_prefix("meshcast1")
@@ -369,6 +369,50 @@ impl AppConfig {
     pub fn link_state(&self) -> Option<LinkState> {
         self.link.clone().map(LinkState::from)
     }
+}
+
+/// Validate and sanitize a ticket string before use.
+pub fn validate_ticket(ticket: &str) -> Result<&str> {
+    let ticket = ticket.trim();
+    if ticket.is_empty() {
+        anyhow::bail!("Empty ticket");
+    }
+    // iroh-live tickets are: "iroh-live:" + base64url + "/" + name
+    // Only allow safe characters
+    if !ticket.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/' | '+' | '=')) {
+        anyhow::bail!("Ticket contains invalid characters");
+    }
+    Ok(ticket)
+}
+
+/// Launch a viewer subprocess for the given ticket, detached from the parent.
+/// Cross-platform: uses setsid on Linux, direct spawn elsewhere.
+pub fn launch_viewer(meshcast_bin: &std::path::Path, ticket: &str) -> Result<()> {
+    let ticket = validate_ticket(ticket)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("setsid")
+            .args([meshcast_bin.as_os_str(), std::ffi::OsStr::new("watch"), std::ffi::OsStr::new(ticket)])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("Failed to launch viewer")?;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::process::Command::new(meshcast_bin)
+            .args(["watch", ticket])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("Failed to launch viewer")?;
+    }
+
+    Ok(())
 }
 
 /// Lightweight iroh node for gossip-only communication.
