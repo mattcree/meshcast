@@ -20,6 +20,8 @@ struct Data {
     signal_node: SignalNode,
     links: Mutex<HashMap<UserId, iroh_gossip::api::GossipSender>>,
     pending_pins: Mutex<HashMap<String, (iroh_gossip::proto::TopicId, UserId, std::time::Instant)>>,
+    /// Per-user stream config being built in the Discord config card
+    stream_configs: Mutex<HashMap<UserId, (String, u32)>>, // (quality, fps)
     signal_tx: broadcast::Sender<(UserId, Signal)>,
     store_path: std::path::PathBuf,
     store: Mutex<BotLinkStore>,
@@ -118,112 +120,68 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Start a stream. If linked, signals your desktop app automatically.
+/// Start a stream — shows config card first, then signals your app.
 #[poise::command(slash_command)]
 async fn stream(
     ctx: Context<'_>,
     #[description = "Stream title"] title: Option<String>,
-    #[description = "iroh-live ticket (not needed if linked)"] ticket: Option<String>,
 ) -> Result<(), Error> {
-
     let user = ctx.author();
     let user_id = user.id;
     let display_name = user.global_name.as_deref().unwrap_or(&user.name);
     let title = title.unwrap_or_else(|| format!("{display_name}'s Stream"));
 
     let has_link = ctx.data().links.lock().expect("poisoned").contains_key(&user_id);
-
-    let ticket = if let Some(t) = ticket {
-        t
-    } else if has_link {
-        let sender = ctx.data().links.lock().expect("poisoned").get(&user_id).cloned();
-        let sender = match sender {
-            Some(s) => s,
-            None => {
-                ctx.say("Link lost. Run `/link` again.").await?;
-                return Ok(());
-            }
-        };
-
-        ctx.defer().await?;
-
-        let signal = Signal::StartStream { title: title.clone() };
-        sender
-            .broadcast_neighbors(signal.encode()?)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        let mut rx = ctx.data().signal_tx.subscribe();
-        let ticket: Option<String> =
-            tokio::time::timeout(Duration::from_secs(30), async move {
-                loop {
-                    match rx.recv().await {
-                        Ok((uid, Signal::StreamReady { ticket })) if uid == user_id => {
-                            return ticket;
-                        }
-                        Err(_) => return String::new(),
-                        _ => continue,
-                    }
-                }
-            })
-            .await
-            .ok()
-            .filter(|t| !t.is_empty());
-
-        match ticket {
-            Some(t) => t,
-            None => {
-                ctx.say("Your Meshcast app doesn't seem to be running. Open it and try again.")
-                    .await?;
-                return Ok(());
-            }
-        }
-    } else {
-        ctx.say("Connect your app first with `/link`, or pass a stream code: `/stream ticket:<code>`")
-            .await?;
+    if !has_link {
+        ctx.say("Connect your app first with `/link`.").await?;
         return Ok(());
-    };
+    }
 
-    let avatar_url = user.avatar_url().unwrap_or_default();
+    // Show ephemeral config card with quality/fps selectors + Start/Cancel
+    let config_embed = CreateEmbed::new()
+        .title("Stream Setup")
+        .description(format!("**{}**\nChoose your settings and click Start.", title))
+        .color(0x5865F2);
 
-    let embed = CreateEmbed::new()
-        .title(&title)
-        .description(
-            "Click **Watch** to view this stream.\n\
-             Need the app? Click your platform to download."
-        )
-        .color(0x5865F2)
-        .author(CreateEmbedAuthor::new(display_name).icon_url(&avatar_url))
-        .footer(serenity::all::CreateEmbedFooter::new("Started streaming"))
-        .timestamp(serenity::model::Timestamp::now());
-
-    let watch_btn =
-        CreateButton::new("watch").label("Watch").style(serenity::all::ButtonStyle::Primary);
-    let download_btn = CreateButton::new_link(
-        "https://github.com/mattcree/meshcast/releases/latest",
+    let quality_select = serenity::all::CreateSelectMenu::new(
+        "stream-quality",
+        serenity::all::CreateSelectMenuKind::String {
+            options: vec![
+                serenity::all::CreateSelectMenuOption::new("360p", "360p"),
+                serenity::all::CreateSelectMenuOption::new("720p", "720p").default_selection(true),
+                serenity::all::CreateSelectMenuOption::new("1080p", "1080p"),
+            ],
+        },
     )
-    .label("Download App");
+    .placeholder("Resolution");
+    let quality_row = CreateActionRow::SelectMenu(quality_select);
 
-    let row = CreateActionRow::Buttons(vec![watch_btn, download_btn]);
+    let fps_select = serenity::all::CreateSelectMenu::new(
+        "stream-fps",
+        serenity::all::CreateSelectMenuKind::String {
+            options: vec![
+                serenity::all::CreateSelectMenuOption::new("30 FPS", "30").default_selection(true),
+                serenity::all::CreateSelectMenuOption::new("60 FPS", "60"),
+            ],
+        },
+    )
+    .placeholder("FPS");
+    let fps_row = CreateActionRow::SelectMenu(fps_select);
+
+    let start_btn = CreateButton::new(format!("stream-start:{}", title))
+        .label("Start Stream")
+        .style(serenity::all::ButtonStyle::Success);
+    let cancel_btn = CreateButton::new("stream-cancel")
+        .label("Cancel")
+        .style(serenity::all::ButtonStyle::Secondary);
+    let btn_row = CreateActionRow::Buttons(vec![start_btn, cancel_btn]);
 
     let reply = poise::CreateReply::default()
-        .embed(embed)
-        .components(vec![row]);
+        .embed(config_embed)
+        .components(vec![quality_row, fps_row, btn_row])
+        .ephemeral(true);
 
-    let handle = ctx.send(reply).await?;
-    let message = handle.message().await?;
-
-    ctx.data()
-        .active_streams
-        .lock()
-        .expect("poisoned")
-        .insert(ctx.channel_id(), (message.id, ticket, user_id, title));
-    ctx.data()
-        .viewers
-        .lock()
-        .expect("poisoned")
-        .insert(ctx.channel_id(), std::collections::HashSet::new());
-
+    ctx.send(reply).await?;
     Ok(())
 }
 
@@ -358,6 +316,7 @@ async fn main() -> anyhow::Result<()> {
                     signal_tx,
                     links: Mutex::new(links),
                     pending_pins: Mutex::new(HashMap::new()),
+                    stream_configs: Mutex::new(HashMap::new()),
                     store_path: path,
                     store: Mutex::new(store),
                 })
@@ -392,7 +351,177 @@ async fn handle_event(
 ) -> Result<(), Error> {
     if let serenity::FullEvent::InteractionCreate { interaction } = event {
         if let Some(component) = interaction.as_message_component() {
-            if component.data.custom_id == "watch" {
+            let id = component.data.custom_id.as_str();
+            let user_id = component.user.id;
+
+            // Handle quality/fps select menus
+            if id == "stream-quality" || id == "stream-fps" {
+                if let serenity::all::ComponentInteractionDataKind::StringSelect { values } = &component.data.kind {
+                    if let Some(value) = values.first() {
+                        let mut configs = data.stream_configs.lock().expect("poisoned");
+                        let entry = configs.entry(user_id).or_insert(("720p".into(), 30));
+                        if id == "stream-quality" {
+                            entry.0 = value.clone();
+                        } else {
+                            entry.1 = value.parse().unwrap_or(30);
+                        }
+                    }
+                }
+                // Acknowledge without changing the message
+                component
+                    .create_response(ctx, serenity::all::CreateInteractionResponse::Acknowledge)
+                    .await?;
+                return Ok(());
+            }
+
+            // Handle stream cancel
+            if id == "stream-cancel" {
+                data.stream_configs.lock().expect("poisoned").remove(&user_id);
+                component
+                    .create_response(
+                        ctx,
+                        serenity::all::CreateInteractionResponse::UpdateMessage(
+                            serenity::all::CreateInteractionResponseMessage::new()
+                                .content("Stream cancelled.")
+                                .embeds(vec![])
+                                .components(vec![]),
+                        ),
+                    )
+                    .await?;
+                return Ok(());
+            }
+
+            // Handle stream start
+            if id.starts_with("stream-start:") {
+                let title = id.strip_prefix("stream-start:").unwrap_or("Stream").to_string();
+                let (quality, fps) = data
+                    .stream_configs
+                    .lock()
+                    .expect("poisoned")
+                    .remove(&user_id)
+                    .unwrap_or(("720p".into(), 30));
+
+                let sender = data.links.lock().expect("poisoned").get(&user_id).cloned();
+                let sender = match sender {
+                    Some(s) => s,
+                    None => {
+                        component
+                            .create_response(
+                                ctx,
+                                serenity::all::CreateInteractionResponse::UpdateMessage(
+                                    serenity::all::CreateInteractionResponseMessage::new()
+                                        .content("Link lost. Run `/link` again.")
+                                        .embeds(vec![])
+                                        .components(vec![]),
+                                ),
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                };
+
+                // Update the ephemeral message to show "Starting..."
+                component
+                    .create_response(
+                        ctx,
+                        serenity::all::CreateInteractionResponse::UpdateMessage(
+                            serenity::all::CreateInteractionResponseMessage::new()
+                                .content(format!("Starting stream at {quality} {fps}fps..."))
+                                .embeds(vec![])
+                                .components(vec![]),
+                        ),
+                    )
+                    .await?;
+
+                // Signal the app
+                let signal = Signal::StartStream {
+                    title: title.clone(),
+                    quality: quality.clone(),
+                    fps,
+                };
+                sender
+                    .broadcast_neighbors(signal.encode()?)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                // Wait for StreamReady
+                let mut rx = data.signal_tx.subscribe();
+                let ticket: Option<String> =
+                    tokio::time::timeout(Duration::from_secs(30), async move {
+                        loop {
+                            match rx.recv().await {
+                                Ok((uid, Signal::StreamReady { ticket })) if uid == user_id => {
+                                    return ticket;
+                                }
+                                Err(_) => return String::new(),
+                                _ => continue,
+                            }
+                        }
+                    })
+                    .await
+                    .ok()
+                    .filter(|t| !t.is_empty());
+
+                match ticket {
+                    Some(ticket) => {
+                        let display_name = component.user.global_name.as_deref().unwrap_or(&component.user.name);
+                        let avatar_url = component.user.avatar_url().unwrap_or_default();
+
+                        let embed = CreateEmbed::new()
+                            .title(&title)
+                            .description(format!(
+                                "Streaming at **{quality} {fps}fps**\nClick **Watch** to view."
+                            ))
+                            .color(0x5865F2)
+                            .author(CreateEmbedAuthor::new(display_name).icon_url(&avatar_url))
+                            .footer(serenity::all::CreateEmbedFooter::new("Started streaming"))
+                            .timestamp(serenity::model::Timestamp::now());
+
+                        let watch_btn = CreateButton::new("watch")
+                            .label("Watch")
+                            .style(serenity::all::ButtonStyle::Primary);
+                        let download_btn = CreateButton::new_link(
+                            "https://github.com/mattcree/meshcast/releases/latest",
+                        )
+                        .label("Download App");
+                        let row = CreateActionRow::Buttons(vec![watch_btn, download_btn]);
+
+                        // Post the public stream embed
+                        let channel_id = component.channel_id;
+                        let msg = channel_id
+                            .send_message(
+                                ctx,
+                                serenity::all::CreateMessage::new()
+                                    .embed(embed)
+                                    .components(vec![row]),
+                            )
+                            .await?;
+
+                        data.active_streams
+                            .lock()
+                            .expect("poisoned")
+                            .insert(channel_id, (msg.id, ticket, user_id, title));
+                        data.viewers
+                            .lock()
+                            .expect("poisoned")
+                            .insert(channel_id, std::collections::HashSet::new());
+                    }
+                    None => {
+                        // Follow up since we already responded
+                        component
+                            .create_followup(
+                                ctx,
+                                serenity::all::CreateInteractionResponseFollowup::new()
+                                    .content("Your Meshcast app doesn't seem to be running. Open it and try again.")
+                                    .ephemeral(true),
+                            )
+                            .await?;
+                    }
+                }
+                return Ok(());
+            }
+
+            if id == "watch" {
                 tracing::info!(user = %component.user.name, "Watch button clicked");
 
                 let user_id = component.user.id;

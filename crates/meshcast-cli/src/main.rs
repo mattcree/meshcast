@@ -239,7 +239,7 @@ async fn cmd_daemon() -> Result<()> {
                         }
                         tracing::info!("Received gossip message ({} bytes)", msg.content.len());
                         match Signal::decode(&msg.content) {
-                            Ok(Signal::StartStream { title }) => {
+                            Ok(Signal::StartStream { title, quality: _, fps: _ }) => {
                                 tracing::info!("Bot requested stream start: {title}");
                                 match start_stream("meshcast".to_string()).await {
                                     Ok((l, bc, ticket)) => {

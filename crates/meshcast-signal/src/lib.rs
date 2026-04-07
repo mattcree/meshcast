@@ -16,7 +16,7 @@ pub use iroh_gossip::api::Event;
 /// Messages exchanged between bot and desktop app over gossip.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Signal {
-    StartStream { title: String },
+    StartStream { title: String, quality: String, fps: u32 },
     StreamReady { ticket: String },
     StopStream,
     StreamStopped,

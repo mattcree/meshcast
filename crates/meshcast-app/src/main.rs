@@ -587,9 +587,14 @@ async fn daemon_loop(
 
                         tracing::info!("Received gossip message");
                         match Signal::decode(&msg.content) {
-                            Ok(Signal::StartStream { title }) => {
-                                tracing::info!("Start stream requested: {title}");
-                                // Don't capture immediately — ask for user consent
+                            Ok(Signal::StartStream { title, quality, fps }) => {
+                                tracing::info!("Start stream requested: {title} ({quality} {fps}fps)");
+                                // Store config from Discord, ask for user consent
+                                {
+                                    let mut s = state.lock().expect("poisoned");
+                                    s.config.video.quality = quality;
+                                    s.config.video.fps = fps;
+                                }
                                 pending_stream = Some(title.clone());
                                 let _ = ui_tx.send(UiEvent::StreamRequested { title });
                             }
