@@ -87,16 +87,17 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
     data.links.lock().expect("poisoned").insert(user_id, sender);
     spawn_receiver(user_id, receiver, data.signal_tx.clone());
 
-    // Store PIN for pairing exchange
-    data.pending_pins.lock().expect("poisoned").insert(
-        pin.clone(),
-        (topic, user_id, std::time::Instant::now()),
-    );
+    // Store PIN for pairing exchange (expire old PINs first)
+    {
+        let mut pins = data.pending_pins.lock().expect("poisoned");
+        pins.retain(|_, (_, _, created)| created.elapsed() < Duration::from_secs(600));
+        pins.insert(pin.clone(), (topic, user_id, std::time::Instant::now()));
+    }
 
-    // Persist the link
+    // Persist the link (don't store bot's own secret key — it's in BotLinkStore)
     let link_state = LinkState::new(
         topic,
-        &data.signal_node.endpoint.secret_key(),
+        &iroh::SecretKey::from_bytes(&[0u8; 32]), // placeholder — bot key is in BotLinkStore
         data.signal_node.endpoint.id(),
     );
     {

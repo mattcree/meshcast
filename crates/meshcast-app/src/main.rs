@@ -171,6 +171,7 @@ fn main() -> Result<()> {
                 visible: true,
                 quit: false,
                 frame_count: 0,
+                last_saved_config: None,
                 _tray: tray,
             }))
         }),
@@ -187,6 +188,7 @@ struct MeshcastApp {
     visible: bool,
     quit: bool,
     frame_count: u32,
+    last_saved_config: Option<String>, // serialized config for change detection
     _tray: Option<tray_icon::TrayIcon>,
 }
 
@@ -378,8 +380,10 @@ impl eframe::App for MeshcastApp {
                 ui.add_space(4.0);
                 ui.checkbox(&mut s.config.audio.enabled, "Audio capture");
 
-                // Save config whenever settings are shown
-                {
+                // Save config only when changed
+                let config_fingerprint = format!("{:?}", s.config);
+                if self.last_saved_config.as_ref() != Some(&config_fingerprint) {
+                    self.last_saved_config = Some(config_fingerprint);
                     let config_snapshot = s.config.clone();
                     if let Ok(rt) = tokio::runtime::Handle::try_current() {
                         rt.spawn(async move {
@@ -545,8 +549,11 @@ async fn daemon_loop(
                                     if let Some(ref s) = sender {
                                         let _ = s.broadcast_neighbors(Signal::StreamStopped.encode()?).await;
                                     }
-                                    state.lock().expect("poisoned").is_streaming = false;
-                                    state.lock().expect("poisoned").status_msg = "Stream stopped.".into();
+                                    {
+                                        let mut s = state.lock().expect("poisoned");
+                                        s.is_streaming = false;
+                                        s.status_msg = "Stream stopped.".into();
+                                    }
                                 }
                             }
                             Ok(Signal::WatchStream { ticket }) => {
@@ -614,8 +621,11 @@ async fn daemon_loop(
                             if let Some(ref s) = sender {
                                 let _ = s.broadcast_neighbors(Signal::StreamStopped.encode()?).await;
                             }
-                            state.lock().expect("poisoned").is_streaming = false;
-                            state.lock().expect("poisoned").status_msg = "Stream stopped.".into();
+                            {
+                                let mut st = state.lock().expect("poisoned");
+                                st.is_streaming = false;
+                                st.status_msg = "Stream stopped.".into();
+                            }
                         }
                     }
                     None => break,

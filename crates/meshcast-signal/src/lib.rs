@@ -76,9 +76,15 @@ pub struct PairCode;
 
 impl PairCode {
     /// Generate a 6-digit PIN.
+    /// Generate an 8-character alphanumeric PIN (36^8 = ~2.8 trillion possibilities).
     pub fn generate_pin() -> String {
-        let n: u32 = rand::random::<u32>() % 1_000_000;
-        format!("{n:06}")
+        const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I confusion
+        (0..8)
+            .map(|_| {
+                let idx = rand::random::<usize>() % CHARSET.len();
+                CHARSET[idx] as char
+            })
+            .collect()
     }
 
     /// Encode a full pairing code from bot endpoint ID + PIN.
@@ -99,8 +105,8 @@ impl PairCode {
     pub fn parse(input: &str) -> Result<(Option<EndpointId>, String)> {
         let input = input.trim().to_uppercase();
 
-        // Check if it's just a 6-digit PIN
-        if input.len() == 6 && input.chars().all(|c| c.is_ascii_digit()) {
+        // Check if it's just a PIN (8 alphanumeric chars, or legacy 6-digit)
+        if (input.len() == 8 || input.len() == 6) && !input.contains('-') {
             return Ok((None, input));
         }
 
@@ -110,10 +116,10 @@ impl PairCode {
             anyhow::bail!("Invalid pairing code format");
         }
 
-        // Last part is the PIN (6 digits)
+        // Last part is the PIN (8 alphanumeric chars)
         let pin = parts.last().unwrap().to_string();
-        if pin.len() != 6 || !pin.chars().all(|c| c.is_ascii_digit()) {
-            anyhow::bail!("Pairing code must end with a 6-digit PIN");
+        if pin.len() < 6 || pin.len() > 8 {
+            anyhow::bail!("Pairing code must end with a PIN (6-8 characters)");
         }
 
         // Everything before the last dash is the base32 endpoint ID
@@ -352,6 +358,11 @@ impl AppConfig {
         }
         let data = toml::to_string_pretty(self)?;
         tokio::fs::write(&path, data).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         Ok(())
     }
 

@@ -79,6 +79,14 @@ mkdir -p "$BIN_DIR"
 cp target/release/meshcast-bot "$BIN_DIR/meshcast-bot"
 echo ">>> Installed meshcast-bot to $BIN_DIR/meshcast-bot"
 
+# Store token in a credential file (not in the unit file)
+CRED_DIR="$HOME/.config/meshcast-bot"
+CRED_FILE="$CRED_DIR/discord.env"
+mkdir -p "$CRED_DIR"
+echo "DISCORD_TOKEN=${DISCORD_TOKEN}" > "$CRED_FILE"
+chmod 600 "$CRED_FILE"
+echo ">>> Stored Discord token in $CRED_FILE (mode 600)"
+
 # Create systemd user service
 mkdir -p "$SERVICE_DIR"
 cat > "$SERVICE_DIR/meshcast-bot.service" << EOF
@@ -89,7 +97,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=DISCORD_TOKEN=${DISCORD_TOKEN}
+EnvironmentFile=${CRED_FILE}
 ExecStart=${BIN_DIR}/meshcast-bot
 Restart=on-failure
 RestartSec=10
