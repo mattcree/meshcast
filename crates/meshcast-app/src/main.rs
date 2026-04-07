@@ -114,9 +114,9 @@ fn main() -> Result<()> {
         is_linked: config.link.is_some(),
         config: config.clone(),
         status_msg: if config.link.is_some() {
-            "Linked. Connecting to bot...".into()
+            String::new()
         } else {
-            "Not linked. Paste a link token to connect.".into()
+            String::new()
         },
         ..Default::default()
     }));
@@ -145,7 +145,21 @@ fn main() -> Result<()> {
     eframe::run_native(
         "Meshcast",
         native_options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            // Dark theme with blurple accent
+            let mut visuals = egui::Visuals::dark();
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(30, 31, 34); // Discord dark
+            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(43, 45, 49);
+            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(53, 55, 60);
+            visuals.widgets.active.bg_fill = egui::Color32::from_rgb(88, 101, 242); // Blurple
+            visuals.window_fill = egui::Color32::from_rgb(30, 31, 34);
+            visuals.panel_fill = egui::Color32::from_rgb(30, 31, 34);
+            visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
+            visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+            visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+            visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
+            cc.egui_ctx.set_visuals(visuals);
+
             // Create tray icon
             let tray = create_tray_icon();
 
@@ -155,6 +169,7 @@ fn main() -> Result<()> {
                 cmd_tx,
                 visible: true,
                 quit: false,
+                frame_count: 0,
                 _tray: tray,
             }))
         }),
@@ -170,19 +185,31 @@ struct MeshcastApp {
     cmd_tx: mpsc::UnboundedSender<DaemonCmd>,
     visible: bool,
     quit: bool,
+    frame_count: u32,
     _tray: Option<tray_icon::TrayIcon>,
 }
 
 impl eframe::App for MeshcastApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame_count = self.frame_count.saturating_add(1);
+
         // Handle quit flag from UI button or tray menu
-        if self.quit {
+        if self.quit && self.frame_count > 10 {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
 
-        // Handle window close → minimize to tray instead of quitting
-        if ctx.input(|i| i.viewport().close_requested()) && !self.quit {
+        // Consume any stale close events from previous instance
+        if self.frame_count <= 10 {
+            if ctx.input(|i| i.viewport().close_requested()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+            // Don't process quit button clicks in early frames
+            self.quit = false;
+        }
+
+        // Handle window close → minimize instead of quitting
+        if self.frame_count > 10 && ctx.input(|i| i.viewport().close_requested()) && !self.quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             self.visible = false;
@@ -248,92 +275,143 @@ impl eframe::App for MeshcastApp {
         // Request periodic repaint for status updates
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let blurple = egui::Color32::from_rgb(88, 101, 242);
+        let panel_frame = egui::Frame::new()
+            .fill(egui::Color32::from_rgb(30, 31, 34))
+            .inner_margin(egui::Margin::same(16));
+
+        egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
             let s = self.state.lock().expect("poisoned");
 
-            ui.heading("Meshcast");
-            ui.separator();
-
-            // Status
+            // Header bar
             ui.horizontal(|ui| {
-                let (color, label) = if s.is_streaming {
-                    (egui::Color32::RED, "LIVE")
-                } else if s.is_connected {
-                    (egui::Color32::GREEN, "Connected")
-                } else if s.is_linked {
-                    (egui::Color32::YELLOW, "Linked (offline)")
-                } else {
-                    (egui::Color32::GRAY, "Not linked")
-                };
-                ui.colored_label(color, format!("● {label}"));
+                ui.heading(egui::RichText::new("Meshcast").color(egui::Color32::WHITE).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Quit").clicked() {
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new("Quit").color(egui::Color32::from_rgb(200, 200, 200))
+                    ).fill(egui::Color32::from_rgb(55, 57, 63))).clicked() {
                         self.quit = true;
                     }
                 });
             });
-            ui.label(&s.status_msg);
+            ui.add_space(4.0);
+
+            // Status pill
+            let (color, label) = if s.is_streaming {
+                (egui::Color32::from_rgb(237, 66, 69), "LIVE")
+            } else if s.is_connected {
+                (egui::Color32::from_rgb(87, 242, 135), "Connected")
+            } else if s.is_linked {
+                (egui::Color32::from_rgb(254, 231, 92), "Offline")
+            } else {
+                (egui::Color32::from_rgb(128, 132, 142), "Not linked")
+            };
+            ui.horizontal(|ui| {
+                ui.colored_label(color, egui::RichText::new(format!("● {label}")).strong());
+                ui.label(
+                    egui::RichText::new(&s.status_msg)
+                        .color(egui::Color32::from_rgb(148, 155, 164)),
+                );
+            });
+
+            ui.add_space(12.0);
+            ui.separator();
             ui.add_space(8.0);
 
             // Link section
             if !s.is_linked {
-                ui.group(|ui| {
-                    ui.label("Enter pairing code from Discord /link command:");
-                    drop(s); // release lock for mutable access
-                    let mut s = self.state.lock().expect("poisoned");
-                    let response = ui.text_edit_singleline(&mut s.link_token_input);
-                    if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                        || ui.button("Link").clicked()
-                    {
-                        let token = s.link_token_input.clone();
-                        if !token.is_empty() {
-                            let _ = self.cmd_tx.send(DaemonCmd::Link { token });
-                            s.link_token_input.clear();
-                            s.status_msg = "Linking...".into();
-                        }
+                ui.label(egui::RichText::new("Get Started").color(egui::Color32::WHITE).heading());
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("Type /link in Discord, then paste the code below:")
+                        .color(egui::Color32::from_rgb(148, 155, 164)),
+                );
+                ui.add_space(8.0);
+                drop(s);
+                let mut s = self.state.lock().expect("poisoned");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut s.link_token_input)
+                        .hint_text("Paste pairing code...")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(4.0);
+                let link_clicked = ui.add_sized(
+                    [ui.available_width(), 32.0],
+                    egui::Button::new(egui::RichText::new("Connect").color(egui::Color32::WHITE))
+                        .fill(blurple),
+                ).clicked();
+                if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    || link_clicked
+                {
+                    let token = s.link_token_input.clone();
+                    if !token.is_empty() {
+                        let _ = self.cmd_tx.send(DaemonCmd::Link { token });
+                        s.link_token_input.clear();
+                        s.status_msg = "Connecting...".into();
                     }
-                });
+                }
             } else {
-                // Config section
-                ui.group(|ui| {
-                    ui.label("Video Quality");
-                    drop(s);
-                    let mut s = self.state.lock().expect("poisoned");
-                    egui::ComboBox::from_label("")
+                // Settings
+                ui.label(egui::RichText::new("Stream Settings").color(egui::Color32::WHITE).heading());
+                ui.add_space(8.0);
+
+                drop(s);
+                let mut s = self.state.lock().expect("poisoned");
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Quality").color(egui::Color32::from_rgb(185, 187, 190)));
+                    egui::ComboBox::from_id_salt("quality")
                         .selected_text(&s.config.video.quality)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut s.config.video.quality, "360p".into(), "360p");
                             ui.selectable_value(&mut s.config.video.quality, "720p".into(), "720p");
-                            ui.selectable_value(
-                                &mut s.config.video.quality,
-                                "1080p".into(),
-                                "1080p",
-                            );
+                            ui.selectable_value(&mut s.config.video.quality, "1080p".into(), "1080p");
                         });
 
-                    ui.horizontal(|ui| {
-                        ui.label("FPS:");
-                        ui.selectable_value(&mut s.config.video.fps, 30, "30");
-                        ui.selectable_value(&mut s.config.video.fps, 60, "60");
-                    });
-
-                    ui.checkbox(&mut s.config.audio.enabled, "Audio capture");
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new("FPS").color(egui::Color32::from_rgb(185, 187, 190)));
+                    ui.selectable_value(&mut s.config.video.fps, 30, "30");
+                    ui.selectable_value(&mut s.config.video.fps, 60, "60");
                 });
 
-                let s = self.state.lock().expect("poisoned");
                 ui.add_space(4.0);
+                ui.checkbox(&mut s.config.audio.enabled, "Audio capture");
 
-                // Stream controls
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                // Stream status
                 if s.is_streaming {
                     let vc = s.viewer_count;
-                    ui.label(format!(
-                        "{vc} viewer{}",
-                        if vc == 1 { "" } else { "s" }
-                    ));
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(237, 66, 69),
+                            egui::RichText::new("● LIVE").strong(),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{vc} viewer{}",
+                                if vc == 1 { "" } else { "s" }
+                            ))
+                            .color(egui::Color32::from_rgb(148, 155, 164)),
+                        );
+                    });
+                    ui.add_space(4.0);
                     drop(s);
-                    if ui.button("Stop Stream").clicked() {
+                    if ui.add_sized(
+                        [ui.available_width(), 32.0],
+                        egui::Button::new(egui::RichText::new("Stop Stream").color(egui::Color32::WHITE))
+                            .fill(egui::Color32::from_rgb(237, 66, 69)),
+                    ).clicked() {
                         let _ = self.cmd_tx.send(DaemonCmd::StopStream);
                     }
+                } else {
+                    drop(s);
+                    ui.label(
+                        egui::RichText::new("Use /stream in Discord to start, or watch via the Watch button.")
+                            .color(egui::Color32::from_rgb(148, 155, 164)),
+                    );
                 }
             }
         });
