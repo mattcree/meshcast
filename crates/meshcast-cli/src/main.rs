@@ -213,6 +213,7 @@ async fn cmd_daemon() -> Result<()> {
     println!("Press Ctrl+C to stop.\n");
 
     let mut live: Option<(Live, LocalBroadcast)> = None;
+    let expected_peer = state.peer_endpoint_id();
 
     loop {
         tokio::select! {
@@ -228,6 +229,14 @@ async fn cmd_daemon() -> Result<()> {
 
                 match event {
                     Event::Received(msg) => {
+                        // Verify sender identity
+                        if msg.delivered_from != expected_peer {
+                            tracing::warn!(
+                                "Rejected message from unknown peer {}",
+                                msg.delivered_from.fmt_short()
+                            );
+                            continue;
+                        }
                         tracing::info!("Received gossip message ({} bytes)", msg.content.len());
                         match Signal::decode(&msg.content) {
                             Ok(Signal::StartStream { title }) => {

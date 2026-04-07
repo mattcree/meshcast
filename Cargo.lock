@@ -3432,7 +3432,7 @@ dependencies = [
 [[package]]
 name = "iroh-gossip"
 version = "0.97.0"
-source = "git+https://github.com/n0-computer/iroh-gossip?branch=deps%2Firoh-main#1038f721663ffddc526359e33757ba998046ff2d"
+source = "git+https://github.com/n0-computer/iroh-gossip?rev=1038f721663ffddc526359e33757ba998046ff2d#1038f721663ffddc526359e33757ba998046ff2d"
 dependencies = [
  "blake3",
  "bytes",
@@ -3461,7 +3461,7 @@ dependencies = [
 [[package]]
 name = "iroh-live"
 version = "0.1.0"
-source = "git+https://github.com/n0-computer/iroh-live?branch=main#edd9bcc530a615f3ab3a6919e96790a077905376"
+source = "git+https://github.com/n0-computer/iroh-live?rev=edd9bcc530a615f3ab3a6919e96790a077905376#edd9bcc530a615f3ab3a6919e96790a077905376"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3519,7 +3519,7 @@ dependencies = [
 [[package]]
 name = "iroh-moq"
 version = "0.1.0"
-source = "git+https://github.com/n0-computer/iroh-live?branch=main#edd9bcc530a615f3ab3a6919e96790a077905376"
+source = "git+https://github.com/n0-computer/iroh-live?rev=edd9bcc530a615f3ab3a6919e96790a077905376#edd9bcc530a615f3ab3a6919e96790a077905376"
 dependencies = [
  "iroh",
  "moq-lite",
@@ -4232,7 +4232,7 @@ dependencies = [
 [[package]]
 name = "moq-media"
 version = "0.1.0"
-source = "git+https://github.com/n0-computer/iroh-live?branch=main#edd9bcc530a615f3ab3a6919e96790a077905376"
+source = "git+https://github.com/n0-computer/iroh-live?rev=edd9bcc530a615f3ab3a6919e96790a077905376#edd9bcc530a615f3ab3a6919e96790a077905376"
 dependencies = [
  "anyhow",
  "audioadapter-buffers",
@@ -4263,7 +4263,7 @@ dependencies = [
 [[package]]
 name = "moq-media-egui"
 version = "0.1.0"
-source = "git+https://github.com/n0-computer/iroh-live?branch=main#edd9bcc530a615f3ab3a6919e96790a077905376"
+source = "git+https://github.com/n0-computer/iroh-live?rev=edd9bcc530a615f3ab3a6919e96790a077905376#edd9bcc530a615f3ab3a6919e96790a077905376"
 dependencies = [
  "anyhow",
  "egui",
@@ -4582,7 +4582,7 @@ dependencies = [
 [[package]]
 name = "noq"
 version = "0.17.0"
-source = "git+https://github.com/n0-computer/noq?branch=main#93f421632b9bc61525e1d7559d51d40d77cc5149"
+source = "git+https://github.com/n0-computer/noq?rev=93f421632b9bc61525e1d7559d51d40d77cc5149#93f421632b9bc61525e1d7559d51d40d77cc5149"
 dependencies = [
  "bytes",
  "cfg_aliases 0.2.1",
@@ -4603,7 +4603,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "0.16.0"
-source = "git+https://github.com/n0-computer/noq?branch=main#93f421632b9bc61525e1d7559d51d40d77cc5149"
+source = "git+https://github.com/n0-computer/noq?rev=93f421632b9bc61525e1d7559d51d40d77cc5149#93f421632b9bc61525e1d7559d51d40d77cc5149"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",
@@ -4629,7 +4629,7 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "0.9.0"
-source = "git+https://github.com/n0-computer/noq?branch=main#93f421632b9bc61525e1d7559d51d40d77cc5149"
+source = "git+https://github.com/n0-computer/noq?rev=93f421632b9bc61525e1d7559d51d40d77cc5149#93f421632b9bc61525e1d7559d51d40d77cc5149"
 dependencies = [
  "cfg_aliases 0.2.1",
  "libc",
@@ -6528,7 +6528,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 [[package]]
 name = "rusty-capture"
 version = "0.1.0"
-source = "git+https://github.com/n0-computer/iroh-live?branch=main#edd9bcc530a615f3ab3a6919e96790a077905376"
+source = "git+https://github.com/n0-computer/iroh-live?rev=edd9bcc530a615f3ab3a6919e96790a077905376#edd9bcc530a615f3ab3a6919e96790a077905376"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -6557,7 +6557,7 @@ dependencies = [
 [[package]]
 name = "rusty-codecs"
 version = "0.1.0"
-source = "git+https://github.com/n0-computer/iroh-live?branch=main#edd9bcc530a615f3ab3a6919e96790a077905376"
+source = "git+https://github.com/n0-computer/iroh-live?rev=edd9bcc530a615f3ab3a6919e96790a077905376#edd9bcc530a615f3ab3a6919e96790a077905376"
 dependencies = [
  "anyhow",
  "ash",
@@ -8582,7 +8582,7 @@ dependencies = [
 [[package]]
 name = "web-transport-iroh"
 version = "0.2.2"
-source = "git+https://github.com/Frando/web-transport?branch=deps%2Firoh-main#39fafa6ffddeda60b2726d9af98e8cc251bb3f51"
+source = "git+https://github.com/Frando/web-transport?rev=39fafa6ffddeda60b2726d9af98e8cc251bb3f51#39fafa6ffddeda60b2726d9af98e8cc251bb3f51"
 dependencies = [
  "bytes",
  "http",
@@ -8599,7 +8599,7 @@ dependencies = [
 [[package]]
 name = "web-transport-proto"
 version = "0.6.0"
-source = "git+https://github.com/Frando/web-transport?branch=deps%2Firoh-main#39fafa6ffddeda60b2726d9af98e8cc251bb3f51"
+source = "git+https://github.com/Frando/web-transport?rev=39fafa6ffddeda60b2726d9af98e8cc251bb3f51#39fafa6ffddeda60b2726d9af98e8cc251bb3f51"
 dependencies = [
  "bytes",
  "http",
@@ -8612,7 +8612,7 @@ dependencies = [
 [[package]]
 name = "web-transport-trait"
 version = "0.3.4"
-source = "git+https://github.com/Frando/web-transport?branch=deps%2Firoh-main#39fafa6ffddeda60b2726d9af98e8cc251bb3f51"
+source = "git+https://github.com/Frando/web-transport?rev=39fafa6ffddeda60b2726d9af98e8cc251bb3f51#39fafa6ffddeda60b2726d9af98e8cc251bb3f51"
 dependencies = [
  "bytes",
 ]
@@ -9830,4 +9830,4 @@ dependencies = [
 [[patch.unused]]
 name = "web-transport-noq"
 version = "0.0.3"
-source = "git+https://github.com/Frando/web-transport?branch=deps%2Firoh-main#39fafa6ffddeda60b2726d9af98e8cc251bb3f51"
+source = "git+https://github.com/Frando/web-transport?rev=39fafa6ffddeda60b2726d9af98e8cc251bb3f51#39fafa6ffddeda60b2726d9af98e8cc251bb3f51"

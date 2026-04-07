@@ -10,7 +10,7 @@ bytes = "1"
 data-encoding = "2"
 dirs-next = "2"
 iroh = { git = "https://github.com/n0-computer/iroh", rev = "8af8370b567d9e9a89aaf25929b327a6a5b96de1" }
-iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", branch = "deps/iroh-main" }
+iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", rev = "1038f721663ffddc526359e33757ba998046ff2d" }
 postcard = { version = "1", features = ["alloc"] }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

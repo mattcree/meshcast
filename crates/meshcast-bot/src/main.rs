@@ -119,17 +119,13 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Start or stop a stream. If linked, signals your desktop app automatically.
+/// Start a stream. If linked, signals your desktop app automatically.
 #[poise::command(slash_command)]
 async fn stream(
     ctx: Context<'_>,
     #[description = "Stream title"] title: Option<String>,
     #[description = "iroh-live ticket (not needed if linked)"] ticket: Option<String>,
-    #[description = "Stop the active stream"] stop: Option<bool>,
 ) -> Result<(), Error> {
-    if stop.unwrap_or(false) {
-        return handle_stop(ctx).await;
-    }
 
     let user = ctx.author();
     let user_id = user.id;
@@ -232,63 +228,6 @@ async fn stream(
     Ok(())
 }
 
-async fn handle_stop(ctx: Context<'_>) -> Result<(), Error> {
-    let user_id = ctx.author().id;
-    let channel_id = ctx.channel_id();
-
-    let sender = ctx.data().links.lock().expect("poisoned").get(&user_id).cloned();
-    if let Some(sender) = sender {
-        let _ = sender
-            .broadcast_neighbors(Signal::StopStream.encode()?)
-            .await;
-    }
-
-    let entry = ctx
-        .data()
-        .active_streams
-        .lock()
-        .expect("poisoned")
-        .remove(&channel_id);
-    ctx.data().viewers.lock().expect("poisoned").remove(&channel_id);
-
-    let (message_id, _, _, stream_title) = match entry {
-        Some(e) => e,
-        None => {
-            ctx.say("No active stream in this channel.").await?;
-            return Ok(());
-        }
-    };
-
-    let mut message = ctx
-        .http()
-        .get_message(channel_id, message_id)
-        .await
-        .context("Failed to fetch stream message")?;
-
-    let display_name = ctx.author().global_name.as_deref().unwrap_or(&ctx.author().name);
-    let avatar_url = ctx.author().avatar_url().unwrap_or_default();
-
-    let ended_embed = CreateEmbed::new()
-        .title(stream_title)
-        .description("This stream has ended.")
-        .color(0x99AAB5)
-        .author(CreateEmbedAuthor::new(display_name).icon_url(&avatar_url))
-        .footer(serenity::all::CreateEmbedFooter::new("Stream ended"))
-        .timestamp(serenity::model::Timestamp::now());
-
-    message
-        .edit(
-            ctx.http(),
-            serenity::all::EditMessage::new()
-                .embed(ended_embed)
-                .components(vec![]),
-        )
-        .await
-        .context("Failed to edit stream message")?;
-
-    ctx.say("Stream stopped.").await?;
-    Ok(())
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

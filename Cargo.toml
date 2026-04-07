@@ -7,14 +7,14 @@ edition = "2021"
 license = "MIT"
 
 [patch.crates-io]
-noq = { git = "https://github.com/n0-computer/noq", branch = "main" }
-noq-proto = { git = "https://github.com/n0-computer/noq", branch = "main" }
-noq-udp = { git = "https://github.com/n0-computer/noq", branch = "main" }
+noq = { git = "https://github.com/n0-computer/noq", rev = "93f421632b9bc61525e1d7559d51d40d77cc5149" }
+noq-proto = { git = "https://github.com/n0-computer/noq", rev = "93f421632b9bc61525e1d7559d51d40d77cc5149" }
+noq-udp = { git = "https://github.com/n0-computer/noq", rev = "93f421632b9bc61525e1d7559d51d40d77cc5149" }
 iroh = { git = "https://github.com/n0-computer/iroh", rev = "8af8370b567d9e9a89aaf25929b327a6a5b96de1" }
 iroh-base = { git = "https://github.com/n0-computer/iroh", rev = "8af8370b567d9e9a89aaf25929b327a6a5b96de1" }
 iroh-relay = { git = "https://github.com/n0-computer/iroh", rev = "8af8370b567d9e9a89aaf25929b327a6a5b96de1" }
-iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", branch = "deps/iroh-main" }
-web-transport-iroh = { git = "https://github.com/Frando/web-transport", branch = "deps/iroh-main" }
-web-transport-noq = { git = "https://github.com/Frando/web-transport", branch = "deps/iroh-main" }
-web-transport-proto = { git = "https://github.com/Frando/web-transport", branch = "deps/iroh-main" }
-web-transport-trait = { git = "https://github.com/Frando/web-transport", branch = "deps/iroh-main" }
+iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", rev = "1038f721663ffddc526359e33757ba998046ff2d" }
+web-transport-iroh = { git = "https://github.com/Frando/web-transport", rev = "39fafa6ffddeda60b2726d9af98e8cc251bb3f51" }
+web-transport-noq = { git = "https://github.com/Frando/web-transport", rev = "39fafa6ffddeda60b2726d9af98e8cc251bb3f51" }
+web-transport-proto = { git = "https://github.com/Frando/web-transport", rev = "39fafa6ffddeda60b2726d9af98e8cc251bb3f51" }
+web-transport-trait = { git = "https://github.com/Frando/web-transport", rev = "39fafa6ffddeda60b2726d9af98e8cc251bb3f51" }

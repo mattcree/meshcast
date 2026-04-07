@@ -67,11 +67,14 @@ enum UiEvent {
 enum DaemonCmd {
     Link { token: String },
     StopStream,
+    ApproveStream,
+    RejectStream,
 }
 
 /// Shared state between UI and background tasks.
 struct AppState {
     config: AppConfig,
+    pending_stream_title: Option<String>, // waiting for user consent
     is_linked: bool,
     is_connected: bool,
     is_streaming: bool,
@@ -89,6 +92,7 @@ impl Default for AppState {
             is_connected: false,
             is_streaming: false,
             viewer_count: 0,
+            pending_stream_title: None,
             stream_ticket: None,
             status_msg: "Starting...".into(),
             link_token_input: String::new(),
@@ -252,7 +256,14 @@ impl eframe::App for MeshcastApp {
                     s.status_msg = "Disconnected from bot.".into();
                 }
                 UiEvent::StreamRequested { title } => {
-                    s.status_msg = format!("Starting stream: {title}...");
+                    s.pending_stream_title = Some(title);
+                    s.status_msg = "Stream requested — approve below.".into();
+                    // Show and focus the window so user sees the consent dialog
+                    drop(s);
+                    self.visible = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    continue; // skip re-acquiring lock below
                 }
                 UiEvent::StreamStarted { ticket } => {
                     s.is_streaming = true;
@@ -396,6 +407,46 @@ impl eframe::App for MeshcastApp {
                 ui.separator();
                 ui.add_space(8.0);
 
+                // Consent dialog for incoming stream request
+                if let Some(title) = s.pending_stream_title.clone() {
+                    ui.group(|ui| {
+                        ui.label(
+                            egui::RichText::new("Stream Request")
+                                .color(egui::Color32::from_rgb(254, 231, 92))
+                                .heading(),
+                        );
+                        ui.label(format!("Discord wants to start: \"{title}\""));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            drop(s);
+                            let approve = ui.add_sized(
+                                [120.0, 32.0],
+                                egui::Button::new(
+                                    egui::RichText::new("Share Screen").color(egui::Color32::WHITE),
+                                )
+                                .fill(blurple),
+                            ).clicked();
+                            let reject = ui.add_sized(
+                                [120.0, 32.0],
+                                egui::Button::new("Decline")
+                                    .fill(egui::Color32::from_rgb(55, 57, 63)),
+                            ).clicked();
+
+                            if approve {
+                                let _ = self.cmd_tx.send(DaemonCmd::ApproveStream);
+                                self.state.lock().expect("poisoned").pending_stream_title = None;
+                            }
+                            if reject {
+                                let _ = self.cmd_tx.send(DaemonCmd::RejectStream);
+                                let mut st = self.state.lock().expect("poisoned");
+                                st.pending_stream_title = None;
+                                st.status_msg = "Stream declined.".into();
+                            }
+                        });
+                    });
+                    return; // don't show settings while consent is pending
+                }
+
                 // Stream status
                 if s.is_streaming {
                     let vc = s.viewer_count;
@@ -497,6 +548,10 @@ async fn daemon_loop(
     };
 
     let mut live: Option<(Live, LocalBroadcast)> = None;
+    let mut pending_stream: Option<String> = None; // title waiting for consent
+    let mut active_viewers: u32 = 0;
+    const MAX_VIEWERS: u32 = 5;
+    let expected_peer = link_state.as_ref().map(|ls| ls.peer_endpoint_id());
 
     loop {
         tokio::select! {
@@ -519,28 +574,24 @@ async fn daemon_loop(
 
                 match event {
                     Event::Received(msg) => {
+                        // Verify sender identity
+                        if let Some(ref expected) = expected_peer {
+                            if msg.delivered_from != *expected {
+                                tracing::warn!(
+                                    "Rejected message from unknown peer {}",
+                                    msg.delivered_from.fmt_short()
+                                );
+                                continue;
+                            }
+                        }
+
                         tracing::info!("Received gossip message");
                         match Signal::decode(&msg.content) {
                             Ok(Signal::StartStream { title }) => {
-                                tracing::info!("Start stream: {title}");
+                                tracing::info!("Start stream requested: {title}");
+                                // Don't capture immediately — ask for user consent
+                                pending_stream = Some(title.clone());
                                 let _ = ui_tx.send(UiEvent::StreamRequested { title });
-
-                                let cfg = state.lock().expect("poisoned").config.clone();
-                                match start_stream("meshcast".into(), &cfg.video.quality, cfg.video.fps).await {
-                                    Ok((l, bc, ticket)) => {
-                                        tracing::info!("Streaming: {ticket}");
-                                        if let Some(ref s) = sender {
-                                            let sig = Signal::StreamReady { ticket: ticket.clone() };
-                                            let _ = s.broadcast_neighbors(sig.encode()?).await;
-                                        }
-                                        let _ = ui_tx.send(UiEvent::StreamStarted { ticket });
-                                        live = Some((l, bc));
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Failed to start stream: {e}");
-                                        let _ = ui_tx.send(UiEvent::StreamFailed { error: e.to_string() });
-                                    }
-                                }
                             }
                             Ok(Signal::StopStream) => {
                                 tracing::info!("Stop stream");
@@ -557,15 +608,22 @@ async fn daemon_loop(
                                 }
                             }
                             Ok(Signal::WatchStream { ticket }) => {
-                                tracing::info!("Watch: {ticket}");
-                                let _ = ui_tx.send(UiEvent::WatchRequested);
-                                let exe = std::env::current_exe().unwrap_or_else(|_| "meshcast".into());
-                                let meshcast_cli = exe.parent()
-                                    .map(|p| p.join("meshcast"))
-                                    .unwrap_or_else(|| "meshcast".into());
-                                match meshcast_signal::launch_viewer(&meshcast_cli, &ticket) {
-                                    Ok(_) => tracing::info!("Viewer launched"),
-                                    Err(e) => tracing::error!("Failed to launch viewer: {e}"),
+                                if active_viewers >= MAX_VIEWERS {
+                                    tracing::warn!("Viewer limit reached ({MAX_VIEWERS}), ignoring WatchStream");
+                                } else {
+                                    tracing::info!("Watch: {ticket}");
+                                    let _ = ui_tx.send(UiEvent::WatchRequested);
+                                    let exe = std::env::current_exe().unwrap_or_else(|_| "meshcast".into());
+                                    let meshcast_cli = exe.parent()
+                                        .map(|p| p.join("meshcast"))
+                                        .unwrap_or_else(|| "meshcast".into());
+                                    match meshcast_signal::launch_viewer(&meshcast_cli, &ticket) {
+                                        Ok(_) => {
+                                            active_viewers += 1;
+                                            tracing::info!("Viewer launched ({active_viewers}/{MAX_VIEWERS})");
+                                        }
+                                        Err(e) => tracing::error!("Failed to launch viewer: {e}"),
+                                    }
                                 }
                             }
                             Ok(Signal::ViewerUpdate { count }) => {
@@ -607,6 +665,30 @@ async fn daemon_loop(
                                 state.lock().expect("poisoned").status_msg = format!("Link failed: {e}");
                             }
                         }
+                    }
+                    Some(DaemonCmd::ApproveStream) => {
+                        if let Some(_title) = pending_stream.take() {
+                            let cfg = state.lock().expect("poisoned").config.clone();
+                            match start_stream("meshcast".into(), &cfg.video.quality, cfg.video.fps).await {
+                                Ok((l, bc, ticket)) => {
+                                    tracing::info!("Streaming: {ticket}");
+                                    if let Some(ref s) = sender {
+                                        let sig = Signal::StreamReady { ticket: ticket.clone() };
+                                        let _ = s.broadcast_neighbors(sig.encode()?).await;
+                                    }
+                                    let _ = ui_tx.send(UiEvent::StreamStarted { ticket });
+                                    live = Some((l, bc));
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to start stream: {e}");
+                                    let _ = ui_tx.send(UiEvent::StreamFailed { error: e.to_string() });
+                                }
+                            }
+                        }
+                    }
+                    Some(DaemonCmd::RejectStream) => {
+                        pending_stream = None;
+                        tracing::info!("Stream request declined by user");
                     }
                     Some(DaemonCmd::StopStream) => {
                         if let Some((l, _bc)) = live.take() {
