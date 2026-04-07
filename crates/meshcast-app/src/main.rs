@@ -145,9 +145,34 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    // Initialize GTK on Linux (required for tray-icon)
+    // Spawn tray icon as a Python subprocess (GTK requires main thread, conflicts with winit)
     #[cfg(target_os = "linux")]
-    gtk::init().ok();
+    std::process::Command::new("python3")
+        .args(["-c", r#"
+import gi, os, signal
+gi.require_version("Gtk", "3.0")
+gi.require_version("AppIndicator3", "0.1")
+from gi.repository import Gtk, AppIndicator3
+ind = AppIndicator3.Indicator.new("meshcast", "dialog-information", AppIndicator3.IndicatorCategory.APPLICATION_STATUS)
+ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+menu = Gtk.Menu()
+show = Gtk.MenuItem(label="Show Meshcast")
+stop = Gtk.MenuItem(label="Stop Stream")
+quit_item = Gtk.MenuItem(label="Quit Meshcast")
+quit_item.connect("activate", lambda _: os.kill(os.getppid(), signal.SIGUSR1))
+menu.append(show)
+menu.append(stop)
+menu.append(Gtk.SeparatorMenuItem())
+menu.append(quit_item)
+menu.show_all()
+ind.set_menu(menu)
+Gtk.main()
+"#])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok();
 
     eframe::run_native(
         "Meshcast",
@@ -168,7 +193,11 @@ fn main() -> Result<()> {
             cc.egui_ctx.set_visuals(visuals);
 
             // Create tray icon
+            // Tray icon on Linux handled by Python subprocess above
+            #[cfg(not(target_os = "linux"))]
             let tray = create_tray_icon();
+            #[cfg(target_os = "linux")]
+            let tray: Option<tray_icon::TrayIcon> = None;
 
             Ok(Box::new(MeshcastApp {
                 state,
