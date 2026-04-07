@@ -54,7 +54,7 @@ fn create_tray_icon() -> Option<tray_icon::TrayIcon> {
 enum UiEvent {
     Connected,
     Disconnected,
-    StreamRequested { title: String },
+    StreamRequested { title: String, server: String },
     StreamStarted { ticket: String },
     StreamFailed { error: String },
     WatchRequested,
@@ -74,7 +74,8 @@ enum DaemonCmd {
 /// Shared state between UI and background tasks.
 struct AppState {
     config: AppConfig,
-    pending_stream_title: Option<String>, // waiting for user consent
+    pending_stream_title: Option<String>,
+    pending_stream_server: Option<String>,
     is_linked: bool,
     is_connected: bool,
     is_streaming: bool,
@@ -93,6 +94,7 @@ impl Default for AppState {
             is_streaming: false,
             viewer_count: 0,
             pending_stream_title: None,
+            pending_stream_server: None,
             stream_ticket: None,
             status_msg: "Starting...".into(),
             link_token_input: String::new(),
@@ -253,15 +255,16 @@ impl eframe::App for MeshcastApp {
                     s.is_connected = false;
                     s.status_msg = "Disconnected from bot.".into();
                 }
-                UiEvent::StreamRequested { title } => {
+                UiEvent::StreamRequested { title, server } => {
                     s.pending_stream_title = Some(title);
+                    s.pending_stream_server = Some(server);
                     s.status_msg = "Stream requested — approve below.".into();
-                    // Show and focus the window so user sees the consent dialog
+                    // Bring window to foreground
                     drop(s);
                     self.visible = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    continue; // skip re-acquiring lock below
+                    continue;
                 }
                 UiEvent::StreamStarted { ticket } => {
                     s.is_streaming = true;
@@ -412,13 +415,18 @@ impl eframe::App for MeshcastApp {
                 // Consent dialog for incoming stream request
                 let s = self.state.lock().expect("poisoned");
                 if let Some(title) = s.pending_stream_title.clone() {
+                    let server = s.pending_stream_server.clone().unwrap_or_default();
                     ui.group(|ui| {
                         ui.label(
                             egui::RichText::new("Stream Request")
                                 .color(egui::Color32::from_rgb(254, 231, 92))
                                 .heading(),
                         );
-                        ui.label(format!("Discord wants to start: \"{title}\""));
+                        if !server.is_empty() {
+                            ui.label(format!("From **{server}**: \"{title}\""));
+                        } else {
+                            ui.label(format!("\"{title}\""));
+                        }
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             drop(s);
@@ -437,12 +445,15 @@ impl eframe::App for MeshcastApp {
 
                             if approve {
                                 let _ = self.cmd_tx.send(DaemonCmd::ApproveStream);
-                                self.state.lock().expect("poisoned").pending_stream_title = None;
+                                let mut st = self.state.lock().expect("poisoned");
+                                st.pending_stream_title = None;
+                                st.pending_stream_server = None;
                             }
                             if reject {
                                 let _ = self.cmd_tx.send(DaemonCmd::RejectStream);
                                 let mut st = self.state.lock().expect("poisoned");
                                 st.pending_stream_title = None;
+                                st.pending_stream_server = None;
                                 st.status_msg = "Stream declined.".into();
                             }
                         });
@@ -586,8 +597,8 @@ async fn daemon_loop(
 
                         tracing::info!("Received gossip message");
                         match Signal::decode(&msg.content) {
-                            Ok(Signal::StartStream { title, quality, fps }) => {
-                                tracing::info!("Start stream requested: {title} ({quality} {fps}fps)");
+                            Ok(Signal::StartStream { title, quality, fps, server }) => {
+                                tracing::info!("Start stream requested: {title} ({quality} {fps}fps) from {server}");
                                 // Store config from Discord, ask for user consent
                                 {
                                     let mut s = state.lock().expect("poisoned");
@@ -595,7 +606,7 @@ async fn daemon_loop(
                                     s.config.video.fps = fps;
                                 }
                                 pending_stream = Some(title.clone());
-                                let _ = ui_tx.send(UiEvent::StreamRequested { title });
+                                let _ = ui_tx.send(UiEvent::StreamRequested { title, server });
                             }
                             Ok(Signal::StopStream) => {
                                 tracing::info!("Stop stream");
@@ -749,8 +760,8 @@ async fn do_link(
         while let Some(event) = pair_receiver.next().await {
             if let Ok(meshcast_signal::Event::Received(msg)) = event {
                 match meshcast_signal::PairSignal::decode(&msg.content) {
-                    Ok(meshcast_signal::PairSignal::PairAccepted { topic }) => {
-                        return Ok(meshcast_signal::TopicId::from_bytes(topic));
+                    Ok(meshcast_signal::PairSignal::PairAccepted { topic, server_name }) => {
+                        return Ok((meshcast_signal::TopicId::from_bytes(topic), server_name));
                     }
                     Ok(meshcast_signal::PairSignal::PairRejected { reason }) => {
                         return Err(anyhow::anyhow!("Rejected: {reason}"));
@@ -764,12 +775,14 @@ async fn do_link(
     .await
     .map_err(|_| anyhow::anyhow!("Timed out — is the bot running?"))??;
 
+    let (real_topic, server_name) = real_topic;
+
     let link_state = meshcast_signal::LinkState::new(
         real_topic,
         &node.endpoint.secret_key(),
         bot_id,
     );
-    config.add_link(format!("Server {}", bot_id.fmt_short()), LinkConfig::from(link_state));
+    config.add_link(server_name, LinkConfig::from(link_state));
     config.save().await?;
 
     let _ = ui_tx.send(UiEvent::Linked { config: config.clone() });

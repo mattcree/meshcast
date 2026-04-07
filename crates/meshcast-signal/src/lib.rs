@@ -16,7 +16,7 @@ pub use iroh_gossip::proto::TopicId;
 /// Messages exchanged between bot and desktop app over gossip.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Signal {
-    StartStream { title: String, quality: String, fps: u32 },
+    StartStream { title: String, quality: String, fps: u32, server: String },
     StreamReady { ticket: String },
     StopStream,
     StreamStopped,
@@ -168,8 +168,8 @@ pub fn derive_pairing_topic(pin: &str) -> TopicId {
 pub enum PairSignal {
     /// App sends PIN to bot to request pairing.
     PairRequest { pin: String },
-    /// Bot responds with the gossip topic if PIN is valid.
-    PairAccepted { topic: [u8; 32] },
+    /// Bot responds with the gossip topic and server name if PIN is valid.
+    PairAccepted { topic: [u8; 32], server_name: String },
     /// Bot rejects the PIN.
     PairRejected { reason: String },
 }

@@ -195,8 +195,8 @@ async fn cmd_link(input: String) -> Result<()> {
         while let Some(event) = pair_receiver.next().await {
             if let Ok(Event::Received(msg)) = event {
                 match PairSignal::decode(&msg.content) {
-                    Ok(PairSignal::PairAccepted { topic }) => {
-                        return Ok(meshcast_signal::TopicId::from_bytes(topic));
+                    Ok(PairSignal::PairAccepted { topic, server_name }) => {
+                        return Ok((meshcast_signal::TopicId::from_bytes(topic), server_name));
                     }
                     Ok(PairSignal::PairRejected { reason }) => {
                         return Err(anyhow::anyhow!("Rejected: {reason}"));
@@ -210,8 +210,9 @@ async fn cmd_link(input: String) -> Result<()> {
     .await
     .map_err(|_| anyhow::anyhow!("Timed out — is the bot running?"))??;
 
+    let (real_topic, server_name) = real_topic;
     let state = LinkState::new(real_topic, &node.endpoint.secret_key(), bot_id);
-    config.add_link(format!("Server {}", bot_id.fmt_short()), LinkConfig::from(state));
+    config.add_link(server_name, LinkConfig::from(state));
     config.save().await?;
 
     println!("Linked! Run `meshcast daemon` to start listening.");
@@ -264,7 +265,7 @@ async fn cmd_daemon() -> Result<()> {
                         }
                         tracing::info!("Received gossip message ({} bytes)", msg.content.len());
                         match Signal::decode(&msg.content) {
-                            Ok(Signal::StartStream { title, quality: _, fps: _ }) => {
+                            Ok(Signal::StartStream { title, quality: _, fps: _, server: _ }) => {
                                 tracing::info!("Bot requested stream start: {title}");
                                 match start_stream("meshcast".to_string()).await {
                                     Ok((l, bc, ticket)) => {

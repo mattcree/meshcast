@@ -68,6 +68,7 @@ fn spawn_receiver(
 async fn link(ctx: Context<'_>) -> Result<(), Error> {
     let user_id = ctx.author().id;
     let data = ctx.data();
+    let server_name = ctx.guild().map(|g| g.name.clone()).unwrap_or_else(|| "Unknown Server".into());
 
     let real_topic = iroh_gossip::proto::TopicId::from_bytes(rand::random());
     let pin = PairCode::generate_pin();
@@ -129,7 +130,7 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
                                 tracing::info!(user = %uid, "PIN accepted, establishing link");
 
                                 // Send PairAccepted with the real topic
-                                let accept = PairSignal::PairAccepted { topic: *topic.as_bytes() };
+                                let accept = PairSignal::PairAccepted { topic: *topic.as_bytes(), server_name: server_name.clone() };
                                 let _ = pair_sender.broadcast_neighbors(accept.encode().unwrap()).await;
 
                                 // Now subscribe to the real gossip topic
@@ -493,10 +494,16 @@ async fn handle_event(
                     .await?;
 
                 // Signal the app
+                let guild_name = if let Some(gid) = component.guild_id {
+                    gid.to_partial_guild(ctx).await.ok().map(|g| g.name).unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 let signal = Signal::StartStream {
                     title: title.clone(),
                     quality: quality.clone(),
                     fps,
+                    server: guild_name,
                 };
                 sender
                     .broadcast_neighbors(signal.encode()?)
