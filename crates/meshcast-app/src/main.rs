@@ -378,6 +378,16 @@ impl eframe::App for MeshcastApp {
                 ui.add_space(4.0);
                 ui.checkbox(&mut s.config.audio.enabled, "Audio capture");
 
+                // Save config whenever settings are shown
+                {
+                    let config_snapshot = s.config.clone();
+                    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                        rt.spawn(async move {
+                            let _ = config_snapshot.save().await;
+                        });
+                    }
+                }
+
                 ui.add_space(12.0);
                 ui.separator();
                 ui.add_space(8.0);
