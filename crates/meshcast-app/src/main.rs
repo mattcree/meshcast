@@ -256,10 +256,21 @@ impl eframe::App for MeshcastApp {
                     s.status_msg = "Disconnected from bot.".into();
                 }
                 UiEvent::StreamRequested { title, server } => {
+                    let notify_server = server.clone();
+                    let notify_title = title.clone();
                     s.pending_stream_title = Some(title);
                     s.pending_stream_server = Some(server);
                     s.status_msg = "Stream requested — approve below.".into();
-                    // Bring window to foreground
+                    std::thread::spawn(move || {
+                        let _ = std::process::Command::new("notify-send")
+                            .args([
+                                "--app-name=Meshcast",
+                                "--urgency=critical",
+                                &format!("Stream Request from {notify_server}"),
+                                &format!("\"{}\" — Open Meshcast to approve", notify_title),
+                            ])
+                            .spawn();
+                    });
                     drop(s);
                     self.visible = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
