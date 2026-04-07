@@ -510,8 +510,8 @@ async fn daemon_loop(
                                 tracing::info!("Start stream: {title}");
                                 let _ = ui_tx.send(UiEvent::StreamRequested { title });
 
-                                let quality = state.lock().expect("poisoned").config.video.quality.clone();
-                                match start_stream("meshcast".into(), &quality).await {
+                                let cfg = state.lock().expect("poisoned").config.clone();
+                                match start_stream("meshcast".into(), &cfg.video.quality, cfg.video.fps).await {
                                     Ok((l, bc, ticket)) => {
                                         tracing::info!("Streaming: {ticket}");
                                         if let Some(ref s) = sender {
@@ -700,7 +700,9 @@ async fn do_link_legacy(
     Ok(())
 }
 
-async fn start_stream(name: String, quality: &str) -> Result<(Live, LocalBroadcast, String)> {
+async fn start_stream(name: String, quality: &str, _fps: u32) -> Result<(Live, LocalBroadcast, String)> {
+    // Note: fps is stored in config but iroh-live's preset API hardcodes 30fps.
+    // Custom framerate requires iroh-live API changes. Quality (resolution) works.
     let l = Live::from_env()
         .await
         .context("Failed to initialize iroh-live")?
