@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use futures_lite::StreamExt;
-use meshcast_signal::{BotLinkStore, Event, LinkState, PairCode, PairToken, Signal, SignalNode};
+use meshcast_signal::{BotLinkStore, Event, LinkState, PairCode, PairSignal, Signal, SignalNode, derive_pairing_topic};
 use poise::serenity_prelude as serenity;
 use serenity::all::{
     ChannelId, CreateActionRow, CreateButton, CreateEmbed, CreateEmbedAuthor, MessageId, UserId,
@@ -18,13 +18,12 @@ struct Data {
     active_streams: std::sync::Arc<Mutex<HashMap<ChannelId, (MessageId, String, UserId, String)>>>,
     viewers: Mutex<HashMap<ChannelId, std::collections::HashSet<UserId>>>,
     signal_node: SignalNode,
-    links: Mutex<HashMap<UserId, iroh_gossip::api::GossipSender>>,
-    pending_pins: Mutex<HashMap<String, (iroh_gossip::proto::TopicId, UserId, std::time::Instant)>>,
-    /// Per-user stream config being built in the Discord config card
-    stream_configs: Mutex<HashMap<UserId, (String, u32)>>, // (quality, fps)
+    links: std::sync::Arc<Mutex<HashMap<UserId, iroh_gossip::api::GossipSender>>>,
+    pending_pins: std::sync::Arc<Mutex<HashMap<String, (iroh_gossip::proto::TopicId, UserId, std::time::Instant)>>>,
+    stream_configs: Mutex<HashMap<UserId, (String, u32)>>,
     signal_tx: broadcast::Sender<(UserId, Signal)>,
     store_path: std::path::PathBuf,
-    store: Mutex<BotLinkStore>,
+    store: std::sync::Arc<Mutex<BotLinkStore>>,
 }
 
 fn store_path() -> std::path::PathBuf {
@@ -70,45 +69,106 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
     let user_id = ctx.author().id;
     let data = ctx.data();
 
-    let topic = iroh_gossip::proto::TopicId::from_bytes(rand::random());
-    let addr = data.signal_node.addr();
+    let real_topic = iroh_gossip::proto::TopicId::from_bytes(rand::random());
     let pin = PairCode::generate_pin();
     let full_code = PairCode::encode_full(data.signal_node.endpoint.id(), &pin);
-    // Keep legacy token as fallback
-    let _legacy_token = PairToken::new(topic, vec![addr]).encode()?;
 
-    let gossip_topic = data
-        .signal_node
-        .gossip
-        .subscribe(topic, vec![])
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let (sender, receiver) = gossip_topic.split();
-
-    data.links.lock().expect("poisoned").insert(user_id, sender);
-    spawn_receiver(user_id, receiver, data.signal_tx.clone());
-
-    // Store PIN for pairing exchange (expire old PINs first)
+    // Store PIN → real topic mapping (expire old PINs first)
     {
         let mut pins = data.pending_pins.lock().expect("poisoned");
         pins.retain(|_, (_, _, created)| created.elapsed() < Duration::from_secs(600));
-        pins.insert(pin.clone(), (topic, user_id, std::time::Instant::now()));
+        pins.insert(pin.clone(), (real_topic, user_id, std::time::Instant::now()));
     }
 
-    // Persist the link (don't store bot's own secret key — it's in BotLinkStore)
-    let link_state = LinkState::new(
-        topic,
-        &iroh::SecretKey::from_bytes(&[0u8; 32]), // placeholder — bot key is in BotLinkStore
-        data.signal_node.endpoint.id(),
-    );
-    {
-        let mut store = data.store.lock().expect("poisoned");
-        store.links.insert(user_id.to_string(), link_state);
-    }
-    let store_snapshot = data.store.lock().expect("poisoned").clone();
-    if let Err(e) = store_snapshot.save(&data.store_path).await {
-        tracing::error!("Failed to save link store: {e}");
-    }
+    // Subscribe to the pairing topic (derived from PIN) to handle PairRequest
+    let pairing_topic = derive_pairing_topic(&pin);
+    let gossip = data.signal_node.gossip.clone();
+    let pending_pins = data.pending_pins.clone();
+    let links = data.links.clone();
+    let signal_tx = data.signal_tx.clone();
+    let store = data.store.clone();
+    let store_path = data.store_path.clone();
+    let endpoint_id = data.signal_node.endpoint.id();
+
+    // Spawn pairing listener on the derived topic
+    tokio::spawn(async move {
+        let pairing_sub = match gossip.subscribe(pairing_topic, vec![]).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("Failed to subscribe to pairing topic: {e}");
+                return;
+            }
+        };
+        let (pair_sender, mut pair_receiver) = pairing_sub.split();
+
+        // Wait for PairRequest or timeout
+        let result = tokio::time::timeout(Duration::from_secs(600), async {
+            while let Some(event) = pair_receiver.next().await {
+                if let Ok(Event::Received(msg)) = event {
+                    if let Ok(PairSignal::PairRequest { pin: received_pin }) = PairSignal::decode(&msg.content) {
+                        // Validate PIN
+                        let valid = {
+                            let mut pins = pending_pins.lock().expect("poisoned");
+                            if let Some((topic, uid, created)) = pins.get(&received_pin) {
+                                if created.elapsed() < Duration::from_secs(600) {
+                                    let t = *topic;
+                                    let u = *uid;
+                                    pins.remove(&received_pin); // one-time use
+                                    Some((t, u))
+                                } else {
+                                    pins.remove(&received_pin);
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        };
+
+                        match valid {
+                            Some((topic, uid)) => {
+                                tracing::info!(user = %uid, "PIN accepted, establishing link");
+
+                                // Send PairAccepted with the real topic
+                                let accept = PairSignal::PairAccepted { topic: *topic.as_bytes() };
+                                let _ = pair_sender.broadcast_neighbors(accept.encode().unwrap()).await;
+
+                                // Now subscribe to the real gossip topic
+                                if let Ok(real_sub) = gossip.subscribe(topic, vec![]).await {
+                                    let (sender, receiver) = real_sub.split();
+                                    links.lock().expect("poisoned").insert(uid, sender);
+                                    spawn_receiver(uid, receiver, signal_tx.clone());
+
+                                    // Persist the link
+                                    let link_state = LinkState::new(
+                                        topic,
+                                        &iroh::SecretKey::from_bytes(&[0u8; 32]),
+                                        endpoint_id,
+                                    );
+                                    {
+                                        let mut s = store.lock().expect("poisoned");
+                                        s.links.insert(uid.to_string(), link_state);
+                                    }
+                                    let snapshot = store.lock().expect("poisoned").clone();
+                                    let _ = snapshot.save(&store_path).await;
+                                    tracing::info!(user = %uid, "Link established via PairCode");
+                                }
+                                return; // done
+                            }
+                            None => {
+                                tracing::warn!("Invalid or expired PIN");
+                                let reject = PairSignal::PairRejected { reason: "Invalid or expired code".into() };
+                                let _ = pair_sender.broadcast_neighbors(reject.encode().unwrap()).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }).await;
+
+        if result.is_err() {
+            tracing::debug!("Pairing topic timed out");
+        }
+    });
 
     ctx.say(format!(
         "**Your pairing code:**\n\
@@ -314,11 +374,11 @@ async fn main() -> anyhow::Result<()> {
                     viewers: Mutex::new(HashMap::new()),
                     signal_node,
                     signal_tx,
-                    links: Mutex::new(links),
-                    pending_pins: Mutex::new(HashMap::new()),
+                    links: std::sync::Arc::new(Mutex::new(links)),
+                    pending_pins: std::sync::Arc::new(Mutex::new(HashMap::new())),
                     stream_configs: Mutex::new(HashMap::new()),
                     store_path: path,
-                    store: Mutex::new(store),
+                    store: std::sync::Arc::new(Mutex::new(store)),
                 })
             })
         })

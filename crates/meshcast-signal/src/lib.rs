@@ -6,12 +6,12 @@ use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 use iroh_gossip::net::{Gossip, GOSSIP_ALPN};
-use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
 
 // Re-exports for consumers
 pub use iroh::EndpointId;
 pub use iroh_gossip::api::Event;
+pub use iroh_gossip::proto::TopicId;
 
 /// Messages exchanged between bot and desktop app over gossip.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,13 +70,12 @@ impl PairToken {
 }
 
 /// Short pairing code — contains bot's endpoint ID + 6-digit PIN.
-/// Format: "XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXXXX"
-/// (32 bytes endpoint ID as base32 = 52 chars, then dash, then 6-digit PIN)
+/// Short pairing code — bot endpoint ID + 8-char PIN.
+/// Format: "XXXX-XXXX-...-XXXXXXXX" (base32 endpoint ID with dashes, then 8-char PIN)
 pub struct PairCode;
 
 impl PairCode {
-    /// Generate a 6-digit PIN.
-    /// Generate an 8-character alphanumeric PIN (36^8 = ~2.8 trillion possibilities).
+    /// Generate an 8-character alphanumeric PIN (~40 bits entropy).
     pub fn generate_pin() -> String {
         const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I confusion
         (0..8)
@@ -141,7 +140,37 @@ impl PairCode {
     }
 }
 
-/// Add a new signal for the PIN exchange during pairing.
+/// Derive a temporary gossip topic from a PIN for the pairing exchange.
+/// Both sides compute the same topic from the PIN, enabling rendezvous.
+pub fn derive_pairing_topic(pin: &str) -> TopicId {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    // Simple deterministic derivation — not cryptographic, just needs to be unique
+    let mut hasher = DefaultHasher::new();
+    "meshcast-pair-".hash(&mut hasher);
+    pin.hash(&mut hasher);
+    let h1 = hasher.finish();
+    let mut hasher2 = DefaultHasher::new();
+    h1.hash(&mut hasher2);
+    pin.hash(&mut hasher2);
+    let h2 = hasher2.finish();
+    let mut hasher3 = DefaultHasher::new();
+    h2.hash(&mut hasher3);
+    "meshcast-pair-salt".hash(&mut hasher3);
+    let h3 = hasher3.finish();
+    let mut hasher4 = DefaultHasher::new();
+    h3.hash(&mut hasher4);
+    h1.hash(&mut hasher4);
+    let h4 = hasher4.finish();
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&h1.to_le_bytes());
+    bytes[8..16].copy_from_slice(&h2.to_le_bytes());
+    bytes[16..24].copy_from_slice(&h3.to_le_bytes());
+    bytes[24..32].copy_from_slice(&h4.to_le_bytes());
+    TopicId::from_bytes(bytes)
+}
+
+/// Signal for the PIN exchange during pairing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PairSignal {
     /// App sends PIN to bot to request pairing.
@@ -150,6 +179,16 @@ pub enum PairSignal {
     PairAccepted { topic: [u8; 32] },
     /// Bot rejects the PIN.
     PairRejected { reason: String },
+}
+
+impl PairSignal {
+    pub fn encode(&self) -> Result<bytes::Bytes> {
+        Ok(bytes::Bytes::from(postcard::to_allocvec(self)?))
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        Ok(postcard::from_bytes(data)?)
+    }
 }
 
 /// Persisted link state — survives restarts.

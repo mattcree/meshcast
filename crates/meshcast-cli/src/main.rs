@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use futures_lite::StreamExt;
 use iroh_live::ticket::LiveTicket;
 use iroh_live::Live;
-use meshcast_signal::{Event, LinkState, PairToken, Signal, SignalNode};
+use meshcast_signal::{AppConfig, Event, LinkConfig, LinkState, PairCode, PairSignal, PairToken, Signal, SignalNode, derive_pairing_topic};
 use moq_media::capture::ScreenCapturer;
 use moq_media::codec::{AudioCodec, VideoCodec};
 use moq_media::format::{AudioPreset, DecoderBackend, PlaybackConfig, VideoPreset};
@@ -144,59 +144,89 @@ async fn cmd_stream(name: String, no_audio: bool, quality: String) -> Result<()>
     Ok(())
 }
 
-fn link_path() -> std::path::PathBuf {
-    dirs_next::home_dir()
-        .unwrap_or_default()
-        .join(".config/meshcast/link.json")
-}
+async fn cmd_link(input: String) -> Result<()> {
+    let mut config = AppConfig::load().await.unwrap_or_default();
 
-async fn cmd_link(token: String) -> Result<()> {
-    let pair = PairToken::decode(&token).context("Invalid pairing token")?;
-    tracing::info!("Linking to bot...");
+    // Try PairCode first, fall back to legacy token
+    let (bot_id, pin) = match PairCode::parse(&input) {
+        Ok((Some(bot_id), pin)) => (bot_id, pin),
+        Ok((None, pin)) => {
+            let cached = config.link_state()
+                .context("No previous connection. Use the full pairing code.")?;
+            (cached.peer_endpoint_id(), pin)
+        }
+        Err(_) => {
+            // Legacy token format
+            let pair = PairToken::decode(&input).context("Invalid pairing code")?;
+            let memory_lookup = iroh::address_lookup::memory::MemoryLookup::new();
+            for peer in &pair.peers {
+                memory_lookup.add_endpoint_info(peer.clone());
+            }
+            let node = SignalNode::new(None).await?;
+            if let Ok(lookup) = node.endpoint.address_lookup() {
+                lookup.add(memory_lookup);
+            }
+            let peer_ids: Vec<_> = pair.peers.iter().map(|p| p.id).collect();
+            let _topic = node.gossip.subscribe_and_join(pair.topic, peer_ids.clone()).await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let state = LinkState::new(pair.topic, &node.endpoint.secret_key(), peer_ids[0]);
+            config.link = Some(LinkConfig::from(state));
+            config.save().await?;
+            println!("Linked! Run `meshcast daemon` to start listening.");
+            return Ok(());
+        }
+    };
 
+    tracing::info!("Pairing with bot {} using PIN", bot_id.fmt_short());
     let node = SignalNode::new(None).await?;
 
-    // Add bot's addresses so we can find it
-    let memory_lookup = iroh::address_lookup::memory::MemoryLookup::new();
-    for peer in &pair.peers {
-        memory_lookup.add_endpoint_info(peer.clone());
-    }
-    if let Ok(lookup) = node.endpoint.address_lookup() {
-        lookup.add(memory_lookup);
-    }
+    // Join the pairing topic derived from PIN
+    let pairing_topic = derive_pairing_topic(&pin);
+    let pairing_sub = node.gossip
+        .subscribe_and_join(pairing_topic, vec![bot_id])
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (pair_sender, mut pair_receiver) = pairing_sub.split();
 
-    let peer_ids: Vec<_> = pair.peers.iter().map(|p| p.id).collect();
-    let gossip_topic = node
-        .gossip
-        .subscribe_and_join(pair.topic, peer_ids.clone())
+    // Send PairRequest
+    tracing::info!("Sending pairing request...");
+    pair_sender
+        .broadcast_neighbors(PairSignal::PairRequest { pin }.encode()?)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Wait briefly for gossip to establish
-    tracing::info!("Connecting to bot...");
-    let mut receiver = gossip_topic.split().1;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while let Some(event) = receiver.next().await {
-            if let Ok(Event::NeighborUp(id)) = event {
-                tracing::info!(peer = %id.fmt_short(), "Bot connected");
-                break;
+    // Wait for response
+    let real_topic = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while let Some(event) = pair_receiver.next().await {
+            if let Ok(Event::Received(msg)) = event {
+                match PairSignal::decode(&msg.content) {
+                    Ok(PairSignal::PairAccepted { topic }) => {
+                        return Ok(meshcast_signal::TopicId::from_bytes(topic));
+                    }
+                    Ok(PairSignal::PairRejected { reason }) => {
+                        return Err(anyhow::anyhow!("Rejected: {reason}"));
+                    }
+                    _ => continue,
+                }
             }
         }
+        Err(anyhow::anyhow!("Connection lost"))
     })
-    .await;
+    .await
+    .map_err(|_| anyhow::anyhow!("Timed out — is the bot running?"))??;
 
-    // Save link state regardless — the bot logs confirm it connects
-    let state = LinkState::new(pair.topic, &node.endpoint.secret_key(), peer_ids[0]);
-    state.save(&link_path()).await?;
+    let state = LinkState::new(real_topic, &node.endpoint.secret_key(), bot_id);
+    config.link = Some(LinkConfig::from(state));
+    config.save().await?;
 
-    println!("Linked! Run `meshcast daemon` to start listening for stream commands.");
+    println!("Linked! Run `meshcast daemon` to start listening.");
     Ok(())
 }
 
 async fn cmd_daemon() -> Result<()> {
-    let state = LinkState::load(&link_path())
-        .await
-        .context("Not linked. Run `meshcast link <TOKEN>` first.")?;
+    let config = AppConfig::load().await.unwrap_or_default();
+    let state = config.link_state()
+        .context("Not linked. Run `meshcast link <CODE>` first.")?;
 
     let node = SignalNode::new(Some(state.secret_key())).await?;
     let peer_id = state.peer_endpoint_id();
@@ -338,13 +368,17 @@ async fn start_stream(name: String) -> Result<(Live, LocalBroadcast, String)> {
 }
 
 async fn cmd_unlink() -> Result<()> {
-    let path = link_path();
-    if path.exists() {
-        tokio::fs::remove_file(&path).await?;
+    let mut config = AppConfig::load().await.unwrap_or_default();
+    if config.link.is_some() {
+        config.link = None;
+        config.save().await?;
         println!("Unlinked.");
     } else {
         println!("Not linked.");
     }
+    // Also clean up legacy link file if it exists
+    let legacy = dirs_next::home_dir().unwrap_or_default().join(".config/meshcast/link.json");
+    let _ = tokio::fs::remove_file(&legacy).await;
     Ok(())
 }
 

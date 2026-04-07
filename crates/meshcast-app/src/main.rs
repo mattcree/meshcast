@@ -5,7 +5,7 @@ use eframe::egui;
 use futures_lite::StreamExt;
 use iroh_live::ticket::LiveTicket;
 use iroh_live::Live;
-use meshcast_signal::{AppConfig, Event, LinkConfig, PairCode, PairToken, Signal, SignalNode};
+use meshcast_signal::{AppConfig, Event, LinkConfig, PairCode, PairSignal, PairToken, Signal, SignalNode, derive_pairing_topic};
 use moq_media::capture::ScreenCapturer;
 use moq_media::codec::{AudioCodec, VideoCodec, h264::H264Encoder};
 use moq_media::format::{AudioPreset, VideoEncoderConfig, VideoPreset};
@@ -698,22 +698,13 @@ async fn do_link(
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
     // Try parsing as short code first, fall back to legacy token
-    let (bot_id, topic) = match PairCode::parse(input) {
-        Ok((Some(bot_id), _pin)) => {
-            // Full code — we have the bot's endpoint ID but need the topic from legacy path
-            // For now, fall back to legacy PairToken which includes the topic
-            tracing::info!("Parsed short code, bot endpoint: {}", bot_id.fmt_short());
-            // TODO: implement PIN-based topic exchange with bot
-            // For now, try legacy format
-            return do_link_legacy(node, input, config, ui_tx).await;
-        }
-        Ok((None, _pin)) => {
+    let (bot_id, pin) = match PairCode::parse(input) {
+        Ok((Some(bot_id), pin)) => (bot_id, pin),
+        Ok((None, pin)) => {
             // PIN only — need cached bot endpoint ID
-            let cached_link = config.link_state();
-            match cached_link {
-                Some(ls) => (ls.peer_endpoint_id(), ls.topic_id()),
-                None => anyhow::bail!("No previous connection. Use the full pairing code for first-time setup."),
-            }
+            let cached = config.link_state()
+                .context("No previous connection. Use the full pairing code.")?;
+            (cached.peer_endpoint_id(), pin)
         }
         Err(_) => {
             // Try legacy token format
@@ -721,15 +712,51 @@ async fn do_link(
         }
     };
 
-    // PIN-only re-link: use cached bot endpoint ID and existing topic
-    let _topic = node
+    tracing::info!("Pairing with bot {} using PIN", bot_id.fmt_short());
+
+    // Derive the pairing topic from the PIN (same derivation as bot)
+    let pairing_topic = derive_pairing_topic(&pin);
+
+    // Join the pairing topic with the bot as bootstrap
+    let pairing_sub = node
         .gossip
-        .subscribe_and_join(topic, vec![bot_id])
+        .subscribe_and_join(pairing_topic, vec![bot_id])
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (pair_sender, mut pair_receiver) = pairing_sub.split();
+
+    // Send PairRequest
+    let request = PairSignal::PairRequest { pin };
+    pair_sender
+        .broadcast_neighbors(request.encode()?)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // Wait for PairAccepted or PairRejected
+    let real_topic = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(event) = pair_receiver.next().await {
+            if let Ok(Event::Received(msg)) = event {
+                match PairSignal::decode(&msg.content) {
+                    Ok(PairSignal::PairAccepted { topic }) => {
+                        return Ok(meshcast_signal::TopicId::from_bytes(topic));
+                    }
+                    Ok(PairSignal::PairRejected { reason }) => {
+                        return Err(anyhow::anyhow!("Pairing rejected: {reason}"));
+                    }
+                    _ => continue,
+                }
+            }
+        }
+        Err(anyhow::anyhow!("Connection lost during pairing"))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Pairing timed out — is the bot running?"))??;
+
+    tracing::info!("Pairing accepted, joining real gossip topic");
+
+    // Save link state with the real topic
     let link_state = meshcast_signal::LinkState::new(
-        topic,
+        real_topic,
         &node.endpoint.secret_key(),
         bot_id,
     );
@@ -739,6 +766,8 @@ async fn do_link(
     let _ = ui_tx.send(UiEvent::Linked);
     Ok(())
 }
+
+use std::time::Duration;
 
 async fn do_link_legacy(
     node: &SignalNode,
