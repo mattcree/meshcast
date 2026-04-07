@@ -59,7 +59,7 @@ enum UiEvent {
     StreamFailed { error: String },
     WatchRequested,
     ViewerCount(u32),
-    Linked,
+    Linked { config: AppConfig },
 }
 
 /// Messages from the UI to the gossip background task.
@@ -116,7 +116,7 @@ fn main() -> Result<()> {
     // Load config
     let config = rt.block_on(AppConfig::load()).unwrap_or_default();
     let state = Arc::new(Mutex::new(AppState {
-        is_linked: config.link.is_some(),
+        is_linked: !config.links.is_empty() || config.link.is_some(),
         config: config.clone(),
         status_msg: if config.link.is_some() {
             String::new()
@@ -277,9 +277,10 @@ impl eframe::App for MeshcastApp {
                 UiEvent::ViewerCount(count) => {
                     s.viewer_count = count;
                 }
-                UiEvent::Linked => {
-                    s.is_linked = true;
-                    s.status_msg = "Linked! Connecting to bot...".into();
+                UiEvent::Linked { config } => {
+                    s.config = config;
+                    s.is_linked = !s.config.links.is_empty() || s.config.link.is_some();
+                    s.status_msg = String::new();
                 }
             }
         }
@@ -330,41 +331,84 @@ impl eframe::App for MeshcastApp {
             ui.separator();
             ui.add_space(8.0);
 
-            // Link section
-            if !s.is_linked {
-                ui.label(egui::RichText::new("Get Started").color(egui::Color32::WHITE).heading());
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("Type /link in Discord, then paste the code below:")
-                        .color(egui::Color32::from_rgb(148, 155, 164)),
-                );
-                ui.add_space(8.0);
-                drop(s);
-                let mut s = self.state.lock().expect("poisoned");
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut s.link_token_input)
-                        .hint_text("Paste pairing code...")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(4.0);
-                let link_clicked = ui.add_sized(
-                    [ui.available_width(), 32.0],
-                    egui::Button::new(egui::RichText::new("Connect").color(egui::Color32::WHITE))
-                        .fill(blurple),
-                ).clicked();
-                if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                    || link_clicked
-                {
-                    let token = s.link_token_input.clone();
-                    if !token.is_empty() {
-                        let _ = self.cmd_tx.send(DaemonCmd::Link { token });
-                        s.link_token_input.clear();
-                        s.status_msg = "Connecting...".into();
-                    }
-                }
-            } else {
-                drop(s);
+            // Server list
+            {
+                let server_names: Vec<String> = s.config.links.iter()
+                    .map(|l| l.name.clone())
+                    .collect();
 
+                if !server_names.is_empty() {
+                    ui.label(egui::RichText::new("Servers").color(egui::Color32::from_rgb(185, 187, 190)).small());
+                    let mut to_remove = None;
+                    for name in &server_names {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(87, 242, 135),
+                                egui::RichText::new(format!("● {name}")),
+                            );
+                            if ui.small_button("Unlink").clicked() {
+                                to_remove = Some(name.clone());
+                            }
+                        });
+                    }
+                    if let Some(name) = to_remove {
+                        drop(s);
+                        let mut s = self.state.lock().expect("poisoned");
+                        s.config.remove_link(&name);
+                        s.is_linked = !s.config.links.is_empty();
+                        let config = s.config.clone();
+                        drop(s);
+                        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                            rt.spawn(async move { let _ = config.save().await; });
+                        }
+                        let s = self.state.lock().expect("poisoned");
+                        // continue with updated state
+                        let _ = &s;
+                        drop(s);
+                    } else {
+                        drop(s);
+                    }
+                    ui.add_space(4.0);
+                } else {
+                    ui.label(
+                        egui::RichText::new("Type /link in a Discord server to get a pairing code.")
+                            .color(egui::Color32::from_rgb(148, 155, 164)),
+                    );
+                    drop(s);
+                }
+
+                // Always show pairing input
+                let mut s = self.state.lock().expect("poisoned");
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut s.link_token_input)
+                            .hint_text("Paste pairing code...")
+                            .desired_width(ui.available_width() - 70.0),
+                    );
+                    let link_clicked = ui.add(
+                        egui::Button::new(egui::RichText::new("Link").color(egui::Color32::WHITE))
+                            .fill(blurple),
+                    ).clicked();
+                    if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        || link_clicked
+                    {
+                        let token = s.link_token_input.clone();
+                        if !token.is_empty() {
+                            let _ = self.cmd_tx.send(DaemonCmd::Link { token });
+                            s.link_token_input.clear();
+                            s.status_msg = "Connecting...".into();
+                        }
+                    }
+                });
+                drop(s);
+            }
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            // Stream section (only when linked)
+            if self.state.lock().expect("poisoned").is_linked {
                 // Consent dialog for incoming stream request
                 let s = self.state.lock().expect("poisoned");
                 if let Some(title) = s.pending_stream_title.clone() {
@@ -725,10 +769,10 @@ async fn do_link(
         &node.endpoint.secret_key(),
         bot_id,
     );
-    config.link = Some(LinkConfig::from(link_state));
+    config.add_link(format!("Server {}", bot_id.fmt_short()), LinkConfig::from(link_state));
     config.save().await?;
 
-    let _ = ui_tx.send(UiEvent::Linked);
+    let _ = ui_tx.send(UiEvent::Linked { config: config.clone() });
     Ok(())
 }
 
@@ -760,10 +804,10 @@ async fn do_link_legacy(
         &node.endpoint.secret_key(),
         peer_ids[0],
     );
-    config.link = Some(LinkConfig::from(link_state));
+    config.add_link(format!("Server {}", peer_ids[0].fmt_short()), LinkConfig::from(link_state));
     config.save().await?;
 
-    let _ = ui_tx.send(UiEvent::Linked);
+    let _ = ui_tx.send(UiEvent::Linked { config: config.clone() });
     Ok(())
 }
 
