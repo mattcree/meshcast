@@ -5,7 +5,7 @@ use eframe::egui;
 use futures_lite::StreamExt;
 use iroh_live::ticket::LiveTicket;
 use iroh_live::Live;
-use meshcast_signal::{AppConfig, Event, LinkConfig, PairCode, PairSignal, PairToken, Signal, SignalNode, derive_pairing_topic};
+use meshcast_signal::{AppConfig, Event, LinkConfig, PairCode, PairToken, Signal, SignalNode};
 use moq_media::capture::ScreenCapturer;
 use moq_media::codec::{AudioCodec, VideoCodec, h264::H264Encoder};
 use moq_media::format::{AudioPreset, VideoEncoderConfig, VideoPreset};
@@ -15,30 +15,23 @@ use moq_media::AudioBackend;
 use tokio::sync::mpsc;
 
 fn create_tray_icon() -> Option<tray_icon::TrayIcon> {
-    use tray_icon::menu::{Menu, MenuItemBuilder, PredefinedMenuItem};
+    use tray_icon::menu::{Menu, MenuItemBuilder};
     use tray_icon::TrayIconBuilder;
 
     let menu = Menu::new();
     let show_item = MenuItemBuilder::new()
-        .text("Show Meshcast")
+        .text("Show")
         .id(tray_icon::menu::MenuId("show".into()))
         .build();
-    let stop_item = MenuItemBuilder::new()
-        .text("Stop Stream")
-        .id(tray_icon::menu::MenuId("stop".into()))
-        .enabled(true)
-        .build();
-    menu.append(&show_item).ok();
-    menu.append(&stop_item).ok();
-    menu.append(&PredefinedMenuItem::separator()).ok();
     let quit_item = MenuItemBuilder::new()
-        .text("Quit Meshcast")
+        .text("Quit")
         .id(tray_icon::menu::MenuId("quit".into()))
         .build();
+    menu.append(&show_item).ok();
     menu.append(&quit_item).ok();
 
-    // 32x32 blurple square icon (RGBA)
-    let size = 32u32;
+    // Simple 16x16 green square icon (RGBA)
+    let size = 16u32;
     let mut rgba = vec![0u8; (size * size * 4) as usize];
     for pixel in rgba.chunks_exact_mut(4) {
         pixel[0] = 0x58; // R
@@ -48,21 +41,12 @@ fn create_tray_icon() -> Option<tray_icon::TrayIcon> {
     }
     let icon = tray_icon::Icon::from_rgba(rgba, size, size).ok()?;
 
-    match TrayIconBuilder::new()
+    TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("Meshcast")
         .with_icon(icon)
         .build()
-    {
-        Ok(tray) => {
-            tracing::info!("Tray icon created");
-            Some(tray)
-        }
-        Err(e) => {
-            tracing::warn!("Failed to create tray icon: {e}");
-            None
-        }
-    }
+        .ok()
 }
 
 /// Messages from the gossip background task to the UI.
@@ -132,7 +116,7 @@ fn main() -> Result<()> {
     // Load config
     let config = rt.block_on(AppConfig::load()).unwrap_or_default();
     let state = Arc::new(Mutex::new(AppState {
-        is_linked: !config.links.is_empty() || config.link.is_some(),
+        is_linked: config.link.is_some(),
         config: config.clone(),
         status_msg: if config.link.is_some() {
             String::new()
@@ -159,9 +143,9 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    // Note: tray-icon requires GTK on Linux, but GTK init conflicts with
-    // winit/eframe on Wayland (both need the main thread). Tray icon is
-    // disabled on Linux for now. The Quit button in the UI provides exit.
+    // Initialize GTK on Linux (required for tray-icon)
+    #[cfg(target_os = "linux")]
+    gtk::init().ok();
 
     eframe::run_native(
         "Meshcast",
@@ -182,12 +166,7 @@ fn main() -> Result<()> {
             cc.egui_ctx.set_visuals(visuals);
 
             // Create tray icon
-            // Tray icon disabled on Linux (GTK + winit conflict on Wayland)
-            // Works on macOS and Windows
-            #[cfg(not(target_os = "linux"))]
             let tray = create_tray_icon();
-            #[cfg(target_os = "linux")]
-            let tray: Option<tray_icon::TrayIcon> = None;
 
             Ok(Box::new(MeshcastApp {
                 state,
@@ -219,9 +198,26 @@ impl eframe::App for MeshcastApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_count = self.frame_count.saturating_add(1);
 
-        // Handle quit from UI button or tray menu
-        if self.quit {
+        // Handle quit flag from UI button or tray menu
+        if self.quit && self.frame_count > 10 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
+        }
+
+        // Consume any stale close events from previous instance
+        if self.frame_count <= 10 {
+            if ctx.input(|i| i.viewport().close_requested()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+            // Don't process quit button clicks in early frames
+            self.quit = false;
+        }
+
+        // Handle window close → minimize instead of quitting
+        if self.frame_count > 10 && ctx.input(|i| i.viewport().close_requested()) && !self.quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            self.visible = false;
         }
 
         // Check tray icon events — show window on click
@@ -236,9 +232,6 @@ impl eframe::App for MeshcastApp {
                     self.visible = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                "stop" => {
-                    let _ = self.cmd_tx.send(DaemonCmd::StopStream);
                 }
                 "quit" => {
                     self.quit = true;
@@ -337,78 +330,43 @@ impl eframe::App for MeshcastApp {
             ui.separator();
             ui.add_space(8.0);
 
-            // Link hint when not linked
+            // Link section
             if !s.is_linked {
+                ui.label(egui::RichText::new("Get Started").color(egui::Color32::WHITE).heading());
+                ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new("Type /link in a Discord server to get a pairing code.")
+                    egui::RichText::new("Type /link in Discord, then paste the code below:")
                         .color(egui::Color32::from_rgb(148, 155, 164)),
                 );
-            }
-
-            // Always show servers list + link input (even when linked)
-            {
-                let s = self.state.lock().expect("poisoned");
-                let server_names: Vec<String> = s.config.links.iter().map(|l| l.name.clone()).collect();
+                ui.add_space(8.0);
                 drop(s);
-
-                if !server_names.is_empty() {
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new("Servers").color(egui::Color32::from_rgb(185, 187, 190)).small());
-                    let mut to_remove = None;
-                    for name in &server_names {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(format!("● {name}")).color(egui::Color32::from_rgb(87, 242, 135)));
-                            if ui.small_button("Unlink").clicked() {
-                                to_remove = Some(name.clone());
-                            }
-                        });
-                    }
-                    if let Some(name) = to_remove {
-                        let mut s = self.state.lock().expect("poisoned");
-                        s.config.remove_link(&name);
-                        let config = s.config.clone();
-                        drop(s);
-                        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                            rt.spawn(async move { let _ = config.save().await; });
-                        }
+                let mut s = self.state.lock().expect("poisoned");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut s.link_token_input)
+                        .hint_text("Paste pairing code...")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(4.0);
+                let link_clicked = ui.add_sized(
+                    [ui.available_width(), 32.0],
+                    egui::Button::new(egui::RichText::new("Connect").color(egui::Color32::WHITE))
+                        .fill(blurple),
+                ).clicked();
+                if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    || link_clicked
+                {
+                    let token = s.link_token_input.clone();
+                    if !token.is_empty() {
+                        let _ = self.cmd_tx.send(DaemonCmd::Link { token });
+                        s.link_token_input.clear();
+                        s.status_msg = "Connecting...".into();
                     }
                 }
-
-                // Always show "add server" input
-                ui.add_space(4.0);
-                let mut s = self.state.lock().expect("poisoned");
-                ui.horizontal(|ui| {
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut s.link_token_input)
-                            .hint_text("Paste pairing code...")
-                            .desired_width(ui.available_width() - 80.0),
-                    );
-                    let link_clicked = ui.add(
-                        egui::Button::new(egui::RichText::new("Link").color(egui::Color32::WHITE))
-                            .fill(blurple),
-                    ).clicked();
-                    if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                        || link_clicked
-                    {
-                        let token = s.link_token_input.clone();
-                        if !token.is_empty() {
-                            let _ = self.cmd_tx.send(DaemonCmd::Link { token });
-                            s.link_token_input.clear();
-                            s.status_msg = "Connecting...".into();
-                        }
-                    }
-                });
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-            }
-
-            // Stream section (only when linked)
-            if self.state.lock().expect("poisoned").is_linked {
-                let s = self.state.lock().expect("poisoned");
+            } else {
+                drop(s);
 
                 // Consent dialog for incoming stream request
+                let s = self.state.lock().expect("poisoned");
                 if let Some(title) = s.pending_stream_title.clone() {
                     ui.group(|ui| {
                         ui.label(
@@ -720,7 +678,7 @@ async fn do_link(
     config: &mut AppConfig,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
-    // Try parsing as PairCode, fall back to legacy token
+    // Try PairCode first, fall back to legacy token
     let (bot_id, pin) = match PairCode::parse(input) {
         Ok((bot_id, pin)) => (bot_id, pin),
         Err(_) => {
@@ -730,10 +688,7 @@ async fn do_link(
 
     tracing::info!("Pairing with bot {} using PIN", bot_id.fmt_short());
 
-    // Derive the pairing topic from the PIN (same derivation as bot)
-    let pairing_topic = derive_pairing_topic(&pin);
-
-    // Join the pairing topic with the bot as bootstrap
+    let pairing_topic = meshcast_signal::derive_pairing_topic(&pin);
     let pairing_sub = node
         .gossip
         .subscribe_and_join(pairing_topic, vec![bot_id])
@@ -741,49 +696,41 @@ async fn do_link(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let (pair_sender, mut pair_receiver) = pairing_sub.split();
 
-    // Send PairRequest
-    let request = PairSignal::PairRequest { pin };
     pair_sender
-        .broadcast_neighbors(request.encode()?)
+        .broadcast_neighbors(meshcast_signal::PairSignal::PairRequest { pin }.encode()?)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Wait for PairAccepted or PairRejected
-    let real_topic = tokio::time::timeout(Duration::from_secs(15), async {
+    let real_topic = tokio::time::timeout(std::time::Duration::from_secs(15), async {
         while let Some(event) = pair_receiver.next().await {
-            if let Ok(Event::Received(msg)) = event {
-                match PairSignal::decode(&msg.content) {
-                    Ok(PairSignal::PairAccepted { topic }) => {
+            if let Ok(meshcast_signal::Event::Received(msg)) = event {
+                match meshcast_signal::PairSignal::decode(&msg.content) {
+                    Ok(meshcast_signal::PairSignal::PairAccepted { topic }) => {
                         return Ok(meshcast_signal::TopicId::from_bytes(topic));
                     }
-                    Ok(PairSignal::PairRejected { reason }) => {
-                        return Err(anyhow::anyhow!("Pairing rejected: {reason}"));
+                    Ok(meshcast_signal::PairSignal::PairRejected { reason }) => {
+                        return Err(anyhow::anyhow!("Rejected: {reason}"));
                     }
                     _ => continue,
                 }
             }
         }
-        Err(anyhow::anyhow!("Connection lost during pairing"))
+        Err(anyhow::anyhow!("Connection lost"))
     })
     .await
-    .map_err(|_| anyhow::anyhow!("Pairing timed out — is the bot running?"))??;
+    .map_err(|_| anyhow::anyhow!("Timed out — is the bot running?"))??;
 
-    tracing::info!("Pairing accepted, joining real gossip topic");
-
-    // Save link state with the real topic
     let link_state = meshcast_signal::LinkState::new(
         real_topic,
         &node.endpoint.secret_key(),
         bot_id,
     );
-    config.add_link(format!("Server {}", bot_id.fmt_short()), LinkConfig::from(link_state));
+    config.link = Some(LinkConfig::from(link_state));
     config.save().await?;
 
     let _ = ui_tx.send(UiEvent::Linked);
     Ok(())
 }
-
-use std::time::Duration;
 
 async fn do_link_legacy(
     node: &SignalNode,
@@ -813,7 +760,7 @@ async fn do_link_legacy(
         &node.endpoint.secret_key(),
         peer_ids[0],
     );
-    config.add_link(format!("Server {}", peer_ids[0].fmt_short()), LinkConfig::from(link_state));
+    config.link = Some(LinkConfig::from(link_state));
     config.save().await?;
 
     let _ = ui_tx.send(UiEvent::Linked);
