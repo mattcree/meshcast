@@ -15,23 +15,30 @@ use moq_media::AudioBackend;
 use tokio::sync::mpsc;
 
 fn create_tray_icon() -> Option<tray_icon::TrayIcon> {
-    use tray_icon::menu::{Menu, MenuItemBuilder};
+    use tray_icon::menu::{Menu, MenuItemBuilder, PredefinedMenuItem};
     use tray_icon::TrayIconBuilder;
 
     let menu = Menu::new();
     let show_item = MenuItemBuilder::new()
-        .text("Show")
+        .text("Show Meshcast")
         .id(tray_icon::menu::MenuId("show".into()))
         .build();
-    let quit_item = MenuItemBuilder::new()
-        .text("Quit")
-        .id(tray_icon::menu::MenuId("quit".into()))
+    let stop_item = MenuItemBuilder::new()
+        .text("Stop Stream")
+        .id(tray_icon::menu::MenuId("stop".into()))
+        .enabled(true)
         .build();
     menu.append(&show_item).ok();
+    menu.append(&stop_item).ok();
+    menu.append(&PredefinedMenuItem::separator()).ok();
+    let quit_item = MenuItemBuilder::new()
+        .text("Quit Meshcast")
+        .id(tray_icon::menu::MenuId("quit".into()))
+        .build();
     menu.append(&quit_item).ok();
 
-    // Simple 16x16 green square icon (RGBA)
-    let size = 16u32;
+    // 32x32 blurple square icon (RGBA)
+    let size = 32u32;
     let mut rgba = vec![0u8; (size * size * 4) as usize];
     for pixel in rgba.chunks_exact_mut(4) {
         pixel[0] = 0x58; // R
@@ -41,12 +48,21 @@ fn create_tray_icon() -> Option<tray_icon::TrayIcon> {
     }
     let icon = tray_icon::Icon::from_rgba(rgba, size, size).ok()?;
 
-    TrayIconBuilder::new()
+    match TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("Meshcast")
         .with_icon(icon)
         .build()
-        .ok()
+    {
+        Ok(tray) => {
+            tracing::info!("Tray icon created");
+            Some(tray)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to create tray icon: {e}");
+            None
+        }
+    }
 }
 
 /// Messages from the gossip background task to the UI.
@@ -232,6 +248,9 @@ impl eframe::App for MeshcastApp {
                     self.visible = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                "stop" => {
+                    let _ = self.cmd_tx.send(DaemonCmd::StopStream);
                 }
                 "quit" => {
                     self.quit = true;
