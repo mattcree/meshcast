@@ -175,6 +175,12 @@ struct MeshcastApp {
 
 impl eframe::App for MeshcastApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Handle quit flag from UI button or tray menu
+        if self.quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
         // Handle window close → minimize to tray instead of quitting
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -260,6 +266,11 @@ impl eframe::App for MeshcastApp {
                     (egui::Color32::GRAY, "Not linked")
                 };
                 ui.colored_label(color, format!("● {label}"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Quit").clicked() {
+                        self.quit = true;
+                    }
+                });
             });
             ui.label(&s.status_msg);
             ui.add_space(8.0);
