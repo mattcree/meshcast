@@ -159,9 +159,9 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    // Initialize GTK on Linux (required for tray-icon)
-    #[cfg(target_os = "linux")]
-    gtk::init().ok();
+    // Note: tray-icon requires GTK on Linux, but GTK init conflicts with
+    // winit/eframe on Wayland (both need the main thread). Tray icon is
+    // disabled on Linux for now. The Quit button in the UI provides exit.
 
     eframe::run_native(
         "Meshcast",
@@ -182,7 +182,12 @@ fn main() -> Result<()> {
             cc.egui_ctx.set_visuals(visuals);
 
             // Create tray icon
+            // Tray icon disabled on Linux (GTK + winit conflict on Wayland)
+            // Works on macOS and Windows
+            #[cfg(not(target_os = "linux"))]
             let tray = create_tray_icon();
+            #[cfg(target_os = "linux")]
+            let tray: Option<tray_icon::TrayIcon> = None;
 
             Ok(Box::new(MeshcastApp {
                 state,
@@ -214,26 +219,9 @@ impl eframe::App for MeshcastApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_count = self.frame_count.saturating_add(1);
 
-        // Handle quit flag from UI button or tray menu
-        if self.quit && self.frame_count > 10 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        // Handle quit from UI button or tray menu
+        if self.quit {
             return;
-        }
-
-        // Consume any stale close events from previous instance
-        if self.frame_count <= 10 {
-            if ctx.input(|i| i.viewport().close_requested()) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            }
-            // Don't process quit button clicks in early frames
-            self.quit = false;
-        }
-
-        // Handle window close → minimize instead of quitting
-        if self.frame_count > 10 && ctx.input(|i| i.viewport().close_requested()) && !self.quit {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            self.visible = false;
         }
 
         // Check tray icon events — show window on click
