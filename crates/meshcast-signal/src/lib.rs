@@ -284,8 +284,22 @@ pub struct AppConfig {
     pub video: VideoConfig,
     #[serde(default)]
     pub audio: AudioConfig,
+    /// Legacy single link — migrated to `links` on load
     #[serde(default)]
     pub link: Option<LinkConfig>,
+    /// Multiple server links
+    #[serde(default)]
+    pub links: Vec<ServerLink>,
+}
+
+/// A named link to a Discord server's bot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerLink {
+    /// Display name (e.g. "My Gaming Server")
+    pub name: String,
+    /// The link configuration
+    #[serde(flatten)]
+    pub config: LinkConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,6 +373,7 @@ impl Default for AppConfig {
             video: VideoConfig::default(),
             audio: AudioConfig::default(),
             link: None,
+            links: Vec::new(),
         }
     }
 }
@@ -398,8 +413,31 @@ impl AppConfig {
         Ok(())
     }
 
+    /// Get the first available link state (prefers `links`, falls back to legacy `link`).
     pub fn link_state(&self) -> Option<LinkState> {
-        self.link.clone().map(LinkState::from)
+        self.links.first()
+            .map(|sl| LinkState::from(sl.config.clone()))
+            .or_else(|| self.link.clone().map(LinkState::from))
+    }
+
+    /// Get all server links.
+    pub fn server_links(&self) -> &[ServerLink] {
+        &self.links
+    }
+
+    /// Add a server link. If a link with the same name exists, replace it.
+    pub fn add_link(&mut self, name: String, config: LinkConfig) {
+        self.links.retain(|l| l.name != name);
+        self.links.push(ServerLink { name, config });
+        // Clear legacy field
+        self.link = None;
+    }
+
+    /// Remove a server link by name.
+    pub fn remove_link(&mut self, name: &str) -> bool {
+        let before = self.links.len();
+        self.links.retain(|l| l.name != name);
+        self.links.len() < before
     }
 }
 

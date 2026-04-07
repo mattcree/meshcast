@@ -165,7 +165,7 @@ async fn cmd_link(input: String) -> Result<()> {
             let _topic = node.gossip.subscribe_and_join(pair.topic, peer_ids.clone()).await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let state = LinkState::new(pair.topic, &node.endpoint.secret_key(), peer_ids[0]);
-            config.link = Some(LinkConfig::from(state));
+            config.add_link(format!("Server {}", peer_ids[0].fmt_short()), LinkConfig::from(state));
             config.save().await?;
             println!("Linked! Run `meshcast daemon` to start listening.");
             return Ok(());
@@ -211,7 +211,7 @@ async fn cmd_link(input: String) -> Result<()> {
     .map_err(|_| anyhow::anyhow!("Timed out — is the bot running?"))??;
 
     let state = LinkState::new(real_topic, &node.endpoint.secret_key(), bot_id);
-    config.link = Some(LinkConfig::from(state));
+    config.add_link(format!("Server {}", bot_id.fmt_short()), LinkConfig::from(state));
     config.save().await?;
 
     println!("Linked! Run `meshcast daemon` to start listening.");
@@ -364,10 +364,11 @@ async fn start_stream(name: String) -> Result<(Live, LocalBroadcast, String)> {
 
 async fn cmd_unlink() -> Result<()> {
     let mut config = AppConfig::load().await.unwrap_or_default();
-    if config.link.is_some() {
+    if !config.links.is_empty() || config.link.is_some() {
+        config.links.clear();
         config.link = None;
         config.save().await?;
-        println!("Unlinked.");
+        println!("Unlinked from all servers.");
     } else {
         println!("Not linked.");
     }
