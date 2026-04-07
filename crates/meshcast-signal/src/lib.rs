@@ -98,27 +98,20 @@ impl PairCode {
     }
 
     /// Parse a pairing code. Returns (bot_endpoint_id, pin).
-    /// Accepts either:
-    /// - Full code: "XXXX-XXXX-...-XXXXXX" (base32 endpoint ID with dashes + PIN)
-    /// - PIN only: "123456" (6 digits, requires cached bot endpoint ID)
-    pub fn parse(input: &str) -> Result<(Option<EndpointId>, String)> {
+    /// Parse a full pairing code. Returns (bot_endpoint_id, pin).
+    /// Format: "XXXX-XXXX-...-XXXXXXXX" (base32 endpoint ID with dashes + 8-char PIN)
+    pub fn parse(input: &str) -> Result<(EndpointId, String)> {
         let input = input.trim().to_uppercase();
 
-        // Check if it's just a PIN (8 alphanumeric chars, or legacy 6-digit)
-        if (input.len() == 8 || input.len() == 6) && !input.contains('-') {
-            return Ok((None, input));
-        }
-
-        // Full code: strip dashes, split into endpoint ID + PIN
         let parts: Vec<&str> = input.split('-').collect();
         if parts.len() < 2 {
-            anyhow::bail!("Invalid pairing code format");
+            anyhow::bail!("Invalid pairing code. Use the full code from /link in Discord.");
         }
 
-        // Last part is the PIN (8 alphanumeric chars)
+        // Last part is the PIN
         let pin = parts.last().unwrap().to_string();
-        if pin.len() < 6 || pin.len() > 8 {
-            anyhow::bail!("Pairing code must end with a PIN (6-8 characters)");
+        if pin.len() != 8 {
+            anyhow::bail!("Invalid pairing code format");
         }
 
         // Everything before the last dash is the base32 endpoint ID
@@ -128,15 +121,15 @@ impl PairCode {
             .context("Invalid pairing code")?;
 
         if id_bytes.len() != 32 {
-            anyhow::bail!("Invalid endpoint ID in pairing code (expected 32 bytes, got {})", id_bytes.len());
+            anyhow::bail!("Invalid pairing code (bad length)");
         }
 
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&id_bytes);
         let endpoint_id = EndpointId::from_bytes(&arr)
-            .map_err(|e| anyhow::anyhow!("Invalid endpoint ID: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Invalid pairing code: {e}"))?;
 
-        Ok((Some(endpoint_id), pin))
+        Ok((endpoint_id, pin))
     }
 }
 

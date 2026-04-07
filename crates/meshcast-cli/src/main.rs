@@ -149,12 +149,7 @@ async fn cmd_link(input: String) -> Result<()> {
 
     // Try PairCode first, fall back to legacy token
     let (bot_id, pin) = match PairCode::parse(&input) {
-        Ok((Some(bot_id), pin)) => (bot_id, pin),
-        Ok((None, pin)) => {
-            let cached = config.link_state()
-                .context("No previous connection. Use the full pairing code.")?;
-            (cached.peer_endpoint_id(), pin)
-        }
+        Ok((bot_id, pin)) => (bot_id, pin),
         Err(_) => {
             // Legacy token format
             let pair = PairToken::decode(&input).context("Invalid pairing code")?;

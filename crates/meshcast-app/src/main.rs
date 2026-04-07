@@ -697,17 +697,10 @@ async fn do_link(
     config: &mut AppConfig,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
-    // Try parsing as short code first, fall back to legacy token
+    // Try parsing as PairCode, fall back to legacy token
     let (bot_id, pin) = match PairCode::parse(input) {
-        Ok((Some(bot_id), pin)) => (bot_id, pin),
-        Ok((None, pin)) => {
-            // PIN only — need cached bot endpoint ID
-            let cached = config.link_state()
-                .context("No previous connection. Use the full pairing code.")?;
-            (cached.peer_endpoint_id(), pin)
-        }
+        Ok((bot_id, pin)) => (bot_id, pin),
         Err(_) => {
-            // Try legacy token format
             return do_link_legacy(node, input, config, ui_tx).await;
         }
     };

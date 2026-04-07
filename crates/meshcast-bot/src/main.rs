@@ -173,8 +173,7 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
     ctx.say(format!(
         "**Your pairing code:**\n\
          ```\n{full_code}\n```\n\
-         Enter this in the Meshcast app to connect.\n\n\
-         *Already paired before?* Just use the PIN: **{pin}**"
+         Paste this into the Meshcast app to connect."
     ))
     .await?;
     Ok(())
