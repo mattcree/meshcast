@@ -250,7 +250,8 @@ impl eframe::App for MeshcastApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Handle quit from UI button
         if self.quit {
-            return; // let eframe close naturally
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
         }
 
         // Tray icon click events (non-Linux only — Linux uses Python subprocess)

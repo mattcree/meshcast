@@ -42,7 +42,7 @@ def quit_app(_=None):
         try:
             with open(PID_PATH) as f:
                 pid = int(f.read().strip())
-            os.kill(pid, signal.SIGTERM)
+            os.kill(pid, signal.SIGUSR1)  # triggers clean shutdown in the app
         except:
             pass
     Gtk.main_quit()
