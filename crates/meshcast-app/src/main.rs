@@ -49,6 +49,19 @@ fn create_tray_icon() -> Option<tray_icon::TrayIcon> {
         .ok()
 }
 
+/// Write tray state to a file for the Python tray subprocess to read.
+fn write_tray_state(streaming: bool, connected: bool, quality: &str, fps: u32, viewers: u32) {
+    let state_path = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join(".config/meshcast/.tray-state");
+    let json = format!(
+        r#"{{"streaming":{},"connected":{},"quality":"{}","fps":{},"viewers":{}}}"#,
+        streaming, connected, quality, fps, viewers
+    );
+    let _ = std::fs::write(&state_path, json);
+}
+
 /// Messages from the gossip background task to the UI.
 #[derive(Debug)]
 enum UiEvent {
@@ -110,6 +123,29 @@ fn main() -> Result<()> {
         )
         .init();
 
+    // Handle SIGUSR1 (sent by tray quit) — exit cleanly instead of crashing
+    #[cfg(unix)]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static QUIT_FLAG: AtomicBool = AtomicBool::new(false);
+        unsafe {
+            libc::signal(libc::SIGUSR1, handle_sigusr1 as libc::sighandler_t);
+        }
+        extern "C" fn handle_sigusr1(_: libc::c_int) {
+            QUIT_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Check flag periodically — we'll poll it in the eframe update loop
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if QUIT_FLAG.load(Ordering::Relaxed) {
+                    tracing::info!("SIGUSR1 received — exiting");
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -145,34 +181,73 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    // Spawn tray icon as a Python subprocess (GTK requires main thread, conflicts with winit)
+    // Write initial tray state
+    write_tray_state(false, false, "720p", 30, 0);
+
+    // Spawn tray icon as a Python subprocess with dynamic state reading
     #[cfg(target_os = "linux")]
     let tray_pid = std::process::Command::new("python3")
         .args(["-c", r#"
-import gi, os, signal
+import gi, os, signal, json
 gi.require_version("Gtk", "3.0")
 gi.require_version("AppIndicator3", "0.1")
-from gi.repository import Gtk, AppIndicator3
+from gi.repository import Gtk, AppIndicator3, GLib
+
 ppid = os.getppid()
-def check_parent(*_):
-    try: os.kill(ppid, 0)  # check if parent is alive
-    except: Gtk.main_quit()
-    return True
-import gi.repository.GLib as GLib
-GLib.timeout_add_seconds(2, check_parent)  # auto-quit when parent dies
+state_path = os.path.expanduser("~/.config/meshcast/.tray-state")
+last_state = {}
+
 ind = AppIndicator3.Indicator.new("meshcast", "dialog-information", AppIndicator3.IndicatorCategory.APPLICATION_STATUS)
 ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+
 menu = Gtk.Menu()
-show = Gtk.MenuItem(label="Show Meshcast")
-stop = Gtk.MenuItem(label="Stop Stream")
+show_item = Gtk.MenuItem(label="Show Meshcast")
+stop_item = Gtk.MenuItem(label="Stop Stream")
+stop_item.set_sensitive(False)
+sep = Gtk.SeparatorMenuItem()
 quit_item = Gtk.MenuItem(label="Quit Meshcast")
 quit_item.connect("activate", lambda _: (os.kill(ppid, signal.SIGUSR1), Gtk.main_quit()))
-menu.append(show)
-menu.append(stop)
-menu.append(Gtk.SeparatorMenuItem())
+menu.append(show_item)
+menu.append(stop_item)
+menu.append(sep)
 menu.append(quit_item)
 menu.show_all()
 ind.set_menu(menu)
+
+def update_state():
+    global last_state
+    # Check parent alive
+    try: os.kill(ppid, 0)
+    except: Gtk.main_quit(); return False
+    # Read state
+    try:
+        with open(state_path) as f:
+            state = json.load(f)
+    except: return True
+    if state == last_state: return True
+    last_state = state
+    streaming = state.get("streaming", False)
+    connected = state.get("connected", False)
+    quality = state.get("quality", "")
+    fps = state.get("fps", 30)
+    viewers = state.get("viewers", 0)
+    # Update menu
+    stop_item.set_sensitive(streaming)
+    # Update tooltip
+    if streaming:
+        ind.set_icon_full("media-record", "Meshcast")
+        tip = f"LIVE: {quality} {fps}fps — {viewers} viewer{'s' if viewers != 1 else ''}"
+    elif connected:
+        ind.set_icon_full("network-idle", "Meshcast")
+        tip = "Meshcast — Connected"
+    else:
+        ind.set_icon_full("dialog-information", "Meshcast")
+        tip = "Meshcast — Offline"
+    ind.set_title(tip)
+    return True
+
+GLib.timeout_add_seconds(2, update_state)
+update_state()
 Gtk.main()
 "#])
         .stdin(std::process::Stdio::null())
@@ -294,10 +369,12 @@ impl eframe::App for MeshcastApp {
                 UiEvent::Connected => {
                     s.is_connected = true;
                     s.status_msg = "Connected to bot.".into();
+                    write_tray_state(s.is_streaming, true, &s.config.video.quality, s.config.video.fps, s.viewer_count);
                 }
                 UiEvent::Disconnected => {
                     s.is_connected = false;
                     s.status_msg = "Disconnected from bot.".into();
+                    write_tray_state(s.is_streaming, false, &s.config.video.quality, s.config.video.fps, s.viewer_count);
                 }
                 UiEvent::StreamRequested { title, server } => {
                     let notify_server = server.clone();
@@ -325,15 +402,18 @@ impl eframe::App for MeshcastApp {
                     s.is_streaming = true;
                     s.stream_ticket = Some(ticket);
                     s.status_msg = String::new();
+                    write_tray_state(true, s.is_connected, &s.config.video.quality, s.config.video.fps, s.viewer_count);
                 }
                 UiEvent::StreamFailed { error } => {
                     s.status_msg = format!("Stream failed: {error}");
+                    write_tray_state(false, s.is_connected, &s.config.video.quality, s.config.video.fps, s.viewer_count);
                 }
                 UiEvent::WatchRequested => {
                     s.status_msg = "Opening viewer...".into();
                 }
                 UiEvent::ViewerCount(count) => {
                     s.viewer_count = count;
+                    write_tray_state(s.is_streaming, s.is_connected, &s.config.video.quality, s.config.video.fps, count);
                 }
                 UiEvent::Linked { config } => {
                     s.config = config;
@@ -769,6 +849,7 @@ async fn daemon_loop(
                                 let mut st = state.lock().expect("poisoned");
                                 st.is_streaming = false;
                                 st.status_msg = "Stream stopped.".into();
+                                write_tray_state(false, st.is_connected, &st.config.video.quality, st.config.video.fps, 0);
                             }
                         }
                     }

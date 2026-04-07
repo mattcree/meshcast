@@ -4057,6 +4057,7 @@ dependencies = [
  "gtk",
  "iroh",
  "iroh-live",
+ "libc",
  "meshcast-signal",
  "moq-media",
  "moq-media-egui",
