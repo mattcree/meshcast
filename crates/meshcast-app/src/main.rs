@@ -266,7 +266,7 @@ impl eframe::App for MeshcastApp {
                 UiEvent::StreamStarted { ticket } => {
                     s.is_streaming = true;
                     s.stream_ticket = Some(ticket);
-                    s.status_msg = "Streaming!".into();
+                    s.status_msg = String::new();
                 }
                 UiEvent::StreamFailed { error } => {
                     s.status_msg = format!("Stream failed: {error}");
@@ -411,19 +411,13 @@ impl eframe::App for MeshcastApp {
                     let vc = s.viewer_count;
                     let quality = s.config.video.quality.clone();
                     let fps = s.config.video.fps;
-                    ui.horizontal(|ui| {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(237, 66, 69),
-                            egui::RichText::new("● LIVE").strong(),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{quality} {fps}fps — {vc} viewer{}",
-                                if vc == 1 { "" } else { "s" }
-                            ))
-                            .color(egui::Color32::from_rgb(148, 155, 164)),
-                        );
-                    });
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{quality} {fps}fps — {vc} viewer{}",
+                            if vc == 1 { "" } else { "s" }
+                        ))
+                        .color(egui::Color32::from_rgb(185, 187, 190)),
+                    );
                     ui.add_space(8.0);
                     drop(s);
                     if ui.add_sized(
