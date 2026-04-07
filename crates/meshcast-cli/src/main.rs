@@ -405,9 +405,10 @@ fn cmd_watch(raw: String, rt: &tokio::runtime::Runtime) -> Result<()> {
             Ok(Box::new(WatchApp {
                 video: video_view,
                 _audio: tracks.audio,
-                _broadcast: tracks.broadcast,
+                broadcast: tracks.broadcast,
                 sub,
                 _live: live,
+                stream_ended: false,
             }))
         }),
     )
@@ -419,9 +420,10 @@ fn cmd_watch(raw: String, rt: &tokio::runtime::Runtime) -> Result<()> {
 struct WatchApp {
     video: Option<moq_media_egui::VideoTrackView>,
     _audio: Option<moq_media::subscribe::AudioTrack>,
-    _broadcast: moq_media::subscribe::RemoteBroadcast,
+    broadcast: moq_media::subscribe::RemoteBroadcast,
     sub: iroh_live::Subscription,
     _live: Live,
+    stream_ended: bool,
 }
 
 impl eframe::App for WatchApp {
@@ -430,11 +432,24 @@ impl eframe::App for WatchApp {
 
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
 
+        // Detect stream end
+        if !self.stream_ended && self.broadcast.shutdown_token().is_cancelled() {
+            self.stream_ended = true;
+        }
+
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(0.0).fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
                 let avail = ui.available_size();
-                if let Some(video) = self.video.as_mut() {
+                if self.stream_ended {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new("Stream ended")
+                                .color(egui::Color32::WHITE)
+                                .heading(),
+                        );
+                    });
+                } else if let Some(video) = self.video.as_mut() {
                     let (img, _) = video.render(ctx, avail);
                     ui.add_sized(avail, img);
                 } else {
