@@ -7,9 +7,10 @@ use iroh_live::ticket::LiveTicket;
 use iroh_live::Live;
 use meshcast_signal::{AppConfig, Event, LinkConfig, PairCode, PairToken, Signal, SignalNode};
 use moq_media::capture::ScreenCapturer;
-use moq_media::codec::{AudioCodec, VideoCodec};
-use moq_media::format::{AudioPreset, VideoPreset};
-use moq_media::publish::LocalBroadcast;
+use moq_media::codec::{AudioCodec, VideoCodec, h264::H264Encoder};
+use moq_media::format::{AudioPreset, VideoEncoderConfig, VideoPreset};
+use moq_media::publish::{LocalBroadcast, VideoRenditions};
+use moq_media::traits::VideoEncoderFactory;
 use moq_media::AudioBackend;
 use tokio::sync::mpsc;
 
@@ -700,9 +701,7 @@ async fn do_link_legacy(
     Ok(())
 }
 
-async fn start_stream(name: String, quality: &str, _fps: u32) -> Result<(Live, LocalBroadcast, String)> {
-    // Note: fps is stored in config but iroh-live's preset API hardcodes 30fps.
-    // Custom framerate requires iroh-live API changes. Quality (resolution) works.
+async fn start_stream(name: String, quality: &str, fps: u32) -> Result<(Live, LocalBroadcast, String)> {
     let l = Live::from_env()
         .await
         .context("Failed to initialize iroh-live")?
@@ -718,10 +717,28 @@ async fn start_stream(name: String, quality: &str, _fps: u32) -> Result<(Live, L
         "1080p" => VideoPreset::P1080,
         _ => VideoPreset::P720,
     };
-    broadcast
-        .video()
-        .set_source(screen, VideoCodec::H264, [preset])
-        .context("Failed to set video source")?;
+
+    if fps != 30 {
+        // Custom FPS: build renditions manually with VideoEncoderConfig
+        let enc_config = VideoEncoderConfig::from_preset(preset).framerate(fps);
+        let video_config = H264Encoder::config_for(&enc_config);
+        let mut renditions = VideoRenditions::empty(screen);
+        renditions.add_with_callback(
+            format!("video/h264-openh264-{quality}-{fps}fps"),
+            video_config.into(),
+            move || H264Encoder::with_config(enc_config.clone()),
+        );
+        broadcast
+            .video()
+            .set(renditions)
+            .context("Failed to set video source")?;
+    } else {
+        // Standard 30fps: use the simple preset API
+        broadcast
+            .video()
+            .set_source(screen, VideoCodec::H264, [preset])
+            .context("Failed to set video source")?;
+    }
 
     let audio_backend = AudioBackend::default();
     if let Ok(mic) = audio_backend.default_input().await {
