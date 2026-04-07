@@ -189,6 +189,101 @@ toolbox run -c meshcast ./target/release/meshcast-app
 toolbox run -c meshcast DISCORD_TOKEN="..." ./target/release/meshcast-bot
 ```
 
+## Deploying the bot
+
+### One-command deploy (Linux server / Proxmox LXC)
+
+SSH into your server and run:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/mattcree/meshcast/main/scripts/deploy-bot.sh | bash -s -- "YOUR_DISCORD_TOKEN"
+```
+
+Or clone and run locally:
+
+```bash
+git clone https://github.com/mattcree/meshcast.git
+cd meshcast
+./scripts/deploy-bot.sh "YOUR_DISCORD_TOKEN"
+```
+
+This will:
+1. Install Rust and build dependencies
+2. Build `meshcast-bot`
+3. Create and start a systemd user service
+4. Enable auto-restart on failure
+
+The bot has **no screen capture or GPU dependencies** — it runs on any minimal Linux server.
+
+### Proxmox LXC setup
+
+1. Create a Fedora container: **Datacenter → Create CT → Template: fedora-43-standard**
+2. Give it 1 CPU, 512MB RAM, 8GB disk (the bot is lightweight)
+3. Start the container and open a console
+4. Run the deploy script above
+
+### Managing the bot
+
+```bash
+# Check status
+systemctl --user status meshcast-bot
+
+# View logs
+journalctl --user -u meshcast-bot -f
+
+# Restart
+systemctl --user restart meshcast-bot
+
+# Update to latest version
+cd ~/meshcast && git pull && cargo build --release -p meshcast-bot
+cp target/release/meshcast-bot ~/.local/bin/
+systemctl --user restart meshcast-bot
+```
+
+## Relay server (for 5+ viewers)
+
+By default, your stream goes directly from your machine to each viewer (P2P). This works great for 2-4 viewers but scales linearly with your upload bandwidth.
+
+For larger audiences, deploy a **relay server** — it receives one copy of your stream and fans it out to all viewers. Your upload stays constant regardless of viewer count.
+
+### When you need a relay
+
+| Viewers | Upload needed (1080p) | Relay needed? |
+|---------|----------------------|---------------|
+| 1-2 | ~10 Mbps | No |
+| 3-4 | ~20 Mbps | Maybe |
+| 5-10 | ~50 Mbps | Yes |
+| 10+ | ~100+ Mbps | Definitely |
+
+### Setting up a relay
+
+The relay needs to be on a machine with its **own** internet connection (not your homelab on the same network). A cheap VPS works:
+
+1. Get a VPS (~$5/mo: Hetzner, Oracle Cloud free tier, DigitalOcean)
+
+2. Build iroh-live's relay:
+```bash
+# On the VPS
+git clone https://github.com/n0-computer/iroh-live.git
+cd iroh-live
+cargo build --release -p iroh-live-cli
+./target/release/irl relay
+```
+
+3. The relay prints its endpoint address. Configure meshcast to use it by passing `--relay <address>` when streaming.
+
+### How the relay works
+
+```
+Without relay:               With relay:
+You ──→ Viewer 1             You ──→ Relay ──→ Viewer 1
+You ──→ Viewer 2                          ──→ Viewer 2  
+You ──→ Viewer 3                          ──→ Viewer 3
+(3x your upload)             (1x your upload)
+```
+
+The relay is just a fan-out server — it doesn't process or re-encode the video. Relay support in Meshcast is planned but not yet integrated into the app UI.
+
 ## Platform support
 
 | | Streamer (capture + publish) | Viewer (watch) |
