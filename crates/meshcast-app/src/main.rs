@@ -181,6 +181,13 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
+    // Write PID file so tray knows if we're running
+    let pid_path = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join(".config/meshcast/.app-pid");
+    let _ = std::fs::write(&pid_path, std::process::id().to_string());
+
     // Write initial tray state
     write_tray_state(false, false, "720p", 30, 0);
 
@@ -209,10 +216,22 @@ def write_cmd(cmd):
 
 import subprocess, sys
 app_path = sys.argv[1] if len(sys.argv) > 1 else None
+pid_path = os.path.expanduser("~/.config/meshcast/.app-pid")
+app_proc = None
+
+def is_app_running():
+    try:
+        with open(pid_path) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True
+    except: return False
 
 def show_app(_):
-    if app_path:
-        subprocess.Popen([app_path], start_new_session=True)
+    global app_proc
+    if not app_path: return
+    if is_app_running(): return  # already open
+    app_proc = subprocess.Popen([app_path], start_new_session=True)
 
 menu = Gtk.Menu()
 show_item = Gtk.MenuItem(label="Show Meshcast")
@@ -313,7 +332,8 @@ Gtk.main()
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
 
-    // Kill tray subprocess on exit
+    // Clean up PID file and tray subprocess on exit
+    let _ = std::fs::remove_file(&pid_path);
     if let Some(pid) = tray_pid {
         let _ = std::process::Command::new("kill").arg(pid.to_string()).spawn();
     }
