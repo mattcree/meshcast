@@ -175,7 +175,6 @@ fn main() -> Result<()> {
                 visible: true,
                 quit: false,
                 frame_count: 0,
-                last_saved_config: None,
                 _tray: tray,
             }))
         }),
@@ -192,7 +191,6 @@ struct MeshcastApp {
     visible: bool,
     quit: bool,
     frame_count: u32,
-    last_saved_config: Option<String>, // serialized config for change detection
     _tray: Option<tray_icon::TrayIcon>,
 }
 
@@ -365,49 +363,10 @@ impl eframe::App for MeshcastApp {
                     }
                 }
             } else {
-                // Settings
-                ui.label(egui::RichText::new("Stream Settings").color(egui::Color32::WHITE).heading());
-                ui.add_space(8.0);
-
                 drop(s);
-                let mut s = self.state.lock().expect("poisoned");
-
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Quality").color(egui::Color32::from_rgb(185, 187, 190)));
-                    egui::ComboBox::from_id_salt("quality")
-                        .selected_text(&s.config.video.quality)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut s.config.video.quality, "360p".into(), "360p");
-                            ui.selectable_value(&mut s.config.video.quality, "720p".into(), "720p");
-                            ui.selectable_value(&mut s.config.video.quality, "1080p".into(), "1080p");
-                        });
-
-                    ui.add_space(12.0);
-                    ui.label(egui::RichText::new("FPS").color(egui::Color32::from_rgb(185, 187, 190)));
-                    ui.selectable_value(&mut s.config.video.fps, 30, "30");
-                    ui.selectable_value(&mut s.config.video.fps, 60, "60");
-                });
-
-                ui.add_space(4.0);
-                ui.checkbox(&mut s.config.audio.enabled, "Audio capture");
-
-                // Save config only when changed
-                let config_fingerprint = format!("{:?}", s.config);
-                if self.last_saved_config.as_ref() != Some(&config_fingerprint) {
-                    self.last_saved_config = Some(config_fingerprint);
-                    let config_snapshot = s.config.clone();
-                    if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                        rt.spawn(async move {
-                            let _ = config_snapshot.save().await;
-                        });
-                    }
-                }
-
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(8.0);
 
                 // Consent dialog for incoming stream request
+                let s = self.state.lock().expect("poisoned");
                 if let Some(title) = s.pending_stream_title.clone() {
                     ui.group(|ui| {
                         ui.label(
@@ -450,6 +409,8 @@ impl eframe::App for MeshcastApp {
                 // Stream status
                 if s.is_streaming {
                     let vc = s.viewer_count;
+                    let quality = s.config.video.quality.clone();
+                    let fps = s.config.video.fps;
                     ui.horizontal(|ui| {
                         ui.colored_label(
                             egui::Color32::from_rgb(237, 66, 69),
@@ -457,13 +418,13 @@ impl eframe::App for MeshcastApp {
                         );
                         ui.label(
                             egui::RichText::new(format!(
-                                "{vc} viewer{}",
+                                "{quality} {fps}fps — {vc} viewer{}",
                                 if vc == 1 { "" } else { "s" }
                             ))
                             .color(egui::Color32::from_rgb(148, 155, 164)),
                         );
                     });
-                    ui.add_space(4.0);
+                    ui.add_space(8.0);
                     drop(s);
                     if ui.add_sized(
                         [ui.available_width(), 32.0],
@@ -475,7 +436,7 @@ impl eframe::App for MeshcastApp {
                 } else {
                     drop(s);
                     ui.label(
-                        egui::RichText::new("Use /stream in Discord to start, or watch via the Watch button.")
+                        egui::RichText::new("Ready. Use /stream in Discord to start streaming.")
                             .color(egui::Color32::from_rgb(148, 155, 164)),
                     );
                 }
