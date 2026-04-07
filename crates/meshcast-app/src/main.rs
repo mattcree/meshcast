@@ -186,6 +186,8 @@ fn main() -> Result<()> {
 
     // Spawn tray icon as a Python subprocess with dynamic state reading
     #[cfg(target_os = "linux")]
+    let app_exe = std::env::current_exe().unwrap_or_default();
+    #[cfg(target_os = "linux")]
     let tray_pid = std::process::Command::new("python3")
         .args(["-c", r#"
 import gi, os, signal, json
@@ -205,9 +207,16 @@ cmd_path = os.path.expanduser("~/.config/meshcast/.tray-cmd")
 def write_cmd(cmd):
     with open(cmd_path, "w") as f: f.write(cmd)
 
+import subprocess, sys
+app_path = sys.argv[1] if len(sys.argv) > 1 else None
+
+def show_app(_):
+    if app_path:
+        subprocess.Popen([app_path], start_new_session=True)
+
 menu = Gtk.Menu()
 show_item = Gtk.MenuItem(label="Show Meshcast")
-show_item.connect("activate", lambda _: write_cmd("show"))
+show_item.connect("activate", show_app)
 stop_item = Gtk.MenuItem(label="Stop Stream")
 stop_item.connect("activate", lambda _: write_cmd("stop"))
 stop_item.set_sensitive(False)
@@ -256,7 +265,7 @@ def update_state():
 GLib.timeout_add_seconds(2, update_state)
 update_state()
 Gtk.main()
-"#])
+"#, app_exe.to_str().unwrap_or("")])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -379,6 +388,10 @@ impl eframe::App for MeshcastApp {
                 let _ = std::fs::remove_file(&cmd_path);
                 match cmd.trim() {
                     "show" => {
+                        // On Wayland, focus/minimize commands are often ignored.
+                        // Toggle visibility to force window re-map.
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
