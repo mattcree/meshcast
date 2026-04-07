@@ -191,108 +191,10 @@ fn main() -> Result<()> {
     // Write initial tray state
     write_tray_state(false, false, "720p", 30, 0);
 
-    // Spawn tray icon as a Python subprocess with dynamic state reading
-    #[cfg(target_os = "linux")]
-    let app_exe = std::env::current_exe().unwrap_or_default();
-    #[cfg(target_os = "linux")]
-    let tray_pid = std::process::Command::new("python3")
-        .args(["-c", r#"
-import gi, os, signal, json
-gi.require_version("Gtk", "3.0")
-gi.require_version("AppIndicator3", "0.1")
-from gi.repository import Gtk, AppIndicator3, GLib
-
-ppid = os.getppid()
-state_path = os.path.expanduser("~/.config/meshcast/.tray-state")
-last_state = {}
-
-ind = AppIndicator3.Indicator.new("meshcast", "dialog-information", AppIndicator3.IndicatorCategory.APPLICATION_STATUS)
-ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
-
-cmd_path = os.path.expanduser("~/.config/meshcast/.tray-cmd")
-
-def write_cmd(cmd):
-    with open(cmd_path, "w") as f: f.write(cmd)
-
-import subprocess, sys
-app_path = sys.argv[1] if len(sys.argv) > 1 else None
-pid_path = os.path.expanduser("~/.config/meshcast/.app-pid")
-app_proc = None
-
-def is_app_running():
-    try:
-        with open(pid_path) as f:
-            pid = int(f.read().strip())
-        os.kill(pid, 0)
-        return True
-    except: return False
-
-def show_app(_):
-    global app_proc
-    if not app_path: return
-    if is_app_running(): return  # already open
-    app_proc = subprocess.Popen([app_path], start_new_session=True)
-
-menu = Gtk.Menu()
-show_item = Gtk.MenuItem(label="Show Meshcast")
-show_item.connect("activate", show_app)
-stop_item = Gtk.MenuItem(label="Stop Stream")
-stop_item.connect("activate", lambda _: write_cmd("stop"))
-stop_item.set_sensitive(False)
-sep = Gtk.SeparatorMenuItem()
-quit_item = Gtk.MenuItem(label="Quit Meshcast")
-quit_item.connect("activate", lambda _: (os.kill(ppid, signal.SIGUSR1), Gtk.main_quit()))
-menu.append(show_item)
-menu.append(stop_item)
-menu.append(sep)
-menu.append(quit_item)
-menu.show_all()
-ind.set_menu(menu)
-
-def update_state():
-    global last_state
-    # Check parent alive
-    try: os.kill(ppid, 0)
-    except: Gtk.main_quit(); return False
-    # Read state
-    try:
-        with open(state_path) as f:
-            state = json.load(f)
-    except: return True
-    if state == last_state: return True
-    last_state = state
-    streaming = state.get("streaming", False)
-    connected = state.get("connected", False)
-    quality = state.get("quality", "")
-    fps = state.get("fps", 30)
-    viewers = state.get("viewers", 0)
-    # Update menu
-    stop_item.set_sensitive(streaming)
-    # Update tooltip
-    if streaming:
-        ind.set_icon_full("media-record", "Meshcast")
-        tip = f"LIVE: {quality} {fps}fps — {viewers} viewer{'s' if viewers != 1 else ''}"
-    elif connected:
-        ind.set_icon_full("network-idle", "Meshcast")
-        tip = "Meshcast — Connected"
-    else:
-        ind.set_icon_full("dialog-information", "Meshcast")
-        tip = "Meshcast — Offline"
-    ind.set_title(tip)
-    return True
-
-GLib.timeout_add_seconds(2, update_state)
-update_state()
-Gtk.main()
-"#, app_exe.to_str().unwrap_or("")])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()
-        .map(|c| c.id());
+    // Tray icon is managed externally via scripts/meshcast-tray.py
+    // On macOS/Windows, use the Rust tray-icon crate instead
     #[cfg(not(target_os = "linux"))]
-    let tray_pid: Option<u32> = None;
+    let _tray = create_tray_icon();
 
     eframe::run_native(
         "Meshcast",
@@ -323,20 +225,15 @@ Gtk.main()
                 state,
                 ui_rx,
                 cmd_tx,
-                visible: true,
                 quit: false,
-                frame_count: 0,
                 _tray: tray,
             }))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
 
-    // Clean up PID file and tray subprocess on exit
+    // Clean up PID file on exit
     let _ = std::fs::remove_file(&pid_path);
-    if let Some(pid) = tray_pid {
-        let _ = std::process::Command::new("kill").arg(pid.to_string()).spawn();
-    }
 
     Ok(())
 }
@@ -345,48 +242,27 @@ struct MeshcastApp {
     state: Arc<Mutex<AppState>>,
     ui_rx: mpsc::UnboundedReceiver<UiEvent>,
     cmd_tx: mpsc::UnboundedSender<DaemonCmd>,
-    visible: bool,
     quit: bool,
-    frame_count: u32,
     _tray: Option<tray_icon::TrayIcon>,
 }
 
 impl eframe::App for MeshcastApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.frame_count = self.frame_count.saturating_add(1);
-
-        // Handle quit flag from UI button or tray menu
-        if self.quit && self.frame_count > 10 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
+        // Handle quit from UI button
+        if self.quit {
+            return; // let eframe close naturally
         }
 
-        // Consume any stale close events from previous instance
-        if self.frame_count <= 10 {
-            if ctx.input(|i| i.viewport().close_requested()) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        // Tray icon click events (non-Linux only — Linux uses Python subprocess)
+        if self._tray.is_some() {
+            if let Ok(tray_icon::TrayIconEvent::Click { .. }) = tray_icon::TrayIconEvent::receiver().try_recv() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
-            // Don't process quit button clicks in early frames
-            self.quit = false;
-        }
-
-        // Handle window close → minimize instead of quitting
-        if self.frame_count > 10 && ctx.input(|i| i.viewport().close_requested()) && !self.quit {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            self.visible = false;
-        }
-
-        // Check tray icon events — show window on click
-        if let Ok(tray_icon::TrayIconEvent::Click { .. }) = tray_icon::TrayIconEvent::receiver().try_recv() {
-            self.visible = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
             match event.id().0.as_str() {
                 "show" => {
-                    self.visible = true;
+
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
@@ -454,7 +330,7 @@ impl eframe::App for MeshcastApp {
                             .spawn();
                     });
                     drop(s);
-                    self.visible = true;
+
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     continue;
