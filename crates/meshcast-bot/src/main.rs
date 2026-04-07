@@ -15,11 +15,10 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
 struct Data {
-    active_streams: Mutex<HashMap<ChannelId, (MessageId, String, UserId, String)>>, // (msg_id, ticket, streamer, title)
+    active_streams: std::sync::Arc<Mutex<HashMap<ChannelId, (MessageId, String, UserId, String)>>>,
     viewers: Mutex<HashMap<ChannelId, std::collections::HashSet<UserId>>>,
     signal_node: SignalNode,
     links: Mutex<HashMap<UserId, iroh_gossip::api::GossipSender>>,
-    /// Pending pairing PINs: PIN → (topic, user_id, created_at)
     pending_pins: Mutex<HashMap<String, (iroh_gossip::proto::TopicId, UserId, std::time::Instant)>>,
     signal_tx: broadcast::Sender<(UserId, Signal)>,
     store_path: std::path::PathBuf,
@@ -298,13 +297,62 @@ async fn main() -> anyhow::Result<()> {
     let restored_count = links.len();
     tracing::info!("Restored {restored_count} link(s)");
 
+    // Subscribe to signals for background stream-end handling
+    let mut stream_end_rx = signal_tx.subscribe();
+
     let framework = poise::Framework::builder()
         .setup(move |ctx, _ready, framework| {
+            let http = ctx.http.clone();
+
+            // Spawn background task to update Discord embeds when streams end
+            let active_streams = std::sync::Arc::new(Mutex::new(HashMap::<ChannelId, (MessageId, String, UserId, String)>::new()));
+            let active_streams_bg = active_streams.clone();
+            let http_bg = http.clone();
+            tokio::spawn(async move {
+                while let Ok((user_id, signal)) = stream_end_rx.recv().await {
+                    if let Signal::StreamStopped = signal {
+                        tracing::info!(user = %user_id, "Stream stopped — updating embed");
+                        // Find and update the embed for this user's stream
+                        let entry: Option<(ChannelId, MessageId, String)> = {
+                            let mut streams = active_streams_bg.lock().expect("poisoned");
+                            let mut found = None;
+                            streams.retain(|channel_id, (msg_id, _, streamer, title)| {
+                                if *streamer == user_id {
+                                    found = Some((*channel_id, *msg_id, title.clone()));
+                                    false // remove
+                                } else {
+                                    true
+                                }
+                            });
+                            found
+                        };
+                        if let Some((channel_id, message_id, title)) = entry {
+                            let ended_embed = CreateEmbed::new()
+                                .title(title)
+                                .description("This stream has ended.")
+                                .color(0x99AAB5)
+                                .footer(serenity::all::CreateEmbedFooter::new("Stream ended"))
+                                .timestamp(serenity::model::Timestamp::now());
+                            let edit = serenity::all::EditMessage::new()
+                                .embed(ended_embed)
+                                .components(vec![]);
+                            if let Err(e) = http_bg.get_message(channel_id, message_id).await
+                                .and_then(|_| Ok(()))
+                            {
+                                tracing::warn!("Failed to fetch message for embed update: {e}");
+                            } else {
+                                let _ = channel_id.edit_message(&http_bg, message_id, edit).await;
+                            }
+                        }
+                    }
+                }
+            });
+
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
                 tracing::info!("Bot is ready");
                 Ok(Data {
-                    active_streams: Mutex::new(HashMap::new()),
+                    active_streams,
                     viewers: Mutex::new(HashMap::new()),
                     signal_node,
                     signal_tx,
