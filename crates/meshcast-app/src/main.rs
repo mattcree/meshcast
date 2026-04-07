@@ -423,10 +423,9 @@ impl eframe::App for MeshcastApp {
                                 .heading(),
                         );
                         if !server.is_empty() {
-                            ui.label(format!("From **{server}**: \"{title}\""));
-                        } else {
-                            ui.label(format!("\"{title}\""));
+                            ui.label(egui::RichText::new(&server).color(egui::Color32::WHITE).strong());
                         }
+                        ui.label(format!("\"{title}\""));
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             drop(s);
