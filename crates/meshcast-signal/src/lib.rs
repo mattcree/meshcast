@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -34,6 +34,37 @@ impl Signal {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         Ok(postcard::from_bytes(bytes)?)
     }
+}
+
+/// Daemon state written to `.tray-state` as JSON.
+/// Read by the tray script and the thin app window.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DaemonState {
+    pub streaming: bool,
+    pub connected: bool,
+    #[serde(default)]
+    pub quality: String,
+    #[serde(default)]
+    pub fps: u32,
+    #[serde(default)]
+    pub viewers: u32,
+    #[serde(default)]
+    pub stream_ticket: Option<String>,
+    #[serde(default)]
+    pub linked_servers: Vec<String>,
+    #[serde(default)]
+    pub pending_request: Option<StreamRequest>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// A pending stream request from the Discord bot, awaiting user consent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamRequest {
+    pub title: String,
+    pub server: String,
+    pub quality: String,
+    pub fps: u32,
 }
 
 /// Pairing token exchanged between bot and desktop app.
@@ -385,8 +416,24 @@ impl AppConfig {
             .join(".config/meshcast")
     }
 
-    pub fn config_path() -> std::path::PathBuf {
+    pub fn config_path() -> PathBuf {
         Self::config_dir().join("config.toml")
+    }
+
+    pub fn state_path() -> PathBuf {
+        Self::config_dir().join(".tray-state")
+    }
+
+    pub fn cmd_path() -> PathBuf {
+        Self::config_dir().join(".tray-cmd")
+    }
+
+    pub fn daemon_pid_path() -> PathBuf {
+        Self::config_dir().join(".daemon-pid")
+    }
+
+    pub fn app_pid_path() -> PathBuf {
+        Self::config_dir().join(".app-pid")
     }
 
     pub async fn load() -> Result<Self> {
@@ -405,6 +452,32 @@ impl AppConfig {
         }
         let data = toml::to_string_pretty(self)?;
         tokio::fs::write(&path, data).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    /// Load config synchronously (for use without tokio).
+    pub fn load_sync() -> Result<Self> {
+        let path = Self::config_path();
+        match std::fs::read_to_string(&path) {
+            Ok(data) => Ok(toml::from_str(&data)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).with_context(|| "Failed to read config"),
+        }
+    }
+
+    /// Save config synchronously (for use without tokio).
+    pub fn save_sync(&self) -> Result<()> {
+        let path = Self::config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let data = toml::to_string_pretty(self)?;
+        std::fs::write(&path, data)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

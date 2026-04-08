@@ -1,48 +1,86 @@
 #!/usr/bin/env python3
-"""Meshcast tray icon — manages the app lifecycle."""
+"""Meshcast tray icon — manages daemon + app lifecycle separately."""
 import gi, os, signal, json, subprocess, sys
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("AppIndicator3", "0.1")
 from gi.repository import Gtk, AppIndicator3, GLib
 
-# Find the app binary
-APP_PATH = os.environ.get("MESHCAST_APP", os.path.expanduser("~/.local/bin/meshcast-app"))
+# Binaries — run inside toolbox for library access (libxdo, pipewire, etc.)
+TOOLBOX = os.environ.get("MESHCAST_TOOLBOX", "meshcast")
+DAEMON_BIN = os.environ.get("MESHCAST_DAEMON", os.path.expanduser("~/.local/bin/meshcast"))
+APP_BIN = os.environ.get("MESHCAST_APP", os.path.expanduser("~/.local/bin/meshcast-app"))
 if len(sys.argv) > 1:
-    APP_PATH = sys.argv[1]
+    DAEMON_BIN = sys.argv[1]
+if len(sys.argv) > 2:
+    APP_BIN = sys.argv[2]
 
+# State files
 STATE_PATH = os.path.expanduser("~/.config/meshcast/.tray-state")
 CMD_PATH = os.path.expanduser("~/.config/meshcast/.tray-cmd")
-PID_PATH = os.path.expanduser("~/.config/meshcast/.app-pid")
+APP_PID_PATH = os.path.expanduser("~/.config/meshcast/.app-pid")
+DAEMON_PID_PATH = os.path.expanduser("~/.config/meshcast/.daemon-pid")
 
-app_proc = None
 last_state = {}
+had_pending = False  # track whether we already opened app for current request
 
-def is_app_running():
+def _is_pid_alive(pid_path):
     try:
-        with open(PID_PATH) as f:
+        with open(pid_path) as f:
             pid = int(f.read().strip())
         os.kill(pid, 0)
         return True
     except:
         return False
 
+def is_app_running():
+    return _is_pid_alive(APP_PID_PATH)
+
+def is_daemon_running():
+    return _is_pid_alive(DAEMON_PID_PATH)
+
+def _toolbox_cmd(binary, *args):
+    """Wrap a command with toolbox run if TOOLBOX is set."""
+    if TOOLBOX:
+        return ["toolbox", "run", "-c", TOOLBOX, binary, *args]
+    return [binary, *args]
+
+def start_daemon():
+    if is_daemon_running():
+        return
+    subprocess.Popen(_toolbox_cmd(DAEMON_BIN, "daemon"), start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 def show_app(_=None):
-    global app_proc
     if is_app_running():
         return
-    app_proc = subprocess.Popen([APP_PATH], start_new_session=True)
+    subprocess.Popen(_toolbox_cmd(APP_BIN), start_new_session=True)
 
 def stop_stream(_=None):
     with open(CMD_PATH, "w") as f:
         f.write("stop")
 
-def quit_app(_=None):
+def quit_all(_=None):
+    # Stop any active stream
+    try:
+        with open(CMD_PATH, "w") as f:
+            f.write("stop")
+    except:
+        pass
+    # Kill app window
     if is_app_running():
         try:
-            with open(PID_PATH) as f:
+            with open(APP_PID_PATH) as f:
                 pid = int(f.read().strip())
-            os.kill(pid, signal.SIGUSR1)  # triggers clean shutdown in the app
+            os.kill(pid, signal.SIGUSR1)
+        except:
+            pass
+    # Kill daemon
+    if is_daemon_running():
+        try:
+            with open(DAEMON_PID_PATH) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGTERM)
         except:
             pass
     Gtk.main_quit()
@@ -63,7 +101,7 @@ stop_item.connect("activate", stop_stream)
 stop_item.set_sensitive(False)
 sep = Gtk.SeparatorMenuItem()
 quit_item = Gtk.MenuItem(label="Quit Meshcast")
-quit_item.connect("activate", quit_app)
+quit_item.connect("activate", quit_all)
 menu.append(show_item)
 menu.append(stop_item)
 menu.append(sep)
@@ -72,12 +110,20 @@ menu.show_all()
 ind.set_menu(menu)
 
 def update_state():
-    global last_state
+    global last_state, had_pending
     try:
         with open(STATE_PATH) as f:
             state = json.load(f)
     except:
         state = {}
+
+    # Auto-open app window when a new stream request arrives
+    pending = state.get("pending_request")
+    if pending and not had_pending:
+        had_pending = True
+        show_app()
+    elif not pending:
+        had_pending = False
 
     if state == last_state:
         return True
@@ -93,13 +139,13 @@ def update_state():
 
     if streaming:
         ind.set_icon_full("media-record", "Meshcast")
-        tip = f"LIVE: {quality} {fps}fps — {viewers} viewer{'s' if viewers != 1 else ''}"
+        tip = f"LIVE: {quality} {fps}fps \u2014 {viewers} viewer{'s' if viewers != 1 else ''}"
     elif connected:
         ind.set_icon_full("network-idle", "Meshcast")
-        tip = "Meshcast — Connected"
+        tip = "Meshcast \u2014 Connected"
     else:
         ind.set_icon_full("dialog-information", "Meshcast")
-        tip = "Meshcast — Ready"
+        tip = "Meshcast \u2014 Ready"
 
     ind.set_title(tip)
     return True
@@ -107,7 +153,8 @@ def update_state():
 GLib.timeout_add_seconds(2, update_state)
 update_state()
 
-# Auto-launch the app on start
+# Start daemon (long-lived), then open app window (disposable)
+start_daemon()
 show_app()
 
 Gtk.main()

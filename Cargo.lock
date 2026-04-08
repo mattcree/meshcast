@@ -4053,18 +4053,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "eframe",
- "futures-lite",
- "gtk",
- "iroh",
- "iroh-live",
  "libc",
  "meshcast-signal",
- "moq-media",
- "moq-media-egui",
- "tokio",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+ "wgpu",
 ]
 
 [[package]]
@@ -4098,6 +4093,7 @@ dependencies = [
  "meshcast-signal",
  "moq-media",
  "moq-media-egui",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -12,16 +12,11 @@ path = "src/main.rs"
 anyhow = "1"
 libc = "0.2"
 eframe = { version = "0.33.0", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
-futures-lite = "2"
-iroh = { git = "https://github.com/n0-computer/iroh", rev = "8af8370b567d9e9a89aaf25929b327a6a5b96de1" }
-iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "edd9bcc530a615f3ab3a6919e96790a077905376", features = ["h264", "opus", "capture-screen"] }
 meshcast-signal = { path = "../meshcast-signal" }
-moq-media = { git = "https://github.com/n0-computer/iroh-live", rev = "edd9bcc530a615f3ab3a6919e96790a077905376" }
-moq-media-egui = { git = "https://github.com/n0-computer/iroh-live", rev = "edd9bcc530a615f3ab3a6919e96790a077905376" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tray-icon = "0.19"
+wgpu = { version = "27", default-features = false, features = ["vulkan", "gles"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-gtk = "0.18"
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+tray-icon = "0.19"
