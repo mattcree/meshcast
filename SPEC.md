@@ -1,3 +1,5 @@
+> **Historical document.** This is the original design spec written before the project existed. It is kept for context; the current architecture, protocol and Discord-integration rationale are documented in [docs/DESIGN.md](docs/DESIGN.md), and the live work list is [BACKLOG.md](BACKLOG.md). Where the two disagree, DESIGN.md wins.
+
 # Meshcast — P2P Screen Streaming for Discord via iroh-live
 
 ## Problem

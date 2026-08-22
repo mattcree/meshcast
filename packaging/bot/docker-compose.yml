@@ -1,0 +1,22 @@
+# Run the Meshcast Discord bot with Docker Compose.
+#
+#   1. Put your bot token in a .env file next to this compose file:
+#        DISCORD_TOKEN=your-token-here
+#   2. docker compose up -d
+#   3. docker compose logs -f
+#
+# The bot needs outbound UDP/TCP (iroh + Discord gateway); no inbound ports.
+
+services:
+  meshcast-bot:
+    image: ghcr.io/mattcree/meshcast-bot:latest
+    container_name: meshcast-bot
+    restart: unless-stopped
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN:?set DISCORD_TOKEN in .env}
+      RUST_LOG: meshcast_bot=info,iroh=warn
+    volumes:
+      - meshcast-bot-data:/data
+
+volumes:
+  meshcast-bot-data:

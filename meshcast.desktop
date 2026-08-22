@@ -1,8 +1,0 @@
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=Meshcast
-Exec=/var/home/cree/.local/bin/meshcast-watch %u
-NoDisplay=true
-Terminal=false
-MimeType=x-scheme-handler/meshcast;

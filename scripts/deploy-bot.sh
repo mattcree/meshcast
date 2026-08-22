@@ -1,131 +1,250 @@
-#!/bin/bash
-set -euo pipefail
-
-# Meshcast Bot Deployment Script
-# Deploys the Discord bot as a systemd service.
+#!/usr/bin/env bash
+# Meshcast Discord bot — one-command deploy for a Linux server
+# (Proxmox LXC, VPS, Raspberry Pi, your homelab box…).
 #
-# Usage:
-#   ./deploy-bot.sh <DISCORD_TOKEN>
+#   curl -fsSL https://raw.githubusercontent.com/mattcree/meshcast/main/scripts/deploy-bot.sh \
+#     | bash -s -- YOUR_DISCORD_TOKEN
 #
-# Run this ON the machine where you want the bot to run
-# (e.g. inside a Proxmox LXC, a VPS, or any Linux server).
+# or:  DISCORD_TOKEN=... ./deploy-bot.sh
+#
+# Options:
+#   --version vX.Y.Z   install a specific release (default: latest)
+#   --from-source      build with cargo instead of downloading the release binary
+#                      (automatic on CPUs without a prebuilt binary, e.g. arm64)
+#   --update           re-download/rebuild and restart (token unchanged)
+#   --uninstall        stop and remove the service (keeps state dir)
 #
 # What it does:
-#   1. Installs Rust (if not present)
-#   2. Installs minimal build dependencies
-#   3. Clones and builds meshcast-bot
-#   4. Creates a systemd user service
-#   5. Starts the bot
+#   * installs the meshcast-bot binary (prebuilt from GitHub Releases, or builds it)
+#   * stores the token in a 0600 env file, never in the unit file
+#   * installs and starts a systemd service (system-wide if root, else a
+#     user service with lingering enabled)
+#   * the bot keeps its identity + links in its state dir, so restarts and
+#     updates don't require users to /link again
+set -euo pipefail
 
-DISCORD_TOKEN="${1:?Usage: $0 <DISCORD_TOKEN>}"
-REPO_URL="https://github.com/mattcree/meshcast.git"
-INSTALL_DIR="$HOME/meshcast"
-BIN_DIR="$HOME/.local/bin"
-SERVICE_DIR="$HOME/.config/systemd/user"
+REPO="${MESHCAST_REPO:-mattcree/meshcast}"
+VERSION="${MESHCAST_VERSION:-latest}"
+FROM_SOURCE=0
+UPDATE=0
+UNINSTALL=0
+TOKEN="${DISCORD_TOKEN:-}"
 
-echo "=== Meshcast Bot Deployment ==="
-echo ""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --version) VERSION="$2"; shift 2 ;;
+        --from-source) FROM_SOURCE=1; shift ;;
+        --update) UPDATE=1; shift ;;
+        --uninstall) UNINSTALL=1; shift ;;
+        -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+        --*) echo "Unknown option: $1" >&2; exit 2 ;;
+        *) TOKEN="$1"; shift ;;
+    esac
+done
 
-# Detect package manager
-if command -v dnf &>/dev/null; then
-    PKG_INSTALL="sudo dnf install -y"
-elif command -v apt-get &>/dev/null; then
-    PKG_INSTALL="sudo apt-get install -y"
-    sudo apt-get update -qq
-elif command -v pacman &>/dev/null; then
-    PKG_INSTALL="sudo pacman -S --noconfirm"
+info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# --- Where things go -------------------------------------------------------
+
+if [ "$(id -u)" = 0 ]; then
+    SCOPE=system
+    BIN_DIR=/usr/local/bin
+    STATE_DIR=/var/lib/meshcast-bot
+    ENV_FILE=/etc/meshcast-bot.env
+    UNIT_DIR=/etc/systemd/system
+    SYSTEMCTL=(systemctl)
+    SERVICE_USER=meshcast-bot
 else
-    echo "Error: No supported package manager found (dnf, apt, pacman)"
-    exit 1
+    SCOPE=user
+    BIN_DIR="$HOME/.local/bin"
+    STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/meshcast-bot"
+    ENV_FILE="$STATE_DIR/discord.env"
+    UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    SYSTEMCTL=(systemctl --user)
+    SERVICE_USER=""
+fi
+UNIT="$UNIT_DIR/meshcast-bot.service"
+SRC_DIR="${MESHCAST_SRC_DIR:-$HOME/meshcast}"
+
+command -v systemctl >/dev/null 2>&1 || die "systemd is required (no systemctl found)."
+
+# --- Uninstall -------------------------------------------------------------
+
+if [ "$UNINSTALL" = 1 ]; then
+    info "Stopping and removing meshcast-bot service"
+    "${SYSTEMCTL[@]}" disable --now meshcast-bot.service 2>/dev/null || true
+    rm -f "$UNIT" "$BIN_DIR/meshcast-bot"
+    "${SYSTEMCTL[@]}" daemon-reload
+    echo "Removed. Token file ($ENV_FILE) and state ($STATE_DIR) were kept; delete them manually if you want."
+    exit 0
 fi
 
-# Install build dependencies
-# The bot only needs Rust + C toolchain (no PipeWire, no GPU, no audio)
-echo ">>> Installing build dependencies..."
-if command -v dnf &>/dev/null; then
-    $PKG_INSTALL gcc gcc-c++ pkg-config openssl-devel cmake clang-devel
-elif command -v apt-get &>/dev/null; then
-    $PKG_INSTALL build-essential pkg-config libssl-dev cmake clang
-elif command -v pacman &>/dev/null; then
-    $PKG_INSTALL base-devel pkg-config openssl cmake clang
-fi
+# --- Token -----------------------------------------------------------------
 
-# Install Rust
-if ! command -v cargo &>/dev/null; then
-    echo ">>> Installing Rust..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    source "$HOME/.cargo/env"
+if [ "$UPDATE" = 1 ] && [ -z "$TOKEN" ]; then
+    [ -f "$ENV_FILE" ] || die "No existing token file at $ENV_FILE; pass the token."
 else
-    echo ">>> Rust already installed ($(rustc --version))"
+    [ -n "$TOKEN" ] || die "Usage: $0 <DISCORD_TOKEN>   (or set DISCORD_TOKEN). Get one at https://discord.com/developers/applications — see docs/DISCORD-SETUP.md"
+    case "$TOKEN" in
+        *" "*|*$'\t'*) die "Token contains whitespace — did you paste the whole thing?" ;;
+    esac
 fi
 
-# Clone or update repo
-if [ -d "$INSTALL_DIR" ]; then
-    echo ">>> Updating meshcast..."
-    cd "$INSTALL_DIR"
-    git pull --ff-only
-else
-    echo ">>> Cloning meshcast..."
-    git clone "$REPO_URL" "$INSTALL_DIR"
-    cd "$INSTALL_DIR"
-fi
+# --- Install binary --------------------------------------------------------
 
-# Build only the bot (much faster than full workspace — no screen capture deps)
-echo ">>> Building meshcast-bot (this may take a few minutes on first build)..."
-cargo build --release -p meshcast-bot
+ARCH="$(uname -m)"
+ASSET=""
+case "$ARCH" in
+    x86_64|amd64) ASSET="meshcast-bot-linux-x86_64.tar.gz" ;;
+    *) warn "No prebuilt bot binary for $ARCH — building from source."; FROM_SOURCE=1 ;;
+esac
 
-# Install binary
 mkdir -p "$BIN_DIR"
-cp target/release/meshcast-bot "$BIN_DIR/meshcast-bot"
-echo ">>> Installed meshcast-bot to $BIN_DIR/meshcast-bot"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
 
-# Store token in a credential file (not in the unit file)
-CRED_DIR="$HOME/.config/meshcast-bot"
-CRED_FILE="$CRED_DIR/discord.env"
-mkdir -p "$CRED_DIR"
-echo "DISCORD_TOKEN=${DISCORD_TOKEN}" > "$CRED_FILE"
-chmod 600 "$CRED_FILE"
-echo ">>> Stored Discord token in $CRED_FILE (mode 600)"
+if [ "$FROM_SOURCE" = 0 ]; then
+    command -v curl >/dev/null 2>&1 || die "curl is required."
+    if [ "$VERSION" = "latest" ]; then
+        BASE="https://github.com/$REPO/releases/latest/download"
+    else
+        BASE="https://github.com/$REPO/releases/download/$VERSION"
+    fi
+    info "Downloading $ASSET ($VERSION)…"
+    if curl -fsSL --retry 3 -o "$WORK/$ASSET" "$BASE/$ASSET"; then
+        if curl -fsSL --retry 3 -o "$WORK/SHA256SUMS" "$BASE/SHA256SUMS" 2>/dev/null; then
+            EXPECTED="$(grep " $ASSET\$" "$WORK/SHA256SUMS" | awk '{print $1}')"
+            ACTUAL="$(sha256sum "$WORK/$ASSET" | awk '{print $1}')"
+            [ -z "$EXPECTED" ] || [ "$EXPECTED" = "$ACTUAL" ] || die "Checksum mismatch for $ASSET"
+            info "Checksum OK"
+        fi
+        tar xzf "$WORK/$ASSET" -C "$WORK"
+        install -m 0755 "$WORK/meshcast-bot/meshcast-bot" "$BIN_DIR/meshcast-bot"
+    else
+        warn "Download failed (no release for $VERSION?). Falling back to building from source."
+        FROM_SOURCE=1
+    fi
+fi
 
-# Create systemd user service
-mkdir -p "$SERVICE_DIR"
-cat > "$SERVICE_DIR/meshcast-bot.service" << EOF
+if [ "$FROM_SOURCE" = 1 ]; then
+    info "Building meshcast-bot from source (this takes a few minutes the first time)…"
+    if command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y gcc gcc-c++ git pkg-config cmake clang-devel
+    elif command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update -qq && sudo apt-get install -y build-essential git pkg-config cmake clang libclang-dev
+    elif command -v pacman >/dev/null 2>&1; then
+        sudo pacman -S --noconfirm --needed base-devel git pkg-config cmake clang
+    else
+        warn "Unknown package manager; make sure gcc, git, pkg-config, cmake and clang are installed."
+    fi
+    if ! command -v cargo >/dev/null 2>&1; then
+        info "Installing Rust…"
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        # shellcheck disable=SC1091
+        source "$HOME/.cargo/env"
+    fi
+    if [ -d "$SRC_DIR/.git" ]; then
+        git -C "$SRC_DIR" pull --ff-only
+    else
+        git clone "https://github.com/$REPO.git" "$SRC_DIR"
+    fi
+    if [ "$VERSION" != "latest" ]; then git -C "$SRC_DIR" checkout "$VERSION"; fi
+    (cd "$SRC_DIR" && cargo build --release --locked -p meshcast-bot)
+    install -m 0755 "$SRC_DIR/target/release/meshcast-bot" "$BIN_DIR/meshcast-bot"
+fi
+info "Installed $BIN_DIR/meshcast-bot"
+
+# --- Token file + state dir -----------------------------------------------
+
+if [ "$SCOPE" = system ]; then
+    id -u "$SERVICE_USER" >/dev/null 2>&1 || useradd --system --home-dir "$STATE_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
+    mkdir -p "$STATE_DIR"
+    chown "$SERVICE_USER:$SERVICE_USER" "$STATE_DIR"
+    chmod 0700 "$STATE_DIR"
+else
+    mkdir -p "$STATE_DIR"
+    chmod 0700 "$STATE_DIR"
+fi
+
+if [ -n "$TOKEN" ]; then
+    umask 077
+    printf 'DISCORD_TOKEN=%s\n' "$TOKEN" > "$ENV_FILE"
+    umask 022
+    chmod 0600 "$ENV_FILE"
+    [ "$SCOPE" = system ] && chown root:root "$ENV_FILE"
+    info "Stored token in $ENV_FILE (mode 600)"
+fi
+
+# --- systemd unit ----------------------------------------------------------
+
+mkdir -p "$UNIT_DIR"
+if [ "$SCOPE" = system ]; then
+    USER_LINE="User=$SERVICE_USER"
+    WANTED_BY="multi-user.target"
+    PROTECT_HOME="true"
+else
+    USER_LINE=""
+    WANTED_BY="default.target"
+    PROTECT_HOME="read-only"
+fi
+
+cat > "$UNIT" <<EOF
 [Unit]
 Description=Meshcast Discord Bot
+Documentation=https://github.com/$REPO
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=${CRED_FILE}
-ExecStart=${BIN_DIR}/meshcast-bot
-Restart=on-failure
+EnvironmentFile=$ENV_FILE
+Environment=RUST_LOG=meshcast_bot=info,iroh=warn
+Environment=MESHCAST_BOT_STATE_DIR=$STATE_DIR
+ExecStart=$BIN_DIR/meshcast-bot
+Restart=always
 RestartSec=10
+$USER_LINE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=$PROTECT_HOME
+ReadWritePaths=$STATE_DIR
 
 [Install]
-WantedBy=default.target
+WantedBy=$WANTED_BY
 EOF
+info "Wrote $UNIT"
 
-echo ">>> Created systemd service"
+if [ "$SCOPE" = user ]; then
+    loginctl enable-linger "$(whoami)" 2>/dev/null || warn "Couldn't enable lingering; the bot will stop when you log out."
+fi
 
-# Enable lingering so the service runs without an active login session
-loginctl enable-linger "$(whoami)" 2>/dev/null || true
+"${SYSTEMCTL[@]}" daemon-reload
+"${SYSTEMCTL[@]}" enable meshcast-bot.service >/dev/null
+"${SYSTEMCTL[@]}" restart meshcast-bot.service
 
-# Start the service
-systemctl --user daemon-reload
-systemctl --user enable meshcast-bot.service
-systemctl --user restart meshcast-bot.service
+sleep 2
+if "${SYSTEMCTL[@]}" is-active --quiet meshcast-bot.service; then
+    echo
+    info "meshcast-bot is running."
+else
+    warn "meshcast-bot is not running. Check the logs:"
+fi
 
-echo ""
-echo "=== Deployment complete ==="
-echo ""
-echo "The bot is running. Check status with:"
-echo "  systemctl --user status meshcast-bot"
-echo ""
-echo "View logs with:"
-echo "  journalctl --user -u meshcast-bot -f"
-echo ""
-echo "To update later:"
-echo "  cd $INSTALL_DIR && git pull && cargo build --release -p meshcast-bot"
-echo "  cp target/release/meshcast-bot $BIN_DIR/"
-echo "  systemctl --user restart meshcast-bot"
+if [ "$SCOPE" = system ]; then
+    LOGS="journalctl -u meshcast-bot -f"
+    STATUS="systemctl status meshcast-bot"
+else
+    LOGS="journalctl --user -u meshcast-bot -f"
+    STATUS="systemctl --user status meshcast-bot"
+fi
+cat <<EOF
+
+  Status:  $STATUS
+  Logs:    $LOGS
+  Update:  curl -fsSL https://raw.githubusercontent.com/$REPO/main/scripts/deploy-bot.sh | bash -s -- --update
+
+Next: invite the bot to your server (docs/DISCORD-SETUP.md), then run /link in Discord.
+EOF

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Meshcast
+GenericName=Screen streaming for Discord
+Comment=P2P screen streaming for Discord via iroh-live
+Exec=@INSTALL_DIR@/meshcast-tray.py --show
+Icon=camera-video
+Terminal=false
+Categories=Network;AudioVideo;Video;
+Keywords=discord;stream;screen;share;
+StartupNotify=false

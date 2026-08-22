@@ -1,123 +1,204 @@
 #!/usr/bin/env python3
-"""Meshcast tray icon — manages daemon + app lifecycle separately."""
-import gi, os, signal, json, subprocess, sys
+"""Meshcast tray icon for Linux.
+
+Runs on the host desktop session (it needs the StatusNotifier D-Bus
+interface, which isn't reachable from inside a toolbox/distrobox container).
+It only manages two other processes:
+
+  * `meshcast daemon`  — long-lived, talks to the Discord bot, streams
+  * `meshcast-app`     — the window; disposable, opened on demand
+
+State flows through ~/.config/meshcast/.tray-state (written by the daemon) and
+commands through ~/.config/meshcast/.tray-cmd (read by the daemon).
+
+Environment:
+  MESHCAST_BIN         path to the `meshcast` CLI (default: next to this script,
+                       then ~/.local/bin/meshcast, then PATH)
+  MESHCAST_APP         path to `meshcast-app` (same lookup)
+  MESHCAST_TOOLBOX     if set, run the binaries via `toolbox run -c <name>`
+                       (only needed if you built inside a toolbox and the
+                       binaries don't run on the host)
+  MESHCAST_CONFIG_DIR  config dir (default $XDG_CONFIG_HOME/meshcast)
+
+Usage: meshcast-tray.py [--show]
+  --show   open the Meshcast window immediately (otherwise only the tray icon
+           appears; the window opens on click or when a stream request arrives)
+"""
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+
+import gi
 
 gi.require_version("Gtk", "3.0")
-gi.require_version("AppIndicator3", "0.1")
-from gi.repository import Gtk, AppIndicator3, GLib
+from gi.repository import GLib, Gtk  # noqa: E402
 
-# Binaries — run inside toolbox for library access (libxdo, pipewire, etc.)
-TOOLBOX = os.environ.get("MESHCAST_TOOLBOX", "meshcast")
-DAEMON_BIN = os.environ.get("MESHCAST_DAEMON", os.path.expanduser("~/.local/bin/meshcast"))
-APP_BIN = os.environ.get("MESHCAST_APP", os.path.expanduser("~/.local/bin/meshcast-app"))
-if len(sys.argv) > 1:
-    DAEMON_BIN = sys.argv[1]
-if len(sys.argv) > 2:
-    APP_BIN = sys.argv[2]
+# Ubuntu/Debian ship the Ayatana fork; Fedora/Arch ship the original.
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator3  # noqa: E402
+except (ValueError, ImportError):
+    gi.require_version("AppIndicator3", "0.1")
+    from gi.repository import AppIndicator3  # noqa: E402
 
-# State files
-STATE_PATH = os.path.expanduser("~/.config/meshcast/.tray-state")
-CMD_PATH = os.path.expanduser("~/.config/meshcast/.tray-cmd")
-APP_PID_PATH = os.path.expanduser("~/.config/meshcast/.app-pid")
-DAEMON_PID_PATH = os.path.expanduser("~/.config/meshcast/.daemon-pid")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SHOW_ON_START = "--show" in sys.argv[1:]
+
+
+def _find_bin(env_var, name):
+    if os.environ.get(env_var):
+        return os.environ[env_var]
+    for candidate in (
+        os.path.join(SCRIPT_DIR, name),
+        os.path.expanduser(f"~/.local/bin/{name}"),
+    ):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which(name) or name
+
+
+DAEMON_BIN = _find_bin("MESHCAST_BIN", "meshcast")
+APP_BIN = _find_bin("MESHCAST_APP", "meshcast-app")
+TOOLBOX = os.environ.get("MESHCAST_TOOLBOX", "")
+
+CONFIG_DIR = os.environ.get("MESHCAST_CONFIG_DIR") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "meshcast"
+)
+STATE_PATH = os.path.join(CONFIG_DIR, ".tray-state")
+CMD_PATH = os.path.join(CONFIG_DIR, ".tray-cmd")
+APP_PID_PATH = os.path.join(CONFIG_DIR, ".app-pid")
+DAEMON_PID_PATH = os.path.join(CONFIG_DIR, ".daemon-pid")
 
 last_state = {}
-had_pending = False  # track whether we already opened app for current request
+had_pending = False  # whether we already opened the window for the current request
 
-def _is_pid_alive(pid_path):
+
+def _read_pid(pid_path):
     try:
         with open(pid_path) as f:
-            pid = int(f.read().strip())
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _is_pid_alive(pid_path):
+    pid = _read_pid(pid_path)
+    if not pid:
+        return False
+    try:
         os.kill(pid, 0)
         return True
-    except:
+    except PermissionError:
+        return True
+    except OSError:
         return False
+
 
 def is_app_running():
     return _is_pid_alive(APP_PID_PATH)
 
+
 def is_daemon_running():
     return _is_pid_alive(DAEMON_PID_PATH)
 
-def _toolbox_cmd(binary, *args):
-    """Wrap a command with toolbox run if TOOLBOX is set."""
+
+def _cmd(binary, *args):
     if TOOLBOX:
         return ["toolbox", "run", "-c", TOOLBOX, binary, *args]
     return [binary, *args]
 
+
+def _spawn(argv):
+    try:
+        subprocess.Popen(
+            argv,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as e:
+        print(f"meshcast-tray: failed to start {argv[0]}: {e}", file=sys.stderr)
+
+
 def start_daemon():
-    if is_daemon_running():
-        return
-    subprocess.Popen(_toolbox_cmd(DAEMON_BIN, "daemon"), start_new_session=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not is_daemon_running():
+        _spawn(_cmd(DAEMON_BIN, "daemon"))
+
 
 def show_app(_=None):
-    if is_app_running():
-        return
-    subprocess.Popen(_toolbox_cmd(APP_BIN), start_new_session=True)
+    if not is_app_running():
+        _spawn(_cmd(APP_BIN))
+
+
+def send_cmd(cmd):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(CMD_PATH, "w") as f:
+            f.write(cmd)
+    except OSError as e:
+        print(f"meshcast-tray: failed to write command: {e}", file=sys.stderr)
+
 
 def stop_stream(_=None):
-    with open(CMD_PATH, "w") as f:
-        f.write("stop")
+    send_cmd("stop")
+
 
 def quit_all(_=None):
-    # Stop any active stream
-    try:
-        with open(CMD_PATH, "w") as f:
-            f.write("stop")
-    except:
-        pass
-    # Kill app window
-    if is_app_running():
+    send_cmd("stop")
+    app_pid = _read_pid(APP_PID_PATH)
+    if app_pid and is_app_running():
         try:
-            with open(APP_PID_PATH) as f:
-                pid = int(f.read().strip())
-            os.kill(pid, signal.SIGUSR1)
-        except:
+            os.kill(app_pid, signal.SIGUSR1)
+        except OSError:
             pass
-    # Kill daemon
-    if is_daemon_running():
+    daemon_pid = _read_pid(DAEMON_PID_PATH)
+    if daemon_pid and is_daemon_running():
         try:
-            with open(DAEMON_PID_PATH) as f:
-                pid = int(f.read().strip())
-            os.kill(pid, signal.SIGTERM)
-        except:
+            os.kill(daemon_pid, signal.SIGTERM)
+        except OSError:
             pass
     Gtk.main_quit()
 
-# Create indicator
+
+# --- Indicator -------------------------------------------------------------
+
 ind = AppIndicator3.Indicator.new(
-    "meshcast", "dialog-information",
-    AppIndicator3.IndicatorCategory.APPLICATION_STATUS
+    "meshcast", "network-offline", AppIndicator3.IndicatorCategory.APPLICATION_STATUS
 )
 ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
 
-# Menu
 menu = Gtk.Menu()
 show_item = Gtk.MenuItem(label="Show Meshcast")
 show_item.connect("activate", show_app)
+status_item = Gtk.MenuItem(label="Starting…")
+status_item.set_sensitive(False)
 stop_item = Gtk.MenuItem(label="Stop Stream")
 stop_item.connect("activate", stop_stream)
 stop_item.set_sensitive(False)
-sep = Gtk.SeparatorMenuItem()
 quit_item = Gtk.MenuItem(label="Quit Meshcast")
 quit_item.connect("activate", quit_all)
-menu.append(show_item)
-menu.append(stop_item)
-menu.append(sep)
-menu.append(quit_item)
+for item in (show_item, status_item, Gtk.SeparatorMenuItem(), stop_item,
+             Gtk.SeparatorMenuItem(), quit_item):
+    menu.append(item)
 menu.show_all()
 ind.set_menu(menu)
+# Clicking the icon (where the desktop supports it) opens the window.
+ind.set_secondary_activate_target(show_item)
+
 
 def update_state():
     global last_state, had_pending
     try:
         with open(STATE_PATH) as f:
             state = json.load(f)
-    except:
+    except (OSError, ValueError):
         state = {}
 
-    # Auto-open app window when a new stream request arrives
+    # Auto-open the window when a new stream request arrives.
     pending = state.get("pending_request")
     if pending and not had_pending:
         had_pending = True
@@ -125,36 +206,50 @@ def update_state():
     elif not pending:
         had_pending = False
 
-    if state == last_state:
+    daemon_alive = is_daemon_running()
+    key = (json.dumps(state, sort_keys=True), daemon_alive)
+    if key == last_state:
         return True
-    last_state = state
+    last_state = key
 
     streaming = state.get("streaming", False)
     connected = state.get("connected", False)
     quality = state.get("quality", "")
     fps = state.get("fps", 30)
     viewers = state.get("viewers", 0)
+    linked = bool(state.get("linked_servers"))
 
     stop_item.set_sensitive(streaming)
 
-    if streaming:
-        ind.set_icon_full("media-record", "Meshcast")
-        tip = f"LIVE: {quality} {fps}fps \u2014 {viewers} viewer{'s' if viewers != 1 else ''}"
+    if not daemon_alive:
+        icon, tip = "network-offline", "Meshcast — daemon not running"
+    elif streaming:
+        icon = "media-record"
+        tip = f"LIVE: {quality} {fps}fps — {viewers} viewer{'s' if viewers != 1 else ''}"
     elif connected:
-        ind.set_icon_full("network-idle", "Meshcast")
-        tip = "Meshcast \u2014 Connected"
+        icon, tip = "network-transmit-receive", "Meshcast — connected to Discord bot"
+    elif linked:
+        icon, tip = "network-idle", "Meshcast — waiting for bot"
     else:
-        ind.set_icon_full("dialog-information", "Meshcast")
-        tip = "Meshcast \u2014 Ready"
+        icon, tip = "network-offline", "Meshcast — not linked"
 
+    ind.set_icon_full(icon, "Meshcast")
     ind.set_title(tip)
+    status_item.set_label(tip)
     return True
 
+
+def keep_daemon_alive():
+    start_daemon()
+    return True
+
+
 GLib.timeout_add_seconds(2, update_state)
+GLib.timeout_add_seconds(15, keep_daemon_alive)
 update_state()
 
-# Start daemon (long-lived), then open app window (disposable)
 start_daemon()
-show_app()
+if SHOW_ON_START:
+    show_app()
 
 Gtk.main()

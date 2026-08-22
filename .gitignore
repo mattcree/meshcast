@@ -1,2 +1,5 @@
 /target
 .env
+*.log
+dist/
+__pycache__/

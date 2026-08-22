@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Meshcast Viewer
+Comment=Open a Meshcast stream link
+Exec=@INSTALL_DIR@/meshcast watch %u
+Icon=camera-video
+Terminal=false
+NoDisplay=true
+MimeType=x-scheme-handler/meshcast;

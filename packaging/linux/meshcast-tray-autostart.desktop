@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Meshcast Tray
+Comment=Keeps Meshcast connected to Discord in the background
+Exec=@INSTALL_DIR@/meshcast-tray.py
+Icon=camera-video
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5
