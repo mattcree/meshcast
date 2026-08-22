@@ -78,6 +78,7 @@ struct ActiveStream {
     control_available: bool,
     /// Who currently has control (user id, display name).
     controller: Option<(UserId, String)>,
+    started_at: Timestamp,
 }
 
 impl ActiveStream {
@@ -97,7 +98,7 @@ impl ActiveStream {
             .color(BLURPLE)
             .author(CreateEmbedAuthor::new(&self.streamer_name).icon_url(&self.avatar_url))
             .footer(CreateEmbedFooter::new("Started streaming"))
-            .timestamp(Timestamp::now())
+            .timestamp(self.started_at)
     }
 
     fn components(&self) -> Vec<CreateActionRow> {
@@ -189,7 +190,7 @@ fn spawn_receiver(
             match event {
                 Ok(Event::Received(msg)) => match Signal::decode(&msg.content) {
                     Ok(signal) => {
-                        tracing::debug!(?signal, user = %user_id, "Signal from app");
+                        tracing::debug!(signal = signal.name(), user = %user_id, "Signal from app");
                         let _ = signal_tx.send((user_id, signal));
                     }
                     Err(e) => tracing::warn!(user = %user_id, "Undecodable signal: {e}"),
@@ -712,6 +713,7 @@ async fn on_stream_start(
                 fps,
                 control_available,
                 controller: None,
+                started_at: Timestamp::now(),
             };
             let msg = channel_id
                 .send_message(
@@ -887,6 +889,10 @@ async fn on_control_request(
             .encode()?;
             if let Err(e) = viewer_sender.broadcast_neighbors(token_msg).await {
                 tracing::warn!("Failed to deliver ControlToken: {e}");
+                // Don't leave the streamer's daemon armed for a viewer who'll never connect.
+                if let Ok(bytes) = Signal::RevokeControl.encode() {
+                    let _ = streamer_sender.broadcast_neighbors(bytes).await;
+                }
                 c.edit_response(
                     ctx,
                     EditInteractionResponse::new().content(
@@ -959,16 +965,24 @@ async fn on_revoke(
     }
     let sender = lock(&data.links).get(&streamer_id).cloned();
     ephemeral(ctx, c, "Revoking control…").await?;
+    let mut rx = data.signal_tx.subscribe();
     if let Some(s) = sender {
         let _ = s.broadcast_neighbors(Signal::RevokeControl.encode()?).await;
     }
-    // The app confirms with ControlRevoked (handled in the background task); if it
-    // doesn't, tidy the card anyway.
-    tokio::time::sleep(STOP_TIMEOUT).await;
-    let still = lock(&data.streams)
-        .get(&streamer_id)
-        .is_some_and(|s| s.controller.is_some());
-    if still {
+    // The app confirms with ControlRevoked (the background task updates the
+    // card); if it doesn't within the timeout, tidy the card anyway.
+    let confirmed = tokio::time::timeout(STOP_TIMEOUT, async {
+        loop {
+            match rx.recv().await {
+                Ok((uid, Signal::ControlRevoked)) if uid == streamer_id => return true,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    if !confirmed {
         clear_controller(&ctx.http, &data.streams, streamer_id).await;
     }
     c.edit_response(

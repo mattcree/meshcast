@@ -43,7 +43,7 @@ Length-prefixed (`u32` little-endian) `postcard` frames on one bidirectional QUI
 
 ```
 viewer → streamer                         streamer → viewer
-Hello { token }                           Welcome { width, height, platform }
+Hello { version, token }                  Welcome { width, height }
 PointerMove { x, y }   // 0..1 of frame    Denied { reason }
 PointerButton { button, pressed }         Revoked { reason }
 Scroll { dx, dy }      // lines            Pong
@@ -60,11 +60,11 @@ Ping
 | Platform | Backend | Notes |
 |---|---|---|
 | Linux Wayland | xdg-desktop-portal **RemoteDesktop** (ashpd), session shared with ScreenCast | Absolute pointer in stream coordinates (`NotifyPointerMotionAbsolute`), `NotifyPointerButton` (evdev codes), `NotifyPointerAxisDiscrete`, `NotifyKeyboardKeysym`. GNOME & KDE. Requires the combined session → the iroh-live fork's `PipeWireScreenCapturer::from_portal_stream`. |
-| Linux X11 | `enigo` (pure-Rust `x11rb` XTest) | Absolute pointer on the main display. |
+| Linux X11 | Same portal path where the desktop provides RemoteDesktop on X11 (GNOME does); otherwise control is unavailable and the stream runs without it (XTest backend is on the backlog). | |
 | macOS | `enigo` (CGEvent) | Needs Accessibility permission (one-time OS prompt). Main display mapping. |
 | Windows | `enigo` (SendInput) | Viewer-only platform today; injection compiles for when capture lands upstream. |
 
-Coordinate mapping: viewer normalises pointer position to the video rectangle (0..1); streamer multiplies by the captured surface size (portal stream size, or main display size for enigo).
+Coordinate mapping: viewer aspect-fits the frame itself and normalises pointer position within that exact rectangle (0..1); streamer multiplies by the captured surface size in *pixels* (the PipeWire-negotiated stream size for the portal — logical and pixel sizes differ on HiDPI — or the main display size for enigo).
 
 ### Components touched
 
@@ -77,6 +77,5 @@ Coordinate mapping: viewer normalises pointer position to the video rectangle (0
 
 ### Phases
 
-1. Protocol + daemon server + viewer client + **pointer/scroll** on Wayland (portal) and X11/macOS (enigo), grant/revoke via app + bot. ← this PR
-2. Keyboard (keysym mapping), idle timeout, rate limits, hotkey release. ← this PR if time allows
+1. Protocol + daemon server + viewer client + pointer/scroll/keyboard on Linux (portal) and macOS/Windows (enigo), grant/revoke via app + bot, idle timeout, rate limits (releases exempt), hotkeys. ← shipped
 3. Backlog: clipboard, multi-monitor, gamepad, "laser pointer only" mode, control for streams started from the CLI.

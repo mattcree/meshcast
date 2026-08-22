@@ -74,7 +74,7 @@ Early versions ran networking inside the GUI process; closing the window killed 
 ### 3.3 Local IPC: files, deliberately
 
 Daemon → GUI/tray: `~/.config/meshcast/.tray-state` (JSON `DaemonState`), rewritten atomically (temp + rename) on every change.
-GUI/tray → daemon: `~/.config/meshcast/.tray-cmd`, one command (`stop`, `approve`, `reject`, `reload`, `link:<code>`), consumed and deleted by the daemon on a 250 ms tick.
+GUI/tray → daemon: `~/.config/meshcast/.tray-cmd`, one command (`stop`, `approve` / `approve:control`, `reject`, `reload`, `link:<code>`, `grant`, `deny`, `revoke`), consumed and deleted by the daemon on a 250 ms tick.
 Liveness: `.daemon-pid` / `.app-pid`, checked with `kill(pid, 0)` (Unix) / `OpenProcess` (Windows).
 
 This is not elegant, but it is trivially debuggable (`cat` the file), works identically on three OSes and from a Python script, needs no socket permissions, and the command volume is a handful of events per hour. A local socket would buy nothing users can feel. If the command set grows (e.g. per-viewer control) this should become a Unix socket/named pipe; noted in the backlog.
@@ -121,6 +121,13 @@ user      Discord         bot                                   daemon
 | bot → app | `WatchStream{ticket}` | viewer clicked Watch |
 | bot → app | `ViewerUpdate{count}` | viewer count changed (to the streamer) |
 | both | `Ping`/`Pong` | reserved |
+| bot → app | `ControlRequest{request_id, viewer}` | a viewer clicked Request control |
+| app → bot | `ControlGranted{request_id, token, addr}` / `ControlDenied{request_id, reason}` | streamer's decision (or timeout / unavailable) |
+| bot → app | `ControlToken{ticket, token, addr, streamer}` | to the *viewer's* daemon: go and connect |
+| app → bot | `ControlRevoked` / bot → app `RevokeControl` | control ended / streamer pressed Revoke on the card |
+| app → bot | `ControlAvailable{available}` | sent just before `StreamReady`; whether the card gets a Request control button |
+
+Remote control itself (input events) does not go over gossip — see `docs/REMOTE-CONTROL.md` for the direct control channel.
 
 The daemon only accepts messages whose gossip `delivered_from` is the bot's endpoint ID for that link. The bot does not verify app identity (the topic is the credential). All signals are idempotent or safely ignorable; duplicates do no harm.
 

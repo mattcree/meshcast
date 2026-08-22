@@ -102,6 +102,28 @@ pub enum Signal {
 }
 
 impl Signal {
+    /// Variant name for logs (never includes payloads such as tokens).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Signal::StartStream { .. } => "StartStream",
+            Signal::StreamReady { .. } => "StreamReady",
+            Signal::StopStream => "StopStream",
+            Signal::StreamStopped => "StreamStopped",
+            Signal::WatchStream { .. } => "WatchStream",
+            Signal::ViewerUpdate { .. } => "ViewerUpdate",
+            Signal::Ping => "Ping",
+            Signal::Pong => "Pong",
+            Signal::StreamFailed { .. } => "StreamFailed",
+            Signal::ControlRequest { .. } => "ControlRequest",
+            Signal::ControlGranted { .. } => "ControlGranted",
+            Signal::ControlDenied { .. } => "ControlDenied",
+            Signal::ControlToken { .. } => "ControlToken",
+            Signal::ControlRevoked => "ControlRevoked",
+            Signal::RevokeControl => "RevokeControl",
+            Signal::ControlAvailable { .. } => "ControlAvailable",
+        }
+    }
+
     pub fn encode(&self) -> Result<Bytes> {
         Ok(Bytes::from(postcard::to_allocvec(self)?))
     }

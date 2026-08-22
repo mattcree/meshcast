@@ -11,115 +11,163 @@ use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::{PersistMode, Session};
 use meshcast_signal::control::{NamedKey, PointerButton};
 use moq_media::capture::PipeWireScreenCapturer;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::control::{HeldState, InjectCmd, InjectorHandle, ScrollAccumulator};
 
+const INFRA_TIMEOUT: Duration = Duration::from_secs(10);
 const DIALOG_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Why the combined portal session couldn't be started.
+#[derive(Debug)]
+pub enum PortalError {
+    /// No RemoteDesktop/ScreenCast portal — caller may fall back to plain capture.
+    Unavailable(anyhow::Error),
+    /// The session was created but failed or was cancelled by the user. Do
+    /// *not* fall back (that would pop a second dialog); the stream fails.
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for PortalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PortalError::Unavailable(e) | PortalError::Failed(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
 /// Result of a combined portal session: a capturer for iroh-live and an
-/// injector handle. Dropping the returned guard ends the portal session
-/// (and therefore the stream) — keep it alive with the stream.
+/// injector handle. Dropping `guard` ends the portal session (and therefore
+/// the stream) — keep it alive with the stream.
 pub struct PortalCapture {
     pub capturer: PipeWireScreenCapturer,
     pub injector: InjectorHandle,
     pub guard: PortalGuard,
 }
 
-/// Holds the injector task; aborting it drops the session objects.
+/// Tells the injector task to release everything and close the portal session.
+/// (Not an abort: the release/close tail must run.)
 pub struct PortalGuard {
-    task: tokio::task::JoinHandle<()>,
+    shutdown: Option<oneshot::Sender<()>>,
 }
 
 impl Drop for PortalGuard {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
     }
+}
+
+async fn step<T, E: std::fmt::Display>(
+    what: &str,
+    dur: Duration,
+    fut: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> Result<T> {
+    tokio::time::timeout(dur, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("{what}: timed out"))?
+        .map_err(|e| anyhow::anyhow!("{what}: {e}"))
 }
 
 /// Open a RemoteDesktop session with screen-cast, start capture on its stream
 /// and spawn the injector task.
-pub async fn start(fps: u32) -> Result<PortalCapture> {
-    let rd = RemoteDesktop::new()
+pub async fn start(fps: u32) -> std::result::Result<PortalCapture, PortalError> {
+    let rd = step("RemoteDesktop portal", INFRA_TIMEOUT, RemoteDesktop::new())
         .await
-        .context("RemoteDesktop portal unavailable (is xdg-desktop-portal running?)")?;
-    let session = rd
-        .create_session()
+        .map_err(PortalError::Unavailable)?;
+    let sc = step("ScreenCast portal", INFRA_TIMEOUT, Screencast::new())
         .await
-        .context("RemoteDesktop: create_session")?;
-    rd.select_devices(
-        &session,
-        DeviceType::Keyboard | DeviceType::Pointer,
-        None,
-        PersistMode::DoNot,
-    )
-    .await
-    .context("RemoteDesktop: select_devices")?
-    .response()
-    .context("RemoteDesktop: select_devices rejected")?;
+        .map_err(PortalError::Unavailable)?;
 
-    let sc = Screencast::new()
-        .await
-        .context("ScreenCast portal unavailable")?;
-    sc.select_sources(
-        &session,
-        CursorMode::Embedded,
-        SourceType::Monitor.into(),
-        false,
-        None,
-        PersistMode::DoNot,
-    )
-    .await
-    .context("ScreenCast: select_sources")?
-    .response()
-    .context("ScreenCast: select_sources rejected")?;
+    let inner = async {
+        let session = step(
+            "RemoteDesktop: create_session",
+            INFRA_TIMEOUT,
+            rd.create_session(),
+        )
+        .await?;
+        step(
+            "RemoteDesktop: select_devices",
+            INFRA_TIMEOUT,
+            rd.select_devices(
+                &session,
+                DeviceType::Keyboard | DeviceType::Pointer,
+                None,
+                PersistMode::DoNot,
+            ),
+        )
+        .await?
+        .response()
+        .context("RemoteDesktop: select_devices rejected")?;
+        step(
+            "ScreenCast: select_sources",
+            INFRA_TIMEOUT,
+            sc.select_sources(
+                &session,
+                CursorMode::Embedded,
+                SourceType::Monitor.into(),
+                false,
+                None,
+                PersistMode::DoNot,
+            ),
+        )
+        .await?
+        .response()
+        .context("ScreenCast: select_sources rejected")?;
 
-    tracing::info!("Waiting for the screen-share / remote-control dialog…");
-    let devices = tokio::time::timeout(DIALOG_TIMEOUT, rd.start(&session, None))
-        .await
-        .context("timed out waiting for the portal dialog")?
-        .context("RemoteDesktop: start")?
+        tracing::info!("Waiting for the screen-share / remote-control dialog…");
+        let devices = step(
+            "RemoteDesktop: start",
+            DIALOG_TIMEOUT,
+            rd.start(&session, None),
+        )
+        .await?
         .response()
         .context("Screen sharing was cancelled")?;
 
-    let streams = devices.streams().unwrap_or_default();
-    let stream = streams.first().context("portal returned no stream")?;
-    let node_id = stream.pipe_wire_node_id();
-    let (w, h) = stream.size().unwrap_or((0, 0));
-    let size = (w.max(1) as u32, h.max(1) as u32);
-    tracing::info!(
-        node_id,
-        width = size.0,
-        height = size.1,
-        "Portal session ready (with remote control)"
-    );
+        let streams = devices.streams().unwrap_or_default();
+        let stream = streams.first().context("portal returned no stream")?;
+        let node_id = stream.pipe_wire_node_id();
 
-    let fd = sc
-        .open_pipe_wire_remote(&session)
+        let fd = step(
+            "ScreenCast: open_pipe_wire_remote",
+            INFRA_TIMEOUT,
+            sc.open_pipe_wire_remote(&session),
+        )
+        .await?;
+
+        let capturer = tokio::task::spawn_blocking(move || {
+            PipeWireScreenCapturer::from_portal_stream(fd, node_id, fps as f32)
+        })
         .await
-        .context("ScreenCast: open_pipe_wire_remote")?;
+        .context("capture thread panicked")??;
 
-    let capturer = tokio::task::spawn_blocking(move || {
-        PipeWireScreenCapturer::from_portal_stream(fd, node_id, fps as f32)
-    })
-    .await
-    .context("capture thread panicked")??;
-
-    // If the portal didn't tell us the size, use what PipeWire negotiated.
-    let size = if w <= 0 || h <= 0 {
+        // Pointer coordinates for NotifyPointerMotionAbsolute are in the
+        // *stream's* pixel space (what PipeWire negotiated), not the portal's
+        // logical size — they differ on HiDPI.
         let [fw, fh] = moq_media::capture::VideoSource::format(&capturer).dimensions;
-        (fw.max(1), fh.max(1))
-    } else {
-        size
+        let size = (fw.max(1), fh.max(1));
+        tracing::info!(
+            node_id,
+            width = size.0,
+            height = size.1,
+            "Portal session ready (with remote control)"
+        );
+        anyhow::Ok((session, capturer, node_id, size))
     };
+    let (session, capturer, node_id, size) = inner.await.map_err(PortalError::Failed)?;
 
     let (tx, rx) = mpsc::channel::<InjectCmd>(256);
-    let task = tokio::spawn(inject_loop(rd, session, node_id, size, rx));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(inject_loop(rd, session, node_id, size, rx, shutdown_rx));
 
     Ok(PortalCapture {
         capturer,
         injector: InjectorHandle::new(tx, size),
-        guard: PortalGuard { task },
+        guard: PortalGuard {
+            shutdown: Some(shutdown_tx),
+        },
     })
 }
 
@@ -129,10 +177,16 @@ async fn inject_loop(
     stream: u32,
     size: (u32, u32),
     mut rx: mpsc::Receiver<InjectCmd>,
+    mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut held = HeldState::default();
     let mut scroll = ScrollAccumulator::default();
-    while let Some(cmd) = rx.recv().await {
+    loop {
+        let cmd = tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            cmd = rx.recv() => match cmd { Some(c) => c, None => break },
+        };
         let res: ashpd::Result<()> = match cmd {
             InjectCmd::Move { x, y } => {
                 rd.notify_pointer_motion_absolute(
@@ -186,39 +240,60 @@ async fn inject_loop(
                 }
                 r
             }
-            InjectCmd::ReleaseAll => {
-                let (buttons, keys) = held.drain();
-                let mut r = Ok(());
-                for b in buttons {
-                    r = rd
-                        .notify_pointer_button(&session, evdev_button(b), KeyState::Released)
-                        .await;
-                }
-                for k in keys {
-                    r = rd
-                        .notify_keyboard_keysym(&session, keysym(k), KeyState::Released)
-                        .await;
-                }
-                r
-            }
+            InjectCmd::ReleaseAll => release_held(&rd, &session, &mut held).await,
         };
         if let Err(e) = res {
             tracing::warn!("Input injection failed: {e}");
         }
     }
-    // Channel closed: release whatever is still held, then the session drops.
+    // Drain queued releases, let go of everything we hold, close the session.
+    while let Ok(cmd) = rx.try_recv() {
+        match cmd {
+            InjectCmd::Button {
+                button,
+                pressed: false,
+            } => {
+                held.note_button(button, false);
+                let _ = rd
+                    .notify_pointer_button(&session, evdev_button(button), KeyState::Released)
+                    .await;
+            }
+            InjectCmd::Key {
+                key,
+                pressed: false,
+            } => {
+                held.note_key(key, false);
+                let _ = rd
+                    .notify_keyboard_keysym(&session, keysym(key), KeyState::Released)
+                    .await;
+            }
+            _ => {}
+        }
+    }
+    let _ = release_held(&rd, &session, &mut held).await;
+    let _ = tokio::time::timeout(INFRA_TIMEOUT, session.close()).await;
+    tracing::debug!("Portal session closed");
+}
+
+/// Release every button/key we believe is held.
+async fn release_held(
+    rd: &RemoteDesktop<'static>,
+    session: &Session<'static, RemoteDesktop<'static>>,
+    held: &mut HeldState,
+) -> ashpd::Result<()> {
     let (buttons, keys) = held.drain();
+    let mut r = Ok(());
     for b in buttons {
-        let _ = rd
-            .notify_pointer_button(&session, evdev_button(b), KeyState::Released)
+        r = rd
+            .notify_pointer_button(session, evdev_button(b), KeyState::Released)
             .await;
     }
     for k in keys {
-        let _ = rd
-            .notify_keyboard_keysym(&session, keysym(k), KeyState::Released)
+        r = rd
+            .notify_keyboard_keysym(session, keysym(k), KeyState::Released)
             .await;
     }
-    let _ = session.close().await;
+    r
 }
 
 fn key_state(pressed: bool) -> KeyState {

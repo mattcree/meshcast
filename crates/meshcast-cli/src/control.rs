@@ -60,15 +60,27 @@ impl InjectorHandle {
         Self { tx, size }
     }
 
-    /// Non-blocking send; drops the event if the backend is saturated.
-    pub fn send(&self, cmd: InjectCmd) {
-        if let Err(e) = self.tx.try_send(cmd) {
+    /// Deliver a command. Moves/scroll/presses/text are best-effort (dropped
+    /// if the backend is saturated); *releases* always get through so nothing
+    /// can stick on the streamer's desktop.
+    pub async fn deliver(&self, cmd: InjectCmd) {
+        let must_deliver = matches!(
+            cmd,
+            InjectCmd::Button { pressed: false, .. }
+                | InjectCmd::Key { pressed: false, .. }
+                | InjectCmd::ReleaseAll
+        );
+        if must_deliver {
+            if self.tx.send(cmd).await.is_err() {
+                tracing::debug!("injector gone; release not delivered");
+            }
+        } else if let Err(e) = self.tx.try_send(cmd) {
             tracing::debug!("injector queue full, dropping event: {e}");
         }
     }
 
     pub async fn release_all(&self) {
-        let _ = self.tx.send(InjectCmd::ReleaseAll).await;
+        self.deliver(InjectCmd::ReleaseAll).await;
     }
 }
 
@@ -213,6 +225,11 @@ impl ControlServer {
             .map(|a| a.controller.clone())
     }
 
+    /// Is a controller currently connected (as opposed to merely granted)?
+    pub fn is_connected(&self) -> bool {
+        lock(&self.state).active.is_some()
+    }
+
     async fn handle(&self, conn: Connection) -> Result<()> {
         let remote = conn.remote_id();
         let (mut send, mut recv) = conn
@@ -335,24 +352,30 @@ impl ControlServer {
         let result = self.pump(&mut send, &mut recv, &injector).await;
         injector.release_all().await;
 
-        // Forget this connection (only if it's still the current one; a newer
-        // connection or a disarm may already have replaced it).
-        {
+        // Forget this connection — but only if it is still the current one. If a
+        // newer connection replaced it (same token, e.g. a second viewer window)
+        // or the daemon disarmed us, this one is already history and must not
+        // be reported as "the controller disconnected" (that would revoke the
+        // live replacement).
+        let was_current = {
             let mut st = lock(&self.state);
             if matches!(&st.active, Some(a) if a.conn.stable_id() == conn.stable_id()) {
                 st.active = None;
+                true
+            } else {
+                false
             }
-        }
+        };
         let reason = match &result {
             Ok(r) => r.clone(),
             Err(e) => format!("{e}"),
         };
-        // Always report; the daemon treats it idempotently (revoke is a no-op
-        // if it initiated the disconnect itself).
-        let _ = self.events.send(ServerEvent::ControllerDisconnected {
-            controller: controller.clone(),
-            reason: reason.clone(),
-        });
+        if was_current {
+            let _ = self.events.send(ServerEvent::ControllerDisconnected {
+                controller: controller.clone(),
+                reason: reason.clone(),
+            });
+        }
         tracing::info!(controller = %controller, "Controller disconnected ({reason})");
         conn.close(0u32.into(), b"bye");
         Ok(())
@@ -367,7 +390,6 @@ impl ControlServer {
     ) -> Result<String> {
         let mut window_start = Instant::now();
         let mut window_count: u32 = 0;
-        let mut last_event = Instant::now();
         let idle = Duration::from_secs(IDLE_REVOKE_SECS);
         loop {
             let frame = tokio::time::timeout(idle, read_frame(recv)).await;
@@ -388,41 +410,57 @@ impl ControlServer {
             };
 
             if msg.is_input() {
-                last_event = Instant::now();
-                // Simple per-second rate limit.
+                // Simple per-second rate limit — but never drop a *release*,
+                // or the streamer ends up with a stuck key/button.
                 if window_start.elapsed() >= Duration::from_secs(1) {
                     window_start = Instant::now();
                     window_count = 0;
                 }
                 window_count += 1;
-                if window_count > MAX_EVENTS_PER_SEC {
+                let is_release = matches!(
+                    msg,
+                    ControlMsg::PointerButton { pressed: false, .. }
+                        | ControlMsg::Key { pressed: false, .. }
+                );
+                if window_count > MAX_EVENTS_PER_SEC && !is_release {
                     continue;
                 }
             }
-            let _ = last_event;
 
             match msg {
-                ControlMsg::PointerMove { x, y } => injector.send(InjectCmd::Move {
-                    x: x.clamp(0.0, 1.0),
-                    y: y.clamp(0.0, 1.0),
-                }),
-                ControlMsg::PointerButton { button, pressed } => {
-                    injector.send(InjectCmd::Button { button, pressed })
+                ControlMsg::PointerMove { x, y } => {
+                    injector
+                        .deliver(InjectCmd::Move {
+                            x: x.clamp(0.0, 1.0),
+                            y: y.clamp(0.0, 1.0),
+                        })
+                        .await
                 }
-                ControlMsg::Scroll { dx, dy } => injector.send(InjectCmd::Scroll {
-                    dx: dx.clamp(-50.0, 50.0),
-                    dy: dy.clamp(-50.0, 50.0),
-                }),
-                ControlMsg::Key { key, pressed } => injector.send(InjectCmd::Key { key, pressed }),
+                ControlMsg::PointerButton { button, pressed } => {
+                    injector
+                        .deliver(InjectCmd::Button { button, pressed })
+                        .await
+                }
+                ControlMsg::Scroll { dx, dy } => {
+                    injector
+                        .deliver(InjectCmd::Scroll {
+                            dx: dx.clamp(-50.0, 50.0),
+                            dy: dy.clamp(-50.0, 50.0),
+                        })
+                        .await
+                }
+                ControlMsg::Key { key, pressed } => {
+                    injector.deliver(InjectCmd::Key { key, pressed }).await
+                }
                 ControlMsg::Text { text } => {
                     // Bound typed bursts; strip control characters.
                     let cleaned: String =
                         text.chars().filter(|c| !c.is_control()).take(256).collect();
                     if !cleaned.is_empty() {
-                        injector.send(InjectCmd::Text(cleaned));
+                        injector.deliver(InjectCmd::Text(cleaned)).await;
                     }
                 }
-                ControlMsg::Release => injector.send(InjectCmd::ReleaseAll),
+                ControlMsg::Release => injector.deliver(InjectCmd::ReleaseAll).await,
                 ControlMsg::Ping => {
                     let _ = write_frame(send, &ControlMsg::Pong).await;
                 }
@@ -727,11 +765,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(matches!(good.status(), ClientStatus::Ended(_)));
-        let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(ev, ServerEvent::ControllerDisconnected { .. }));
+        // We initiated the disconnect via disarm, so no ControllerDisconnected
+        // event is reported (that event is for viewer-initiated drops only).
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), events.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[test]

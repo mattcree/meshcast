@@ -16,7 +16,9 @@ pub fn start() -> Result<InjectorHandle> {
         .name("meshcast-inject".into())
         .spawn(move || run(rx, size_tx))
         .context("spawn injector thread")?;
-    let size = size_rx.recv().context("injector thread died")??;
+    let size = size_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .context("injector thread did not start")??;
     Ok(InjectorHandle::new(tx, size))
 }
 
@@ -67,29 +69,25 @@ fn run(mut rx: mpsc::Receiver<InjectCmd>, size_tx: std::sync::mpsc::Sender<Resul
                 enigo.key(map_key(key), direction(pressed))
             }
             InjectCmd::Text(text) => enigo.text(&text),
-            InjectCmd::ReleaseAll => {
-                let (buttons, keys) = held.drain();
-                let mut r = Ok(());
-                for b in buttons {
-                    r = enigo.button(map_button(b), Direction::Release);
-                }
-                for k in keys {
-                    r = enigo.key(map_key(k), Direction::Release);
-                }
-                r
-            }
+            InjectCmd::ReleaseAll => release_held(&mut enigo, &mut held),
         };
         if let Err(e) = res {
             tracing::warn!("Input injection failed: {e}");
         }
     }
+    let _ = release_held(&mut enigo, &mut held);
+}
+
+fn release_held(enigo: &mut Enigo, held: &mut HeldState) -> enigo::InputResult<()> {
     let (buttons, keys) = held.drain();
+    let mut r = Ok(());
     for b in buttons {
-        let _ = enigo.button(map_button(b), Direction::Release);
+        r = enigo.button(map_button(b), Direction::Release);
     }
     for k in keys {
-        let _ = enigo.key(map_key(k), Direction::Release);
+        r = enigo.key(map_key(k), Direction::Release);
     }
+    r
 }
 
 fn direction(pressed: bool) -> Direction {

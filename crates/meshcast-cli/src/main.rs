@@ -55,6 +55,8 @@ const TICK: Duration = Duration::from_millis(250);
 const WATCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the streamer has to answer a remote-control request.
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long a granted controller has to actually connect before the grant lapses.
+const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
 #[command(
@@ -185,8 +187,14 @@ async fn open_screen(
                         Some(Box::new(pc.guard) as Box<dyn std::any::Any + Send>),
                     ));
                 }
-                Err(e) => {
+                Err(inject_portal::PortalError::Unavailable(e)) => {
+                    // No portal at all → plain capture, no control.
                     tracing::warn!("Remote control unavailable, streaming without it: {e:#}");
+                }
+                // Dialog cancelled / session failed → that *is* the answer; don't
+                // open a second screen-share dialog.
+                Err(inject_portal::PortalError::Failed(e)) => {
+                    return Err(e.context("Screen sharing (with remote control) failed"));
                 }
             }
         }
@@ -202,6 +210,7 @@ async fn open_screen(
             };
         }
     }
+    #[cfg(not(target_os = "linux"))]
     let _ = fps;
     let screen = ScreenCapturer::new().context("Failed to start screen capture")?;
     Ok((Box::new(screen), None, None))
@@ -530,10 +539,10 @@ impl LinkConn {
         match signal.encode() {
             Ok(bytes) => {
                 if let Err(e) = sender.broadcast_neighbors(bytes).await {
-                    tracing::warn!(link = %self.name, "Failed to send {signal:?}: {e}");
+                    tracing::warn!(link = %self.name, "Failed to send {}: {e}", signal.name());
                 }
             }
-            Err(e) => tracing::error!("Failed to encode {signal:?}: {e}"),
+            Err(e) => tracing::error!("Failed to encode {}: {e}", signal.name()),
         }
     }
 
@@ -606,6 +615,8 @@ struct Session {
     pending_control: Option<(usize, u64, String, Instant)>,
     /// Link through which the current grant was made (to report revocation).
     control_link: Option<usize>,
+    /// When the current grant was armed and no controller has connected yet.
+    armed_at: Option<Instant>,
 }
 
 impl Session {
@@ -687,6 +698,14 @@ impl Session {
 
     async fn stop_stream(&mut self, reason: &str) {
         self.revoke_control("stream stopped").await;
+        if self
+            .state
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("Remote control unavailable"))
+        {
+            self.state.error = None;
+        }
         if let Some((idx, _, _, _)) = self.pending_control.take() {
             self.send_to(
                 idx,
@@ -993,6 +1012,7 @@ impl Session {
         let token = ctrl::generate_token();
         self.control.arm(token.clone(), viewer.clone(), injector);
         self.control_link = Some(idx);
+        self.armed_at = Some(Instant::now());
         self.send_to(
             idx,
             Signal::ControlGranted {
@@ -1023,6 +1043,7 @@ impl Session {
     }
 
     async fn revoke_control(&mut self, reason: &str) {
+        self.armed_at = None;
         if let Some(who) = self.control.disarm(reason) {
             if let Some(idx) = self.control_link.take() {
                 self.send_to(idx, Signal::ControlRevoked).await;
@@ -1035,6 +1056,7 @@ impl Session {
     async fn on_server_event(&mut self, ev: ServerEvent) {
         match ev {
             ServerEvent::ControllerConnected { controller } => {
+                self.armed_at = None;
                 notify(
                     "Meshcast",
                     &format!("{controller} is now controlling your screen"),
@@ -1188,6 +1210,7 @@ async fn run_session() -> Result<()> {
         control,
         pending_control: None,
         control_link: None,
+        armed_at: None,
     };
     session.apply_config(&node, &tx, config).await;
     if session.links.is_empty() {
@@ -1269,6 +1292,13 @@ async fn run_session() -> Result<()> {
                 if let Some((_, _, _, since)) = &session.pending_control {
                     if since.elapsed() > CONTROL_REQUEST_TIMEOUT {
                         session.deny_control("no response from the streamer").await;
+                    }
+                }
+                // A grant nobody connects to must not linger (card/app/tray would
+                // disagree and further requests would be refused).
+                if let Some(armed) = session.armed_at {
+                    if !session.control.is_connected() && armed.elapsed() > CONTROL_CONNECT_TIMEOUT {
+                        session.revoke_control("viewer never connected").await;
                     }
                 }
                 session.reap_viewers();
@@ -1380,6 +1410,9 @@ fn cmd_watch(raw: String, rt: &tokio::runtime::Runtime) -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
 
+    // Give a control connection a moment to flush its Release/close frames
+    // before the runtime (and the QUIC endpoint) go away.
+    rt.block_on(tokio::time::sleep(Duration::from_millis(300)));
     Ok(())
 }
 
@@ -1465,8 +1498,18 @@ impl eframe::App for WatchApp {
                     });
                 } else if let Some(video) = self.video.as_mut() {
                     let (img, _) = video.render(ctx, avail);
-                    let resp = ui.add_sized(avail, img);
-                    video_rect = Some(resp.rect);
+                    // Aspect-fit the frame ourselves so we know the exact rect the
+                    // video occupies (pointer mapping depends on it).
+                    let full = ui.available_rect_before_wrap();
+                    let rect = match img.size() {
+                        Some(sz) if sz.x > 0.0 && sz.y > 0.0 => {
+                            let scale = (avail.x / sz.x).min(avail.y / sz.y);
+                            egui::Rect::from_center_size(full.center(), sz * scale)
+                        }
+                        _ => full,
+                    };
+                    ui.put(rect, img);
+                    video_rect = Some(rect);
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.label(
@@ -1517,6 +1560,9 @@ mod viewer {
         paused: bool,
         last_esc: Option<Instant>,
         modifiers: egui::Modifiers,
+        /// Printable keys we sent as *pressed* (chords), so their release is
+        /// always forwarded even if the modifier went up first.
+        pressed_chars: std::collections::HashSet<char>,
         notice: Option<(String, Instant)>,
         ended: bool,
     }
@@ -1534,6 +1580,7 @@ mod viewer {
                 paused: false,
                 last_esc: None,
                 modifiers: egui::Modifiers::NONE,
+                pressed_chars: std::collections::HashSet::new(),
                 notice: None,
                 ended: false,
             }
@@ -1548,10 +1595,10 @@ mod viewer {
         /// Stop controlling (viewer-initiated).
         pub fn release(&mut self) {
             if let Some(c) = self.client.take() {
-                c.send(ControlMsg::Release);
                 c.disconnect();
                 self.set_notice("Control released");
             }
+            self.pressed_chars.clear();
             self.paused = false;
         }
 
@@ -1775,13 +1822,17 @@ mod viewer {
                         pressed,
                         ..
                     } => {
-                        // Presses only inside the video; releases always (so nothing sticks).
-                        if pressed && !video_rect.contains(pos) {
+                        // Presses only inside the video; releases always (so nothing
+                        // sticks) — but don't drag the pointer to the edge first.
+                        let inside = video_rect.contains(pos);
+                        if pressed && !inside {
                             continue;
                         }
                         if let Some(b) = map_button(button) {
-                            if let Some((x, y)) = norm(pos) {
-                                client.send(ControlMsg::PointerMove { x, y });
+                            if inside {
+                                if let Some((x, y)) = norm(pos) {
+                                    client.send(ControlMsg::PointerMove { x, y });
+                                }
                             }
                             client.send(ControlMsg::PointerButton { button: b, pressed });
                         }
@@ -1812,15 +1863,28 @@ mod viewer {
                         }
                         if let Some(k) = map_key(key) {
                             client.send(ControlMsg::Key { key: k, pressed });
-                        } else if chord {
-                            if let Some(c) = key_char(key) {
+                        } else if let Some(c) = key_char(key) {
+                            // Printable keys: as a *key* only inside chords (Ctrl+C…);
+                            // plain typing arrives as Text. A release is always sent
+                            // for a char we pressed, even if the modifier went up first.
+                            if pressed && chord {
+                                self.pressed_chars.insert(c);
                                 client.send(ControlMsg::Key {
                                     key: NamedKey::Char(c),
-                                    pressed,
+                                    pressed: true,
+                                });
+                            } else if !pressed && self.pressed_chars.remove(&c) {
+                                client.send(ControlMsg::Key {
+                                    key: NamedKey::Char(c),
+                                    pressed: false,
                                 });
                             }
                         }
                     }
+                    // egui turns Ctrl/Cmd+C/X/V into these instead of Key events.
+                    egui::Event::Copy => send_chord_char(&client, 'c'),
+                    egui::Event::Cut => send_chord_char(&client, 'x'),
+                    egui::Event::Paste(_) => send_chord_char(&client, 'v'),
                     egui::Event::Text(text) => {
                         if !chord && !text.is_empty() {
                             client.send(ControlMsg::Text { text });
@@ -1829,6 +1893,7 @@ mod viewer {
                     egui::Event::WindowFocused(false) => {
                         client.send(ControlMsg::Release);
                         self.modifiers = egui::Modifiers::NONE;
+                        self.pressed_chars.clear();
                     }
                     _ => {}
                 }
@@ -1879,15 +1944,42 @@ mod viewer {
         })
     }
 
+    /// Press+release a printable key while the (already forwarded) modifiers are held.
+    fn send_chord_char(client: &ControlClient, c: char) {
+        client.send(ControlMsg::Key {
+            key: NamedKey::Char(c),
+            pressed: true,
+        });
+        client.send(ControlMsg::Key {
+            key: NamedKey::Char(c),
+            pressed: false,
+        });
+    }
+
     /// Printable character for a key, for chords like Ctrl+C.
     fn key_char(k: egui::Key) -> Option<char> {
-        let name = k.symbol_or_name();
-        let mut chars = name.chars();
-        match (chars.next(), chars.next()) {
-            (Some(c), None) if c.is_ascii_alphanumeric() || c.is_ascii_punctuation() => {
-                Some(c.to_ascii_lowercase())
+        use egui::Key as K;
+        Some(match k {
+            K::Minus => '-',
+            K::Plus => '+',
+            K::Equals => '=',
+            K::Comma => ',',
+            K::Period => '.',
+            K::Slash => '/',
+            K::Backslash => '\\',
+            K::Semicolon => ';',
+            K::Quote => '\'',
+            K::OpenBracket => '[',
+            K::CloseBracket => ']',
+            K::Backtick => '`',
+            _ => {
+                // Letters and digits: the key's name is a single character.
+                let mut chars = k.name().chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) if c.is_ascii_alphanumeric() => c.to_ascii_lowercase(),
+                    _ => return None,
+                }
             }
-            _ => None,
-        }
+        })
     }
 }
