@@ -150,8 +150,12 @@ if [ "$OS" = "Linux" ]; then
             render "$SRC_DIR/meshcast-tray-autostart.desktop" "$AUTOSTART_DIR/meshcast-tray.desktop"
             info "Tray will start at login (remove $AUTOSTART_DIR/meshcast-tray.desktop to disable)"
         fi
-        command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS_DIR" 2>/dev/null || true
-        command -v xdg-mime >/dev/null 2>&1 && xdg-mime default meshcast-watch.desktop x-scheme-handler/meshcast 2>/dev/null || true
+        if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database "$APPS_DIR" 2>/dev/null || true
+        fi
+        if command -v xdg-mime >/dev/null 2>&1; then
+            xdg-mime default meshcast-watch.desktop x-scheme-handler/meshcast 2>/dev/null || true
+        fi
         info "Registered app launcher and meshcast:// links"
     fi
 

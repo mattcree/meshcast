@@ -16,14 +16,16 @@ CONFIG_DIR="${MESHCAST_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/meshcast}"
 for pidfile in .app-pid .daemon-pid; do
     if [ -f "$CONFIG_DIR/$pidfile" ]; then
         pid="$(cat "$CONFIG_DIR/$pidfile" 2>/dev/null || true)"
-        [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+        if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
     fi
 done
 pkill -f "meshcast-tray.py" 2>/dev/null || true
 
 rm -f "$BIN_DIR/meshcast" "$BIN_DIR/meshcast-app"
 rm -f "$APPS_DIR/meshcast.desktop" "$APPS_DIR/meshcast-watch.desktop" "$AUTOSTART_DIR/meshcast-tray.desktop"
-command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS_DIR" 2>/dev/null || true
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$APPS_DIR" 2>/dev/null || true
+fi
 rm -rf "$INSTALL_DIR"
 
 if [ "$PURGE" = 1 ]; then
