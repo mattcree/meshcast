@@ -157,7 +157,7 @@ struct ActiveStream {
     /// Present when this stream accepts remote control.
     injector: Option<InjectorHandle>,
     /// Keeps the platform capture/injection session alive (portal session).
-    _control_guard: Option<Box<dyn std::any::Any + Send>>,
+    _control_guard: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl ActiveStream {
@@ -174,7 +174,7 @@ async fn open_screen(
 ) -> Result<(
     Box<dyn moq_media::capture::VideoSource>,
     Option<InjectorHandle>,
-    Option<Box<dyn std::any::Any + Send>>,
+    Option<Box<dyn std::any::Any + Send + Sync>>,
 )> {
     if control {
         #[cfg(target_os = "linux")]
@@ -184,7 +184,7 @@ async fn open_screen(
                     return Ok((
                         Box::new(pc.capturer),
                         Some(pc.injector),
-                        Some(Box::new(pc.guard) as Box<dyn std::any::Any + Send>),
+                        Some(Box::new(pc.guard) as Box<dyn std::any::Any + Send + Sync>),
                     ));
                 }
                 Err(inject_portal::PortalError::Unavailable(e)) => {
@@ -508,7 +508,7 @@ async fn cmd_daemon() -> Result<()> {
     }
     process::write_pid_file(&pid_path)?;
 
-    let result = run_session().await;
+    let result = run_session(wait_for_shutdown_signal()).await;
 
     process::remove_own_pid_file(&pid_path);
     ipc::clear_state();
@@ -1180,7 +1180,9 @@ fn command_label(cmd: &IpcCommand) -> &'static str {
     }
 }
 
-async fn run_session() -> Result<()> {
+/// Run the daemon until `shutdown` resolves (Ctrl+C/SIGTERM in production;
+/// a oneshot in tests).
+async fn run_session(shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
     let config = AppConfig::load().await.unwrap_or_else(|e| {
         tracing::error!("Config unreadable, using defaults: {e:#}");
         AppConfig::default()
@@ -1220,7 +1222,6 @@ async fn run_session() -> Result<()> {
 
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let shutdown = wait_for_shutdown_signal();
     tokio::pin!(shutdown);
 
     loop {
@@ -1981,5 +1982,183 @@ mod viewer {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! End-to-end over real iroh-gossip: a fake "bot" node and the real daemon
+    //! session, with a throwaway config dir. Needs network for relay/discovery
+    //! bootstrap, so it is `#[ignore]`:
+    //! `cargo test -p meshcast-cli -- --ignored daemon_session_roundtrip --test-threads=1`
+    use super::*;
+    use meshcast_signal::LinkConfig;
+
+    async fn wait_for<F: Fn() -> bool>(what: &str, secs: u64, f: F) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while !f() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn daemon_session_roundtrip() {
+        // Throwaway config dir so we never touch the real one.
+        let dir = std::env::temp_dir().join(format!("meshcast-it-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("MESHCAST_CONFIG_DIR", &dir);
+
+        // Fake bot.
+        let bot = SignalNode::new(None).await.unwrap();
+        let topic = TopicId::from_bytes(rand_bytes());
+        let bot_topic = bot.gossip.subscribe(topic, vec![]).await.unwrap();
+        let (bot_tx, mut bot_rx) = bot_topic.split();
+
+        // Daemon config: one link to the bot.
+        let mut cfg = AppConfig::default();
+        cfg.add_link(
+            "Test Server".into(),
+            LinkConfig {
+                topic: *topic.as_bytes(),
+                secret_key: rand_bytes(),
+                peer_id: *bot.endpoint.id().as_bytes(),
+            },
+        );
+        cfg.save().await.unwrap();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let daemon = tokio::spawn(run_session(async move {
+            let _ = shutdown_rx.await;
+        }));
+
+        // Bot sees the daemon join.
+        let joined = tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(ev) = bot_rx.next().await {
+                if let Ok(Event::NeighborUp(_)) = ev {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(joined, "daemon never connected to the bot");
+        wait_for("daemon state connected", 20, || ipc::read_state().connected).await;
+        assert_eq!(
+            ipc::read_state().linked_servers,
+            vec!["Test Server".to_string()]
+        );
+
+        // StartStream → consent prompt appears in the state file.
+        bot_tx
+            .broadcast_neighbors(
+                Signal::StartStream {
+                    title: "IT".into(),
+                    quality: "720p".into(),
+                    fps: 30,
+                    server: "Test Server".into(),
+                }
+                .encode()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        wait_for("pending request", 20, || {
+            ipc::read_state().pending_request.is_some()
+        })
+        .await;
+        assert_eq!(ipc::read_state().pending_request.unwrap().title, "IT");
+
+        // Decline in the "app" → bot gets StreamFailed.
+        ipc::send_command(&IpcCommand::Reject).unwrap();
+        let failed = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(ev) = bot_rx.next().await {
+                if let Ok(Event::Received(m)) = ev {
+                    if let Ok(Signal::StreamFailed { reason }) = Signal::decode(&m.content) {
+                        return Some(reason);
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        assert!(
+            failed.as_deref().is_some_and(|r| r.contains("Declined")),
+            "expected StreamFailed(Declined), got {failed:?}"
+        );
+        assert!(ipc::read_state().pending_request.is_none());
+
+        // Ping/Pong.
+        bot_tx
+            .broadcast_neighbors(Signal::Ping.encode().unwrap())
+            .await
+            .unwrap();
+        let pong = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(ev) = bot_rx.next().await {
+                if let Ok(Event::Received(m)) = ev {
+                    if let Ok(Signal::Pong) = Signal::decode(&m.content) {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(pong, "no Pong");
+
+        // A control request while not streaming is denied immediately.
+        bot_tx
+            .broadcast_neighbors(
+                Signal::ControlRequest {
+                    request_id: 7,
+                    viewer: "Viewer".into(),
+                }
+                .encode()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let denied = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(ev) = bot_rx.next().await {
+                if let Ok(Event::Received(m)) = ev {
+                    if let Ok(Signal::ControlDenied { request_id, .. }) = Signal::decode(&m.content)
+                    {
+                        return request_id == 7;
+                    }
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(denied, "control request not denied");
+
+        // Clean shutdown.
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(30), daemon)
+            .await
+            .expect("daemon did not stop")
+            .unwrap()
+            .unwrap();
+        bot.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn rand_bytes() -> [u8; 32] {
+        let mut b = [0u8; 32];
+        for (i, x) in b.iter_mut().enumerate() {
+            // Not cryptographic; fine for a test topic/key.
+            *x = (std::process::id() as u64 * 2654435761
+                + i as u64 * 40503
+                + Instant::now().elapsed().as_nanos() as u64) as u8
+                ^ (i as u8).wrapping_mul(17);
+        }
+        b
     }
 }

@@ -9,6 +9,7 @@ All notable changes to Meshcast. Format follows [Keep a Changelog](https://keepa
 - New signals (`ControlRequest/Granted/Denied/Token/Revoked`, `RevokeControl`, `ControlAvailable`), IPC commands `grant`/`deny`/`revoke`, `approve:control`, config `[control] allow_requests`.
 
 - Remote-control hardening after review: exact aspect-fit pointer mapping in the viewer; portal pointer coordinates in stream *pixels* (HiDPI-correct); every portal step bounded by a timeout; cancelling the portal dialog fails the stream instead of opening a second dialog; the portal session is closed (and all keys released) on stream stop rather than aborted; a grant nobody connects to lapses after 60 s; releases are never rate-limited or dropped; Ctrl/Cmd+C/X/V forwarded (egui intercepts them as Copy/Cut/Paste); chord key releases always sent; bot Revoke waits for confirmation; card timestamp no longer drifts; token-bearing signals never logged.
+- Integration tests over real iroh: `control_roundtrip` (control channel) and `daemon_session_roundtrip` (fake bot ↔ real daemon session via gossip); `run_session` takes a shutdown future.
 - **Open in app** button on the stream card: an https link (GitHub Pages, `docs/watch/`) that opens `meshcast://watch/<ticket>` for viewers who have the app but aren't linked; the ticket stays in the URL fragment.
 
 ### Changed

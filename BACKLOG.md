@@ -48,7 +48,7 @@ Legend: **P1** needed for a smooth v1 experience · **P2** valuable · **P3** ni
 
 ## Robustness & engineering
 
-- [ ] **P1 — Integration test at the gossip layer**: spin up a bot-side `SignalNode` and a daemon `Session` in-process (no Discord, no capture) and drive pairing + StartStream/StreamReady/Stop through real iroh-gossip. Makes protocol changes safe.
+- [x] ~~**P1 — Integration test at the gossip layer**~~ shipped: `daemon_session_roundtrip` (fake bot ↔ real daemon session over iroh-gossip: join, StartStream → consent → StreamFailed, Ping/Pong, ControlDenied, clean shutdown) and `control_roundtrip` (control channel). Both `#[ignore]` (network); run in CI as a non-blocking step. Follow-up: exercise pairing (`/link`) and the approve path with a fake capture source.
 - [ ] **P2 — Older-glibc Linux builds**: Linux release binaries are built on Ubuntu 24.04 (glibc 2.39) because `cros-libva` needs libva ≥ 2.20. Options: build in a container with newer libva on an older base, or drop the `vaapi` default feature of iroh-live/moq-media (check whether the preset H.264 path actually uses VA-API hardware encode first — it may matter for 1080p60 CPU load).
 - [ ] **P2 — Bump iroh / iroh-gossip / iroh-live** to current revisions (pinned April 2026); check upstream for Windows capture and relay API changes.
 - [ ] **P2 — Replace file IPC with a local socket** only if the command set grows (see `docs/DESIGN.md` §3.3) — not before.

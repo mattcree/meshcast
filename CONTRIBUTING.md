@@ -23,6 +23,9 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 shellcheck scripts/*.sh && python3 -m py_compile scripts/meshcast-tray.py
+
+# End-to-end over real iroh (needs network; ~5 s): control channel + daemon session
+cargo test -p meshcast-cli -- --ignored --test-threads=1
 ```
 
 Optional but cheap cross-platform sanity check (needs `mingw64-gcc` + `rustup target add x86_64-pc-windows-gnu`):

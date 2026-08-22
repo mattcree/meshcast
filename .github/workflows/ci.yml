@@ -47,6 +47,13 @@ jobs:
       - name: test
         run: cargo test --workspace
 
+      # End-to-end tests over real iroh endpoints (need the public relay /
+      # discovery, so they are #[ignore] by default). Non-blocking until we've
+      # seen them be reliable on hosted runners.
+      - name: e2e (network)
+        continue-on-error: true
+        run: cargo test -p meshcast-cli -- --ignored --test-threads=1
+
       - name: shellcheck scripts
         run: shellcheck scripts/*.sh
 
