@@ -35,20 +35,30 @@ pub fn pid_file_alive(path: &Path) -> bool {
     read_pid_file(path).is_some_and(pid_alive)
 }
 
-/// Best-effort liveness check for an arbitrary PID.
+/// Is there a live *Meshcast* process with this PID?
+///
+/// PID files can go stale after a crash or reboot and the PID may be reused by
+/// an unrelated process, so this is deliberately strict: the process must be
+/// signalable by us (our own processes always are — EPERM means it's someone
+/// else's) and, where the OS lets us check, its name must start with `meshcast`.
 #[cfg(unix)]
 pub fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    // kill(pid, 0) succeeds if the process exists and we may signal it;
-    // EPERM means it exists but belongs to someone else — still alive.
     // SAFETY: kill with signal 0 performs no action beyond permission checks.
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
+    if rc != 0 {
+        return false;
     }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    #[cfg(target_os = "linux")]
+    {
+        // Reused PID after reboot/crash? Check the process name.
+        if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+            return comm.trim_end().starts_with("meshcast");
+        }
+    }
+    true
 }
 
 #[cfg(windows)]
@@ -184,10 +194,13 @@ mod tests {
 
     #[test]
     fn own_pid_is_alive_and_bogus_is_not() {
+        // Our own test binary is named "meshcast_signal-…", so the name check passes.
         assert!(pid_alive(std::process::id()));
         assert!(!pid_alive(0));
         // Very unlikely to exist; if it does, the test is still harmless.
         assert!(!pid_alive(u32::MAX - 7));
+        // PID 1 exists but is not ours (and not a meshcast process).
+        assert!(!pid_alive(1));
     }
 
     #[test]

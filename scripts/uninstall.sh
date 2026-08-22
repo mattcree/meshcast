@@ -11,7 +11,11 @@ INSTALL_DIR="$DATA_HOME/meshcast"
 BIN_DIR="$HOME/.local/bin"
 APPS_DIR="$DATA_HOME/applications"
 AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
-CONFIG_DIR="${MESHCAST_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/meshcast}"
+if [ "$(uname -s)" = "Darwin" ] && [ -d "$HOME/Library/Application Support/meshcast" ]; then
+    CONFIG_DIR="${MESHCAST_CONFIG_DIR:-$HOME/Library/Application Support/meshcast}"
+else
+    CONFIG_DIR="${MESHCAST_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/meshcast}"
+fi
 
 for pidfile in .app-pid .daemon-pid; do
     if [ -f "$CONFIG_DIR/$pidfile" ]; then

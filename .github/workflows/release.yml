@@ -122,7 +122,6 @@ jobs:
           mkdir -p dist/meshcast-bot
           cp target/release/meshcast-bot dist/meshcast-bot/
           cp scripts/deploy-bot.sh dist/meshcast-bot/
-          cp packaging/bot/meshcast-bot.service dist/meshcast-bot/
           cp README.md LICENSE dist/meshcast-bot/
           tar czf meshcast-bot-linux-x86_64.tar.gz -C dist meshcast-bot
       - uses: actions/upload-artifact@v4

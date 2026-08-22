@@ -41,6 +41,12 @@ Hardening and "ready to install" release. Bot and app from this version remain c
 - A second `/stream` while live would start a second capture and orphan the first.
 - Daemon ignored the audio toggle.
 - Viewer set in the bot wasn't cleared when a stream ended.
+- Bot **Stop** waits for the app to confirm and otherwise forces the card to "ended" (a crashed daemon no longer leaves a dead Live card); a late `StreamReady` with nobody waiting makes the bot tell the app to stop, so the two can't disagree.
+- Linking/unlinking/reloading no longer restarts the daemon session — links are added/removed in place and a live stream survives unrelated link changes; settings changes in the window take effect immediately; `meshcast link` tells a running daemon to reconnect.
+- Liveness checks (daemon/app/tray) verify the PID really is a Meshcast process, so a stale PID file after a crash or reboot can't block start-up.
+- Linux tray: single instance (menu launch while the autostarted tray runs just opens the window), daemon respawn limited to once per minute.
+- `install.sh` replaces binaries atomically (no more `Text file busy` when upgrading while a stream or viewer is open); `deploy-bot.sh` run as root migrates a pre-0.5 user-scope install (identity, links, token) instead of starting a second bot.
+- macOS/Windows: keep using `~/.config/meshcast` if a pre-0.5 config exists there.
 
 ### Removed
 - Legacy `meshcast1…` pairing tokens and the `link.json` file (0.1–0.2 era).

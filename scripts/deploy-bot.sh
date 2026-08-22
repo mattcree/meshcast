@@ -81,6 +81,26 @@ if [ "$UNINSTALL" = 1 ]; then
     exit 0
 fi
 
+# --- Migrate a pre-0.5 user-scope install (root ran the old script) --------
+
+OLD_STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/meshcast-bot"
+OLD_UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/meshcast-bot.service"
+if [ "$SCOPE" = system ] && [ -f "$OLD_UNIT" ]; then
+    info "Found an older user-scope install — migrating it to the system service"
+    systemctl --user disable --now meshcast-bot.service 2>/dev/null || true
+    rm -f "$OLD_UNIT"
+    systemctl --user daemon-reload 2>/dev/null || true
+    mkdir -p "$STATE_DIR"
+    if [ -f "$OLD_STATE_DIR/state.json" ] && [ ! -f "$STATE_DIR/state.json" ]; then
+        cp "$OLD_STATE_DIR/state.json" "$STATE_DIR/state.json"
+        info "Migrated bot identity and links from $OLD_STATE_DIR/state.json (users won't need to /link again)"
+    fi
+    if [ -z "$TOKEN" ] && [ ! -f "$ENV_FILE" ] && [ -f "$OLD_STATE_DIR/discord.env" ]; then
+        cp "$OLD_STATE_DIR/discord.env" "$ENV_FILE"
+        info "Reused token from $OLD_STATE_DIR/discord.env"
+    fi
+fi
+
 # --- Token -----------------------------------------------------------------
 
 if [ "$UPDATE" = 1 ] && [ -z "$TOKEN" ]; then
@@ -146,11 +166,15 @@ if [ "$FROM_SOURCE" = 1 ]; then
         source "$HOME/.cargo/env"
     fi
     if [ -d "$SRC_DIR/.git" ]; then
-        git -C "$SRC_DIR" pull --ff-only
+        git -C "$SRC_DIR" fetch --tags --prune origin
     else
         git clone "https://github.com/$REPO.git" "$SRC_DIR"
     fi
-    if [ "$VERSION" != "latest" ]; then git -C "$SRC_DIR" checkout "$VERSION"; fi
+    if [ "$VERSION" = "latest" ]; then
+        git -C "$SRC_DIR" checkout -q main && git -C "$SRC_DIR" pull --ff-only
+    else
+        git -C "$SRC_DIR" checkout -q "$VERSION"
+    fi
     (cd "$SRC_DIR" && cargo build --release --locked -p meshcast-bot)
     install -m 0755 "$SRC_DIR/target/release/meshcast-bot" "$BIN_DIR/meshcast-bot"
 fi

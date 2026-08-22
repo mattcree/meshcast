@@ -108,22 +108,34 @@ fi
 
 info "Installing to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR" "$BIN_DIR"
-# Stop a running daemon/app so the binaries can be replaced safely.
-CONFIG_DIR="${MESHCAST_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/meshcast}"
+# Stop a running tray/daemon/app so the upgrade takes effect (viewer windows are
+# left alone — the binaries are replaced atomically with mv, which is safe even
+# while the old file is executing).
+if [ "$OS" = "Darwin" ] && [ -d "$HOME/Library/Application Support/meshcast" ]; then
+    CONFIG_DIR="${MESHCAST_CONFIG_DIR:-$HOME/Library/Application Support/meshcast}"
+else
+    CONFIG_DIR="${MESHCAST_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/meshcast}"
+fi
+pkill -f "meshcast-tray.py" 2>/dev/null || true
 for pidfile in .app-pid .daemon-pid; do
     if [ -f "$CONFIG_DIR/$pidfile" ]; then
         pid="$(cat "$CONFIG_DIR/$pidfile" 2>/dev/null || true)"
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             info "Stopping running Meshcast process ($pid)…"
             kill "$pid" 2>/dev/null || true
-            sleep 1
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.5
+            done
         fi
     fi
 done
-pkill -f "meshcast-tray.py" 2>/dev/null || true
 
-cp "$SRC_DIR/meshcast" "$SRC_DIR/meshcast-app" "$INSTALL_DIR/"
-chmod +x "$INSTALL_DIR/meshcast" "$INSTALL_DIR/meshcast-app"
+for bin in meshcast meshcast-app; do
+    cp "$SRC_DIR/$bin" "$INSTALL_DIR/.$bin.new"
+    chmod +x "$INSTALL_DIR/.$bin.new"
+    mv -f "$INSTALL_DIR/.$bin.new" "$INSTALL_DIR/$bin"
+done
 for f in meshcast-tray.py uninstall.sh install.sh README.md LICENSE; do
     [ -f "$SRC_DIR/$f" ] && cp "$SRC_DIR/$f" "$INSTALL_DIR/"
 done

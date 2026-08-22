@@ -15,7 +15,7 @@ crates/meshcast-bot/      poise/serenity bot: /link /unlink /stream, Watch/Stop 
 crates/meshcast-cli/      `meshcast`: daemon (Session state machine), watch (viewer), stream/link/unlink/status
 crates/meshcast-app/      `meshcast-app`: egui window; tray module for macOS/Windows only
 scripts/                  install.sh / install.ps1 / uninstall.sh (desktop), deploy-bot.sh (server), meshcast-tray.py
-packaging/                linux/*.desktop templates, bot/{Dockerfile,docker-compose.yml,meshcast-bot.service}
+packaging/                linux/*.desktop templates, bot/{Dockerfile,docker-compose.yml}
 .github/workflows/        ci.yml (fmt/clippy/test + mac/win check), release.yml (archives, bot, image, checksums)
 docs/                     DESIGN.md, DISCORD-SETUP.md
 ```

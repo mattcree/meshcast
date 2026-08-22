@@ -444,10 +444,21 @@ impl AppConfig {
         if let Some(dir) = std::env::var_os("MESHCAST_CONFIG_DIR") {
             return PathBuf::from(dir);
         }
-        dirs_next::config_dir()
-            .or_else(|| dirs_next::home_dir().map(|h| h.join(".config")))
-            .unwrap_or_default()
-            .join("meshcast")
+        let legacy = dirs_next::home_dir()
+            .map(|h| h.join(".config").join("meshcast"))
+            .unwrap_or_default();
+        let platform = dirs_next::config_dir()
+            .map(|d| d.join("meshcast"))
+            .unwrap_or_else(|| legacy.clone());
+        // Releases before 0.5 used ~/.config/meshcast on every OS. Keep using it
+        // if it holds a config and the platform dir doesn't (macOS/Windows upgrades).
+        if platform != legacy
+            && !platform.join("config.toml").exists()
+            && legacy.join("config.toml").exists()
+        {
+            return legacy;
+        }
+        platform
     }
 
     pub fn config_path() -> PathBuf {
@@ -726,6 +737,29 @@ mod tests {
         assert_eq!(Signal::StreamStopped.encode().unwrap().as_ref(), &[3]);
         assert_eq!(Signal::Ping.encode().unwrap().as_ref(), &[6]);
         assert_eq!(Signal::Pong.encode().unwrap().as_ref(), &[7]);
+        // StreamFailed { reason: "" } = variant 8 + empty string (len 0).
+        assert_eq!(
+            Signal::StreamFailed { reason: "".into() }
+                .encode()
+                .unwrap()
+                .as_ref(),
+            &[8, 0]
+        );
+        // PairSignal indices.
+        assert_eq!(
+            PairSignal::PairRequest { pin: "".into() }
+                .encode()
+                .unwrap()
+                .as_ref(),
+            &[0, 0]
+        );
+        assert_eq!(
+            PairSignal::PairRejected { reason: "".into() }
+                .encode()
+                .unwrap()
+                .as_ref(),
+            &[2, 0]
+        );
     }
 
     #[test]

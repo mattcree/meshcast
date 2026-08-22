@@ -19,8 +19,8 @@ use meshcast_signal::ipc::{self, Command as IpcCommand};
 use meshcast_signal::process;
 use meshcast_signal::{
     derive_pairing_topic, normalize_fps, normalize_quality, sanitize_title, AppConfig, DaemonState,
-    EndpointId, Event, GossipSender, LinkConfig, LinkState, PairCode, PairSignal, Signal,
-    SignalNode, StreamRequest, TopicId,
+    EndpointId, Event, GossipSender, LinkConfig, LinkState, PairCode, PairSignal, ServerLink,
+    Signal, SignalNode, StreamRequest, TopicId,
 };
 use moq_media::capture::ScreenCapturer;
 use moq_media::codec::h264::H264Encoder;
@@ -31,7 +31,7 @@ use moq_media::format::{
 use moq_media::publish::{LocalBroadcast, VideoRenditions};
 use moq_media::traits::VideoEncoderFactory;
 use moq_media::AudioBackend;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// How long the user has to approve a stream request in the app.
 const CONSENT_TIMEOUT: Duration = Duration::from_secs(90);
@@ -217,6 +217,22 @@ async fn start_stream(name: &str, quality: &str, fps: u32, audio: bool) -> Resul
 }
 
 async fn cmd_stream(name: String, no_audio: bool, quality: String, fps: u32) -> Result<()> {
+    // The name ends up in the ticket; keep it to characters `validate_ticket` accepts.
+    let name: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let name = if name.is_empty() {
+        "meshcast".to_string()
+    } else {
+        name
+    };
     let stream = start_stream(&name, &quality, fps, !no_audio).await?;
 
     println!("\nStreaming! Share this ticket to let others watch:\n");
@@ -262,9 +278,14 @@ async fn cmd_link(code: String) -> Result<()> {
     let node = SignalNode::new(None).await?;
     let name = do_link(&node, &code, &mut config).await?;
     node.shutdown().await;
-    println!(
-        "Linked to \"{name}\". Run `meshcast daemon` (or open the Meshcast app) to start listening."
-    );
+    if process::pid_file_alive(&AppConfig::daemon_pid_path()) {
+        let _ = ipc::send_command(&IpcCommand::Reload);
+        println!("Linked to \"{name}\". The running daemon has been told to reconnect.");
+    } else {
+        println!(
+            "Linked to \"{name}\". Run `meshcast daemon` (or open the Meshcast app) to start listening."
+        );
+    }
     Ok(())
 }
 
@@ -401,13 +422,6 @@ fn cmd_status() -> Result<()> {
 // Daemon
 // ---------------------------------------------------------------------------
 
-enum SessionEnd {
-    /// Config changed (link/unlink) — rebuild the session.
-    Restart,
-    /// Shut down the daemon.
-    Exit,
-}
-
 async fn cmd_daemon() -> Result<()> {
     let pid_path = AppConfig::daemon_pid_path();
     if process::pid_file_alive(&pid_path) {
@@ -418,42 +432,96 @@ async fn cmd_daemon() -> Result<()> {
     }
     process::write_pid_file(&pid_path)?;
 
-    let result = async {
-        loop {
-            match run_session().await? {
-                SessionEnd::Restart => {
-                    tracing::info!("Restarting session with updated config");
-                }
-                SessionEnd::Exit => break Ok::<(), anyhow::Error>(()),
-            }
-        }
-    }
-    .await;
+    let result = run_session().await;
 
     process::remove_own_pid_file(&pid_path);
     ipc::clear_state();
     result
 }
 
-/// One linked bot within a session.
+/// One linked bot within a session. Index into `Session::links` is stable for
+/// the life of the session; removed links keep their slot with `sender = None`.
 struct LinkConn {
     name: String,
+    topic: [u8; 32],
     peer_id: EndpointId,
-    sender: GossipSender,
+    sender: Option<GossipSender>,
+    /// Dropping this stops the receiver task (and thus the subscription).
+    stop: Option<oneshot::Sender<()>>,
     connected: bool,
 }
 
 impl LinkConn {
+    fn is_active(&self) -> bool {
+        self.sender.is_some()
+    }
+
     async fn send(&self, signal: Signal) {
+        let Some(sender) = &self.sender else {
+            return;
+        };
         match signal.encode() {
             Ok(bytes) => {
-                if let Err(e) = self.sender.broadcast_neighbors(bytes).await {
+                if let Err(e) = sender.broadcast_neighbors(bytes).await {
                     tracing::warn!(link = %self.name, "Failed to send {signal:?}: {e}");
                 }
             }
             Err(e) => tracing::error!("Failed to encode {signal:?}: {e}"),
         }
     }
+
+    fn deactivate(&mut self) {
+        self.sender = None;
+        self.stop = None; // drops the oneshot → receiver task exits
+        self.connected = false;
+    }
+}
+
+type LinkEvent = (usize, Result<Event>);
+
+/// Subscribe to one bot topic and forward its events (tagged with `idx`) into `tx`.
+///
+/// Uses `subscribe` (not `subscribe_and_join`) so an offline bot doesn't block;
+/// connection state is tracked via NeighborUp/NeighborDown events.
+async fn subscribe_link(
+    node: &SignalNode,
+    sl: &ServerLink,
+    idx: usize,
+    tx: &mpsc::Sender<LinkEvent>,
+) -> Result<LinkConn> {
+    let ls = LinkState::from(sl.config.clone());
+    let peer_id = ls.peer_endpoint_id()?;
+    let topic = node
+        .gossip
+        .subscribe(ls.topic_id(), vec![peer_id])
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (sender, mut receiver) = topic.split();
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                event = receiver.next() => {
+                    let Some(event) = event else { break };
+                    let item = event.map_err(|e| anyhow::anyhow!("{e}"));
+                    if tx.send((idx, item)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    tracing::info!(link = %sl.name, "Subscribed to bot topic");
+    Ok(LinkConn {
+        name: sl.name.clone(),
+        topic: sl.config.topic,
+        peer_id,
+        sender: Some(sender),
+        stop: Some(stop_tx),
+        connected: false,
+    })
 }
 
 struct Session {
@@ -467,11 +535,68 @@ struct Session {
 
 impl Session {
     fn publish_state(&mut self) {
-        self.state.connected = self.links.iter().any(|l| l.connected);
-        self.state.linked_servers = self.links.iter().map(|l| l.name.clone()).collect();
+        self.state.connected = self.links.iter().any(|l| l.is_active() && l.connected);
+        self.state.linked_servers = self
+            .links
+            .iter()
+            .filter(|l| l.is_active())
+            .map(|l| l.name.clone())
+            .collect();
         if let Err(e) = ipc::write_state(&self.state) {
             tracing::warn!("Failed to write state file: {e}");
         }
+    }
+
+    /// Bring the set of subscribed bot topics in line with `new_config`
+    /// without disturbing an active stream (unless its own link was removed).
+    async fn apply_config(
+        &mut self,
+        node: &SignalNode,
+        tx: &mpsc::Sender<LinkEvent>,
+        new_config: AppConfig,
+    ) {
+        // Remove links that are gone from the config.
+        let mut removed = Vec::new();
+        for (idx, conn) in self.links.iter_mut().enumerate() {
+            if conn.is_active()
+                && !new_config
+                    .links
+                    .iter()
+                    .any(|l| l.config.topic == conn.topic)
+            {
+                tracing::info!(link = %conn.name, "Link removed");
+                conn.deactivate();
+                removed.push(idx);
+            }
+        }
+        for idx in removed {
+            if self.active.as_ref().is_some_and(|(i, _)| *i == idx) {
+                self.stop_stream("link removed").await;
+            }
+            if self.pending.as_ref().is_some_and(|(i, _, _)| *i == idx) {
+                self.pending = None;
+                self.state.pending_request = None;
+            }
+        }
+        // Add links that are new.
+        for sl in &new_config.links {
+            let already = self
+                .links
+                .iter()
+                .any(|c| c.is_active() && c.topic == sl.config.topic);
+            if already {
+                continue;
+            }
+            let idx = self.links.len();
+            match subscribe_link(node, sl, idx, tx).await {
+                Ok(conn) => self.links.push(conn),
+                Err(e) => tracing::warn!(link = %sl.name, "Failed to subscribe: {e}"),
+            }
+        }
+        self.state.quality = new_config.video.quality.clone();
+        self.state.fps = new_config.video.fps;
+        self.config = new_config;
+        self.publish_state();
     }
 
     async fn send_to(&self, link_idx: usize, signal: Signal) {
@@ -660,18 +785,57 @@ impl Session {
         }
     }
 
-    /// Handle a local command. `Link` is handled by the session loop because it
-    /// needs the signal node.
-    async fn handle_command(&mut self, cmd: IpcCommand) -> Option<SessionEnd> {
+    /// Handle a local command from the window/tray.
+    async fn handle_command(
+        &mut self,
+        node: &SignalNode,
+        tx: &mpsc::Sender<LinkEvent>,
+        cmd: IpcCommand,
+    ) {
         match cmd {
             IpcCommand::Stop => self.stop_stream("requested locally").await,
             IpcCommand::Approve => self.approve_pending().await,
             IpcCommand::Reject => self.reject_pending("Declined in the Meshcast app").await,
-            IpcCommand::Reload => return Some(SessionEnd::Restart),
-            IpcCommand::Link(_) => {}
+            IpcCommand::Reload => match AppConfig::load().await {
+                Ok(cfg) => {
+                    tracing::info!("Reloading config");
+                    self.apply_config(node, tx, cfg).await;
+                }
+                Err(e) => {
+                    tracing::error!("Config reload failed: {e:#}");
+                    self.state.error = Some(format!("Config error: {e}"));
+                    self.publish_state();
+                }
+            },
+            IpcCommand::Link(code) => {
+                self.state.error = None;
+                self.publish_state();
+                // Work on a fresh copy of the config so we never clobber edits the
+                // window made since this session started.
+                let mut cfg = match AppConfig::load().await {
+                    Ok(cfg) => cfg,
+                    Err(e) => {
+                        tracing::error!("Config unreadable: {e:#}");
+                        self.state.error = Some(format!("Config error: {e}"));
+                        self.publish_state();
+                        return;
+                    }
+                };
+                match do_link(node, &code, &mut cfg).await {
+                    Ok(name) => {
+                        tracing::info!("Linked to \"{name}\"");
+                        notify("Meshcast", &format!("Linked to {name}"));
+                        self.apply_config(node, tx, cfg).await;
+                    }
+                    Err(e) => {
+                        tracing::error!("Link failed: {e:#}");
+                        self.state.error = Some(format!("Link failed: {e}"));
+                        self.publish_state();
+                    }
+                }
+            }
             IpcCommand::Unknown(other) => tracing::debug!("Unknown command: {other}"),
         }
-        None
     }
 
     async fn shutdown(mut self) {
@@ -713,52 +877,19 @@ fn notify(summary: &str, body: &str) {
     });
 }
 
-/// Subscribe to every configured link and forward gossip events into one channel.
-async fn connect_links(
-    node: &SignalNode,
-    config: &AppConfig,
-    tx: &mpsc::Sender<(usize, Result<Event>)>,
-) -> Vec<LinkConn> {
-    let mut links = Vec::new();
-    for sl in config.links.iter() {
-        let ls = LinkState::from(sl.config.clone());
-        let peer_id = match ls.peer_endpoint_id() {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::warn!(link = %sl.name, "Skipping link: {e}");
-                continue;
-            }
-        };
-        // `subscribe` (not `subscribe_and_join`) so an offline bot doesn't block startup;
-        // connection state is tracked via NeighborUp/NeighborDown events.
-        match node.gossip.subscribe(ls.topic_id(), vec![peer_id]).await {
-            Ok(topic) => {
-                let idx = links.len();
-                let (sender, mut receiver) = topic.split();
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    while let Some(event) = receiver.next().await {
-                        let item = event.map_err(|e| anyhow::anyhow!("{e}"));
-                        if tx.send((idx, item)).await.is_err() {
-                            break;
-                        }
-                    }
-                });
-                links.push(LinkConn {
-                    name: sl.name.clone(),
-                    peer_id,
-                    sender,
-                    connected: false,
-                });
-                tracing::info!(link = %sl.name, "Subscribed to bot topic");
-            }
-            Err(e) => tracing::warn!(link = %sl.name, "Failed to subscribe: {e}"),
-        }
+/// Name of a command for logs — never includes payloads (pairing codes are secrets).
+fn command_label(cmd: &IpcCommand) -> &'static str {
+    match cmd {
+        IpcCommand::Stop => "stop",
+        IpcCommand::Approve => "approve",
+        IpcCommand::Reject => "reject",
+        IpcCommand::Reload => "reload",
+        IpcCommand::Link(_) => "link",
+        IpcCommand::Unknown(_) => "unknown",
     }
-    links
 }
 
-async fn run_session() -> Result<SessionEnd> {
+async fn run_session() -> Result<()> {
     let config = AppConfig::load().await.unwrap_or_else(|e| {
         tracing::error!("Config unreadable, using defaults: {e:#}");
         AppConfig::default()
@@ -769,25 +900,20 @@ async fn run_session() -> Result<SessionEnd> {
     let secret_key = config.link_state().map(|l| l.secret_key());
     let node = SignalNode::new(secret_key).await?;
 
-    let (tx, mut rx) = mpsc::channel::<(usize, Result<Event>)>(256);
-    let links = connect_links(&node, &config, &tx).await;
-    if links.is_empty() {
-        tracing::info!("Not linked — waiting for a pairing code (paste it into the Meshcast app)");
-    }
+    let (tx, mut rx) = mpsc::channel::<LinkEvent>(256);
 
     let mut session = Session {
-        state: DaemonState {
-            quality: config.video.quality.clone(),
-            fps: config.video.fps,
-            ..Default::default()
-        },
-        config,
-        links,
+        state: DaemonState::default(),
+        config: AppConfig::default(),
+        links: Vec::new(),
         active: None,
         pending: None,
         viewers: Vec::new(),
     };
-    session.publish_state();
+    session.apply_config(&node, &tx, config).await;
+    if session.links.is_empty() {
+        tracing::info!("Not linked — waiting for a pairing code (paste it into the Meshcast app)");
+    }
     println!("Daemon running. Press Ctrl+C to stop.");
 
     let mut tick = tokio::time::interval(TICK);
@@ -795,20 +921,23 @@ async fn run_session() -> Result<SessionEnd> {
     let shutdown = wait_for_shutdown_signal();
     tokio::pin!(shutdown);
 
-    let end = loop {
+    loop {
         tokio::select! {
             biased;
 
             _ = &mut shutdown => {
                 tracing::info!("Shutting down daemon...");
-                break SessionEnd::Exit;
+                break;
             }
 
             Some((idx, event)) = rx.recv() => {
+                let Some(link) = session.links.get(idx) else { continue };
+                if !link.is_active() {
+                    continue; // stale event from a removed link
+                }
                 match event {
                     Ok(Event::Received(msg)) => {
-                        let expected = session.links.get(idx).map(|l| l.peer_id);
-                        if expected != Some(msg.delivered_from) {
+                        if msg.delivered_from != link.peer_id {
                             tracing::warn!(
                                 "Rejected message from unexpected peer {}",
                                 msg.delivered_from.fmt_short()
@@ -857,39 +986,16 @@ async fn run_session() -> Result<SessionEnd> {
                 session.reap_viewers();
 
                 if let Some(cmd) = ipc::take_command() {
-                    tracing::debug!("Command: {cmd:?}");
-                    match cmd {
-                        IpcCommand::Link(code) => {
-                            session.state.error = None;
-                            session.publish_state();
-                            match do_link(&node, &code, &mut session.config).await {
-                                Ok(name) => {
-                                    tracing::info!("Linked to \"{name}\"");
-                                    notify("Meshcast", &format!("Linked to {name}"));
-                                    break SessionEnd::Restart;
-                                }
-                                Err(e) => {
-                                    tracing::error!("Link failed: {e:#}");
-                                    session.state.error = Some(format!("Link failed: {e}"));
-                                    session.publish_state();
-                                }
-                            }
-                        }
-                        other => {
-                            if let Some(end) = session.handle_command(other).await {
-                                break end;
-                            }
-                        }
-                    }
+                    tracing::debug!("Command: {}", command_label(&cmd));
+                    session.handle_command(&node, &tx, cmd).await;
                 }
             }
         }
-    };
+    }
 
-    // Either way the session is torn down; a restart rebuilds it from config.
     session.shutdown().await;
     node.shutdown().await;
-    Ok(end)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -24,12 +24,14 @@ Usage: meshcast-tray.py [--show]
   --show   open the Meshcast window immediately (otherwise only the tray icon
            appears; the window opens on click or when a stream request arrives)
 """
+import fcntl
 import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
+import time
 
 import gi
 
@@ -85,16 +87,23 @@ def _read_pid(pid_path):
 
 
 def _is_pid_alive(pid_path):
+    """True only if the PID is a live process *of ours* named meshcast*.
+
+    PID files can be stale after a crash/reboot and the PID reused by something
+    unrelated; a permission error means it isn't ours either.
+    """
     pid = _read_pid(pid_path)
     if not pid:
         return False
     try:
         os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except OSError:
+    except OSError:  # ESRCH (gone) or EPERM (not ours)
         return False
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip().startswith("meshcast")
+    except OSError:
+        return True
 
 
 def is_app_running():
@@ -124,9 +133,20 @@ def _spawn(argv):
         print(f"meshcast-tray: failed to start {argv[0]}: {e}", file=sys.stderr)
 
 
+_last_daemon_spawn = 0.0
+
+
 def start_daemon():
-    if not is_daemon_running():
-        _spawn(_cmd(DAEMON_BIN, "daemon"))
+    """Start the daemon if it isn't running (at most once per minute, so a
+    daemon that dies instantly doesn't get respawned in a tight loop)."""
+    global _last_daemon_spawn
+    if is_daemon_running():
+        return
+    now = time.monotonic()
+    if now - _last_daemon_spawn < 60:
+        return
+    _last_daemon_spawn = now
+    _spawn(_cmd(DAEMON_BIN, "daemon"))
 
 
 def show_app(_=None):
@@ -163,6 +183,18 @@ def quit_all(_=None):
             pass
     Gtk.main_quit()
 
+
+# --- Single instance ---------------------------------------------------------
+# A second tray (e.g. app-menu launch while the autostarted one runs) just
+# opens the window and exits.
+os.makedirs(CONFIG_DIR, exist_ok=True)
+_lock = open(os.path.join(CONFIG_DIR, ".tray.lock"), "w")
+try:
+    fcntl.flock(_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    if SHOW_ON_START:
+        show_app()
+    sys.exit(0)
 
 # --- Indicator -------------------------------------------------------------
 

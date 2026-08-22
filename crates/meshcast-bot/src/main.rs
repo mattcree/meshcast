@@ -34,8 +34,11 @@ const DOCS_URL: &str = "https://github.com/mattcree/meshcast#readme";
 /// How long a pairing code stays valid after `/link`.
 const PAIR_CODE_TTL: Duration = Duration::from_secs(600);
 /// How long we wait for the app to approve and start capture after Start is clicked.
-/// Must be ≥ the daemon's consent timeout (90s) so its StreamFailed arrives first.
-const START_TIMEOUT: Duration = Duration::from_secs(100);
+/// Must comfortably exceed the daemon's consent timeout (90s) plus capture start-up
+/// (portal picker, encoder init) so its StreamFailed/StreamReady arrives first.
+const START_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long Stop waits for the app to confirm before forcing the card to "ended".
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long an unfinished `/stream` setup card is kept.
 const SETUP_TTL: Duration = Duration::from_secs(900);
 
@@ -73,6 +76,8 @@ struct Data {
     setups: Mutex<HashMap<UserId, StreamSetup>>,
     /// Active streams keyed by streamer.
     streams: Arc<Mutex<HashMap<UserId, ActiveStream>>>,
+    /// Users whose /stream flow is currently waiting for StreamReady.
+    pending_starts: Arc<Mutex<HashSet<UserId>>>,
     signal_tx: broadcast::Sender<(UserId, Signal)>,
     store_path: std::path::PathBuf,
     store: Arc<Mutex<BotLinkStore>>,
@@ -552,8 +557,17 @@ async fn on_stream_start(
         None => String::new(),
     };
 
-    // Subscribe *before* sending so we can't miss a fast reply.
+    // Subscribe *before* sending so we can't miss a fast reply, and register the
+    // wait so the background task knows a StreamReady is expected.
     let mut rx = data.signal_tx.subscribe();
+    lock(&data.pending_starts).insert(user_id);
+    struct Unregister<'a>(&'a Data, UserId);
+    impl Drop for Unregister<'_> {
+        fn drop(&mut self) {
+            lock(&self.0.pending_starts).remove(&self.1);
+        }
+    }
+    let _unregister = Unregister(data, user_id);
 
     let signal = Signal::StartStream {
         title: title.clone(),
@@ -772,17 +786,52 @@ async fn on_stop(
         return ephemeral(ctx, c, "This stream has already ended.").await;
     }
     let sender = lock(&data.links).get(&streamer_id).cloned();
-    match sender {
-        Some(s) => {
-            let _ = s.broadcast_neighbors(Signal::StopStream.encode()?).await;
-            ephemeral(ctx, c, "Stopping your stream…").await
+    let Some(sender) = sender else {
+        // No link any more: at least tidy up the post.
+        mark_stream_ended(&ctx.http, &data.streams, streamer_id).await;
+        return ephemeral(ctx, c, "Stream marked as ended.").await;
+    };
+
+    // Respond within Discord's 3 s window, then wait for the app to confirm.
+    ephemeral(ctx, c, "Stopping your stream…").await?;
+    let mut rx = data.signal_tx.subscribe();
+    let _ = sender
+        .broadcast_neighbors(Signal::StopStream.encode()?)
+        .await;
+
+    let confirmed = tokio::time::timeout(STOP_TIMEOUT, async {
+        loop {
+            match rx.recv().await {
+                Ok((uid, Signal::StreamStopped)) if uid == streamer_id => return true,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return false,
+            }
         }
-        None => {
-            // No link any more: at least tidy up the post.
-            mark_stream_ended(&ctx.http, &data.streams, streamer_id).await;
-            ephemeral(ctx, c, "Stream marked as ended.").await
-        }
+    })
+    .await
+    .unwrap_or(false);
+
+    if confirmed {
+        // The background task has already updated the post.
+        c.edit_response(
+            ctx,
+            EditInteractionResponse::new().content("Stream stopped."),
+        )
+        .await?;
+    } else {
+        // App unreachable (crashed / offline): don't leave a dead Live card around.
+        tracing::warn!(user = %streamer_id, "No StreamStopped from app; forcing end");
+        mark_stream_ended(&ctx.http, &data.streams, streamer_id).await;
+        c.edit_response(
+            ctx,
+            EditInteractionResponse::new().content(
+                "Your Meshcast app didn't confirm — marked the stream as ended. \
+                 If it's still capturing, stop it from the app or tray.",
+            ),
+        )
+        .await?;
     }
+    Ok(())
 }
 
 /// Replace the live embed with an "ended" one and forget the stream.
@@ -886,16 +935,35 @@ async fn main() -> anyhow::Result<()> {
 
     let streams: Arc<Mutex<HashMap<UserId, ActiveStream>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    // Background: update Discord posts when streams end (e.g. stopped from the app).
+    let pending_starts: Arc<Mutex<HashSet<UserId>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    // Background: update Discord posts when streams end (e.g. stopped from the app),
+    // and keep the app honest if it goes live when nobody is waiting for it.
     {
         let mut rx = signal_tx.subscribe();
         let streams = streams.clone();
+        let pending_starts = pending_starts.clone();
+        let links = links.clone();
         let http = serenity::Http::new(&token);
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok((user_id, Signal::StreamStopped)) => {
                         mark_stream_ended(&http, &streams, user_id).await;
+                    }
+                    Ok((user_id, Signal::StreamReady { .. })) => {
+                        // A StreamReady that arrives after the /stream flow gave up
+                        // (timeout) would leave the desktop capturing with no card
+                        // and no Stop button. Tell the app to stop instead.
+                        let waiting = lock(&pending_starts).contains(&user_id)
+                            || lock(&streams).contains_key(&user_id);
+                        if !waiting {
+                            tracing::warn!(user = %user_id, "Late StreamReady with no pending start; stopping it");
+                            let sender = lock(&links).get(&user_id).cloned();
+                            if let (Some(s), Ok(bytes)) = (sender, Signal::StopStream.encode()) {
+                                let _ = s.broadcast_neighbors(bytes).await;
+                            }
+                        }
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -918,6 +986,7 @@ async fn main() -> anyhow::Result<()> {
                     pending_pins: Arc::new(Mutex::new(HashMap::new())),
                     setups: Mutex::new(HashMap::new()),
                     streams,
+                    pending_starts,
                     signal_tx,
                     store_path: path,
                     store: Arc::new(Mutex::new(store)),

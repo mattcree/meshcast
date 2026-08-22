@@ -384,8 +384,9 @@ impl eframe::App for MeshcastApp {
                     changed |= ui.checkbox(&mut self.config.audio.enabled, "").changed();
                 });
                 if changed {
-                    if let Err(e) = self.config.save_sync() {
-                        self.set_status(format!("Couldn't save config: {e}"));
+                    match self.config.save_sync() {
+                        Ok(()) => self.send(Command::Reload),
+                        Err(e) => self.set_status(format!("Couldn't save config: {e}")),
                     }
                 }
             });
