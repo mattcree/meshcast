@@ -101,7 +101,7 @@ fn install_sigusr1_handler() {
     }
     // SAFETY: installing an async-signal-safe handler that only stores an atomic.
     unsafe {
-        libc::signal(libc::SIGUSR1, handle as libc::sighandler_t);
+        libc::signal(libc::SIGUSR1, handle as *const () as libc::sighandler_t);
     }
 }
 
