@@ -4,6 +4,10 @@ All notable changes to Meshcast. Format follows [Keep a Changelog](https://keepa
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-22
+
+Remote control. New feature — field reports welcome (see `docs/REMOTE-CONTROL.md`). Default streaming/watching behaviour is unchanged unless you tick the new checkbox.
+
 ### Added
 - **Remote control** (`docs/REMOTE-CONTROL.md`): a viewer can request control of the streamer's mouse and keyboard from the stream card; the streamer approves per request in the app, can revoke from card/app/tray, and all held keys are released on revoke/disconnect. Off by default (checkbox in the consent dialog). Input travels over a dedicated iroh protocol (`meshcast/control/1`) with a one-time token. Linux uses the xdg-desktop-portal RemoteDesktop session (combined with screen-cast, so pointer mapping is exact — needs our iroh-live fork's `PipeWireScreenCapturer::from_portal_stream`); macOS/Windows use `enigo`. Viewer: F8 pause, Esc Esc release, on-screen banner.
 - New signals (`ControlRequest/Granted/Denied/Token/Revoked`, `RevokeControl`, `ControlAvailable`), IPC commands `grant`/`deny`/`revoke`, `approve:control`, config `[control] allow_requests`.
@@ -75,7 +79,8 @@ Hardening and "ready to install" release. Bot and app from this version remain c
 ## [0.1.0] - 2026-04-06
 - First working end-to-end: bot `/link` + `/stream`, gossip signalling, egui viewer, GitHub Releases.
 
-[Unreleased]: https://github.com/mattcree/meshcast/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/mattcree/meshcast/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/mattcree/meshcast/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mattcree/meshcast/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mattcree/meshcast/compare/v0.3.1...v0.4.0
 [0.3.x]: https://github.com/mattcree/meshcast/compare/v0.2.0...v0.3.1
