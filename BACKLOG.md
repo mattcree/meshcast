@@ -21,7 +21,7 @@ Legend: **P1** needed for a smooth v1 experience · **P2** valuable · **P3** ni
 
 ## Discord UX
 
-- [ ] **P1 — https "Watch in Meshcast" link** (GitHub Pages page that redirects to `meshcast://watch/<ticket>` and shows install instructions). Gives unlinked viewers a one-click path where a URL handler is registered (Linux/Windows now, macOS after the `.app`). Design note: ticket goes in the URL fragment so it never reaches the server.
+- [x] ~~**P1 — https "Watch in Meshcast" link**~~ shipped: **Open in app** button → `https://mattcree.github.io/meshcast/watch/#<ticket>` (`docs/watch/index.html`, Pages from `/docs`).
 - [ ] **P2 — Persist active stream cards in the bot** (`state.json`) so a bot restart mid-stream still lets Stop / StreamStopped update the card.
 - [ ] **P2 — Role/permission gating**: server setting for who may `/stream`; optional "viewers must have role X" (Watch checks member roles).
 - [ ] **P2 — Stream card polish**: show viewer count live (edit on `ViewerUpdate`), elapsed time, "also streaming" when two people go live in one channel.

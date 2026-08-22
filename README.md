@@ -81,7 +81,7 @@ That's it; the link survives restarts on both sides.
 ### 4. Stream and watch
 
 - **Stream:** type **`/stream`** (optionally `/stream title:Game Night`), pick quality/FPS, click **Start**. Your Meshcast window pops up asking you to confirm (and on Wayland, GNOME asks which screen/window to share). The bot posts a card in the channel.
-- **Watch:** click **Watch** on the card. If you're linked, the viewer opens by itself. If you're not, the bot tells you how to install and gives you the stream ticket for `meshcast watch <ticket>`.
+- **Watch:** click **Watch** on the card. If you're linked, the viewer opens by itself. Not linked but have the app? **Open in app** is an https link that hands the stream to Meshcast via `meshcast://` (Linux/Windows installs register it). Otherwise the bot tells you how to install and gives you the ticket for `meshcast watch <ticket>`.
 - **Stop:** click **Stop** on the card, press **Stop Stream** in the app or tray, or run `/stream` again. The card updates to "Stream ended" and viewers see "Stream ended".
 
 ### Remote control (let a friend drive)

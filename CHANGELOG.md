@@ -8,6 +8,8 @@ All notable changes to Meshcast. Format follows [Keep a Changelog](https://keepa
 - **Remote control** (`docs/REMOTE-CONTROL.md`): a viewer can request control of the streamer's mouse and keyboard from the stream card; the streamer approves per request in the app, can revoke from card/app/tray, and all held keys are released on revoke/disconnect. Off by default (checkbox in the consent dialog). Input travels over a dedicated iroh protocol (`meshcast/control/1`) with a one-time token. Linux uses the xdg-desktop-portal RemoteDesktop session (combined with screen-cast, so pointer mapping is exact — needs our iroh-live fork's `PipeWireScreenCapturer::from_portal_stream`); macOS/Windows use `enigo`. Viewer: F8 pause, Esc Esc release, on-screen banner.
 - New signals (`ControlRequest/Granted/Denied/Token/Revoked`, `RevokeControl`, `ControlAvailable`), IPC commands `grant`/`deny`/`revoke`, `approve:control`, config `[control] allow_requests`.
 
+- **Open in app** button on the stream card: an https link (GitHub Pages, `docs/watch/`) that opens `meshcast://watch/<ticket>` for viewers who have the app but aren't linked; the ticket stays in the URL fragment.
+
 ### Changed
 - `iroh-live`/`moq-media` now come from `github.com/mattcree/iroh-live` (branch `meshcast-0.5`: upstream `edd9bcc` + the one constructor above).
 

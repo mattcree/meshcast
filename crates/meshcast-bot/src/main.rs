@@ -30,6 +30,9 @@ const BLURPLE: u32 = 0x5865F2;
 const GREY: u32 = 0x99AAB5;
 const DOWNLOAD_URL: &str = "https://github.com/mattcree/meshcast/releases/latest";
 const DOCS_URL: &str = "https://github.com/mattcree/meshcast#readme";
+/// Static page that bounces to `meshcast://watch/<ticket>` (ticket in the URL
+/// fragment, so it never reaches the server). Discord only allows http(s) links.
+const WATCH_PAGE_URL: &str = "https://mattcree.github.io/meshcast/watch/";
 
 /// How long a pairing code stays valid after `/link`.
 const PAIR_CODE_TTL: Duration = Duration::from_secs(600);
@@ -119,6 +122,11 @@ impl ActiveStream {
                     .label("Request control")
                     .style(ButtonStyle::Secondary),
             );
+        }
+        // Direct link for people who have the app but haven't linked (or can't).
+        let watch_url = format!("{WATCH_PAGE_URL}#{}", self.ticket);
+        if watch_url.len() <= 512 {
+            buttons.push(CreateButton::new_link(watch_url).label("Open in app"));
         }
         buttons.push(CreateButton::new_link(DOWNLOAD_URL).label("Get Meshcast"));
         vec![CreateActionRow::Buttons(buttons)]

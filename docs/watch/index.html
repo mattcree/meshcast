@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Open in Meshcast</title>
+<style>
+  :root { color-scheme: light dark; --bg:#1e1f22; --fg:#f2f3f5; --muted:#949ba4; --accent:#5865f2; --card:#2b2d31; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f6f6f8; --fg:#1e1f22; --muted:#5c5f66; --card:#ffffff; } }
+  html,body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  main { max-width:560px; margin:8vh auto; padding:0 20px; }
+  .card { background:var(--card); border-radius:12px; padding:24px; box-shadow:0 2px 12px rgba(0,0,0,.15); }
+  h1 { font-size:1.4rem; margin:0 0 8px; }
+  p { margin:8px 0; } .muted { color:var(--muted); }
+  a.btn, button.btn { display:inline-block; background:var(--accent); color:#fff; text-decoration:none; border:0; border-radius:8px; padding:10px 16px; font-weight:600; cursor:pointer; margin:6px 6px 6px 0; }
+  a.sec { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  code, pre { background:rgba(127,127,127,.15); border-radius:6px; padding:2px 6px; font-size:.9em; }
+  pre { padding:10px 12px; overflow-x:auto; white-space:pre-wrap; word-break:break-all; }
+  details { margin-top:14px; } summary { cursor:pointer; color:var(--muted); }
+  #status { min-height:1.5em; }
+</style>
+</head>
+<body>
+<main>
+  <div class="card">
+    <h1>Open this stream in Meshcast</h1>
+    <p id="status" class="muted">Opening Meshcast…</p>
+    <p>
+      <a id="open" class="btn" href="#">Open in Meshcast</a>
+      <a class="btn sec" href="https://github.com/mattcree/meshcast/releases/latest" rel="noopener">Get Meshcast</a>
+    </p>
+    <p class="muted">If nothing happened, Meshcast isn't installed yet, or your browser blocked the link. Install it, then click <b>Open in Meshcast</b> again.</p>
+    <details>
+      <summary>Manual: paste this into a terminal</summary>
+      <pre id="cmd">meshcast watch …</pre>
+      <p class="muted">Linked to the bot already? Just click <b>Watch</b> on the Discord card instead — it opens automatically.</p>
+    </details>
+    <details>
+      <summary>Installing Meshcast</summary>
+      <p><b>Linux / macOS:</b> <code>curl -fsSL https://raw.githubusercontent.com/mattcree/meshcast/main/scripts/install.sh | bash</code></p>
+      <p><b>Windows:</b> <code>irm https://raw.githubusercontent.com/mattcree/meshcast/main/scripts/install.ps1 | iex</code></p>
+      <p class="muted">Then type <code>/link</code> in Discord and paste the code into the Meshcast window for one-click watching next time.</p>
+    </details>
+  </div>
+  <p class="muted" style="text-align:center;margin-top:16px"><a href="https://github.com/mattcree/meshcast" style="color:inherit">Meshcast</a> — P2P screen streaming for Discord. Nothing on this page leaves your browser.</p>
+</main>
+<script>
+(function () {
+  // The ticket travels in the URL fragment, which is never sent to the server.
+  var raw = (location.hash || '').replace(/^#/, '');
+  try { raw = decodeURIComponent(raw); } catch (e) {}
+  raw = raw.replace(/^t=/, '').trim();
+  var ok = raw.length > 0 && raw.length < 2048 && /^[A-Za-z0-9\-_.:\/+=]+$/.test(raw);
+  var status = document.getElementById('status');
+  var open = document.getElementById('open');
+  var cmd = document.getElementById('cmd');
+  if (!ok) {
+    status.textContent = 'This link has no valid stream ticket. Ask the streamer for a fresh one.';
+    open.style.display = 'none';
+    cmd.textContent = 'meshcast watch <ticket>';
+    return;
+  }
+  var uri = 'meshcast://watch/' + raw;
+  open.href = uri;
+  cmd.textContent = 'meshcast watch ' + raw;
+  // Try the protocol handler straight away; leave the button for retries.
+  var t = setTimeout(function () {
+    status.textContent = 'If Meshcast did not open, use the button below.';
+  }, 1500);
+  try { location.href = uri; } catch (e) { clearTimeout(t); }
+})();
+</script>
+</body>
+</html>
