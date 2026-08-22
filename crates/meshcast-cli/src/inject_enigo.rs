@@ -117,7 +117,11 @@ fn map_key(k: NamedKey) -> Key {
         NamedKey::Tab => Key::Tab,
         NamedKey::Backspace => Key::Backspace,
         NamedKey::Delete => Key::Delete,
+        #[cfg(target_os = "windows")]
         NamedKey::Insert => Key::Insert,
+        // macOS keyboards have no Insert; kVK_Help (0x72) is the closest raw code.
+        #[cfg(not(target_os = "windows"))]
+        NamedKey::Insert => Key::Other(0x72),
         NamedKey::Space => Key::Space,
         NamedKey::ArrowLeft => Key::LeftArrow,
         NamedKey::ArrowRight => Key::RightArrow,
