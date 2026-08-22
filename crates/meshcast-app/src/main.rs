@@ -126,13 +126,11 @@ fn main() -> Result<()> {
         extern "C" fn handle_sigusr1(_: libc::c_int) {
             QUIT_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                if QUIT_FLAG.load(Ordering::Relaxed) {
-                    tracing::info!("SIGUSR1 received — exiting");
-                    std::process::exit(0);
-                }
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if QUIT_FLAG.load(Ordering::Relaxed) {
+                tracing::info!("SIGUSR1 received — exiting");
+                std::process::exit(0);
             }
         });
     }
@@ -402,8 +400,7 @@ impl eframe::App for MeshcastApp {
                             .fill(blurple),
                         )
                         .clicked();
-                    if (response.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                         || link_clicked
                     {
                         let token = self.state.link_token_input.clone();
@@ -486,8 +483,7 @@ impl eframe::App for MeshcastApp {
                             .add_sized(
                                 [ui.available_width(), 32.0],
                                 egui::Button::new(
-                                    egui::RichText::new("Stop Stream")
-                                        .color(egui::Color32::WHITE),
+                                    egui::RichText::new("Stop Stream").color(egui::Color32::WHITE),
                                 )
                                 .fill(egui::Color32::from_rgb(237, 66, 69)),
                             )

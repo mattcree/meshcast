@@ -16,12 +16,23 @@ pub use iroh_gossip::proto::TopicId;
 /// Messages exchanged between bot and desktop app over gossip.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Signal {
-    StartStream { title: String, quality: String, fps: u32, server: String },
-    StreamReady { ticket: String },
+    StartStream {
+        title: String,
+        quality: String,
+        fps: u32,
+        server: String,
+    },
+    StreamReady {
+        ticket: String,
+    },
     StopStream,
     StreamStopped,
-    WatchStream { ticket: String },
-    ViewerUpdate { count: u32 },
+    WatchStream {
+        ticket: String,
+    },
+    ViewerUpdate {
+        count: u32,
+    },
     Ping,
     Pong,
 }
@@ -122,7 +133,9 @@ impl PairCode {
         let id_bytes = bot_endpoint_id.as_bytes();
         let id_base32 = data_encoding::BASE32_NOPAD.encode(id_bytes);
         // Format with dashes every 4 chars for readability
-        let chunked: Vec<&str> = id_base32.as_bytes().chunks(4)
+        let chunked: Vec<&str> = id_base32
+            .as_bytes()
+            .chunks(4)
             .map(|c| std::str::from_utf8(c).unwrap_or(""))
             .collect();
         format!("{}-{pin}", chunked.join("-"))
@@ -200,7 +213,10 @@ pub enum PairSignal {
     /// App sends PIN to bot to request pairing.
     PairRequest { pin: String },
     /// Bot responds with the gossip topic and server name if PIN is valid.
-    PairAccepted { topic: [u8; 32], server_name: String },
+    PairAccepted {
+        topic: [u8; 32],
+        server_name: String,
+    },
     /// Bot rejects the PIN.
     PairRejected { reason: String },
 }
@@ -343,9 +359,15 @@ pub struct VideoConfig {
     pub codec: String,
 }
 
-fn default_quality() -> String { "720p".into() }
-fn default_fps() -> u32 { 30 }
-fn default_codec() -> String { "h264".into() }
+fn default_quality() -> String {
+    "720p".into()
+}
+fn default_fps() -> u32 {
+    30
+}
+fn default_codec() -> String {
+    "h264".into()
+}
 
 impl Default for VideoConfig {
     fn default() -> Self {
@@ -363,7 +385,9 @@ pub struct AudioConfig {
     pub enabled: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 impl Default for AudioConfig {
     fn default() -> Self {
@@ -488,7 +512,8 @@ impl AppConfig {
 
     /// Get the first available link state (prefers `links`, falls back to legacy `link`).
     pub fn link_state(&self) -> Option<LinkState> {
-        self.links.first()
+        self.links
+            .first()
             .map(|sl| LinkState::from(sl.config.clone()))
             .or_else(|| self.link.clone().map(LinkState::from))
     }
@@ -522,7 +547,10 @@ pub fn validate_ticket(ticket: &str) -> Result<&str> {
     }
     // iroh-live tickets are: "iroh-live:" + base64url + "/" + name
     // Only allow safe characters
-    if !ticket.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/' | '+' | '=')) {
+    if !ticket
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/' | '+' | '='))
+    {
         anyhow::bail!("Ticket contains invalid characters");
     }
     Ok(ticket)
@@ -536,7 +564,11 @@ pub fn launch_viewer(meshcast_bin: &std::path::Path, ticket: &str) -> Result<()>
     #[cfg(target_os = "linux")]
     {
         std::process::Command::new("setsid")
-            .args([meshcast_bin.as_os_str(), std::ffi::OsStr::new("watch"), std::ffi::OsStr::new(ticket)])
+            .args([
+                meshcast_bin.as_os_str(),
+                std::ffi::OsStr::new("watch"),
+                std::ffi::OsStr::new(ticket),
+            ])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

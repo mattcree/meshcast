@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use futures_lite::StreamExt;
-use meshcast_signal::{BotLinkStore, Event, LinkState, PairCode, PairSignal, Signal, SignalNode, derive_pairing_topic};
+use meshcast_signal::{
+    derive_pairing_topic, BotLinkStore, Event, LinkState, PairCode, PairSignal, Signal, SignalNode,
+};
 use poise::serenity_prelude as serenity;
 use serenity::all::{
     ChannelId, CreateActionRow, CreateButton, CreateEmbed, CreateEmbedAuthor, MessageId, UserId,
@@ -19,7 +21,9 @@ struct Data {
     viewers: Mutex<HashMap<ChannelId, std::collections::HashSet<UserId>>>,
     signal_node: SignalNode,
     links: std::sync::Arc<Mutex<HashMap<UserId, iroh_gossip::api::GossipSender>>>,
-    pending_pins: std::sync::Arc<Mutex<HashMap<String, (iroh_gossip::proto::TopicId, UserId, std::time::Instant)>>>,
+    pending_pins: std::sync::Arc<
+        Mutex<HashMap<String, (iroh_gossip::proto::TopicId, UserId, std::time::Instant)>>,
+    >,
     stream_configs: Mutex<HashMap<UserId, (String, u32)>>,
     signal_tx: broadcast::Sender<(UserId, Signal)>,
     store_path: std::path::PathBuf,
@@ -68,7 +72,10 @@ fn spawn_receiver(
 async fn link(ctx: Context<'_>) -> Result<(), Error> {
     let user_id = ctx.author().id;
     let data = ctx.data();
-    let server_name = ctx.guild().map(|g| g.name.clone()).unwrap_or_else(|| "Unknown Server".into());
+    let server_name = ctx
+        .guild()
+        .map(|g| g.name.clone())
+        .unwrap_or_else(|| "Unknown Server".into());
 
     let real_topic = iroh_gossip::proto::TopicId::from_bytes(rand::random());
     let pin = PairCode::generate_pin();
@@ -78,7 +85,10 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
     {
         let mut pins = data.pending_pins.lock().expect("poisoned");
         pins.retain(|_, (_, _, created)| created.elapsed() < Duration::from_secs(600));
-        pins.insert(pin.clone(), (real_topic, user_id, std::time::Instant::now()));
+        pins.insert(
+            pin.clone(),
+            (real_topic, user_id, std::time::Instant::now()),
+        );
     }
 
     // Subscribe to the pairing topic (derived from PIN) to handle PairRequest
@@ -106,7 +116,9 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
         let result = tokio::time::timeout(Duration::from_secs(600), async {
             while let Some(event) = pair_receiver.next().await {
                 if let Ok(Event::Received(msg)) = event {
-                    if let Ok(PairSignal::PairRequest { pin: received_pin }) = PairSignal::decode(&msg.content) {
+                    if let Ok(PairSignal::PairRequest { pin: received_pin }) =
+                        PairSignal::decode(&msg.content)
+                    {
                         // Validate PIN
                         let valid = {
                             let mut pins = pending_pins.lock().expect("poisoned");
@@ -130,8 +142,13 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
                                 tracing::info!(user = %uid, "PIN accepted, establishing link");
 
                                 // Send PairAccepted with the real topic
-                                let accept = PairSignal::PairAccepted { topic: *topic.as_bytes(), server_name: server_name.clone() };
-                                let _ = pair_sender.broadcast_neighbors(accept.encode().unwrap()).await;
+                                let accept = PairSignal::PairAccepted {
+                                    topic: *topic.as_bytes(),
+                                    server_name: server_name.clone(),
+                                };
+                                let _ = pair_sender
+                                    .broadcast_neighbors(accept.encode().unwrap())
+                                    .await;
 
                                 // Now subscribe to the real gossip topic
                                 if let Ok(real_sub) = gossip.subscribe(topic, vec![]).await {
@@ -157,14 +174,19 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
                             }
                             None => {
                                 tracing::warn!("Invalid or expired PIN");
-                                let reject = PairSignal::PairRejected { reason: "Invalid or expired code".into() };
-                                let _ = pair_sender.broadcast_neighbors(reject.encode().unwrap()).await;
+                                let reject = PairSignal::PairRejected {
+                                    reason: "Invalid or expired code".into(),
+                                };
+                                let _ = pair_sender
+                                    .broadcast_neighbors(reject.encode().unwrap())
+                                    .await;
                             }
                         }
                     }
                 }
             }
-        }).await;
+        })
+        .await;
 
         if result.is_err() {
             tracing::debug!("Pairing topic timed out");
@@ -191,7 +213,12 @@ async fn stream(
     let display_name = user.global_name.as_deref().unwrap_or(&user.name);
     let title = title.unwrap_or_else(|| format!("{display_name}'s Stream"));
 
-    let has_link = ctx.data().links.lock().expect("poisoned").contains_key(&user_id);
+    let has_link = ctx
+        .data()
+        .links
+        .lock()
+        .expect("poisoned")
+        .contains_key(&user_id);
     if !has_link {
         ctx.say("Connect your app first with `/link`.").await?;
         return Ok(());
@@ -200,7 +227,10 @@ async fn stream(
     // Show ephemeral config card with quality/fps selectors + Start/Cancel
     let config_embed = CreateEmbed::new()
         .title("Stream Setup")
-        .description(format!("**{}**\nChoose your settings and click Start.", title))
+        .description(format!(
+            "**{}**\nChoose your settings and click Start.",
+            title
+        ))
         .color(0x5865F2);
 
     let quality_select = serenity::all::CreateSelectMenu::new(
@@ -244,7 +274,6 @@ async fn stream(
     ctx.send(reply).await?;
     Ok(())
 }
-
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -323,7 +352,10 @@ async fn main() -> anyhow::Result<()> {
             let http = ctx.http.clone();
 
             // Spawn background task to update Discord embeds when streams end
-            let active_streams = std::sync::Arc::new(Mutex::new(HashMap::<ChannelId, (MessageId, String, UserId, String)>::new()));
+            let active_streams = std::sync::Arc::new(Mutex::new(HashMap::<
+                ChannelId,
+                (MessageId, String, UserId, String),
+            >::new()));
             let active_streams_bg = active_streams.clone();
             let http_bg = http.clone();
             tokio::spawn(async move {
@@ -354,7 +386,9 @@ async fn main() -> anyhow::Result<()> {
                             let edit = serenity::all::EditMessage::new()
                                 .embed(ended_embed)
                                 .components(vec![]);
-                            if let Err(e) = http_bg.get_message(channel_id, message_id).await
+                            if let Err(e) = http_bg
+                                .get_message(channel_id, message_id)
+                                .await
                                 .and_then(|_| Ok(()))
                             {
                                 tracing::warn!("Failed to fetch message for embed update: {e}");
@@ -401,8 +435,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-
-
 /// Handle component interactions (Watch button clicks)
 async fn handle_event(
     ctx: &serenity::Context,
@@ -416,7 +448,9 @@ async fn handle_event(
 
             // Handle quality/fps select menus
             if id == "stream-quality" || id == "stream-fps" {
-                if let serenity::all::ComponentInteractionDataKind::StringSelect { values } = &component.data.kind {
+                if let serenity::all::ComponentInteractionDataKind::StringSelect { values } =
+                    &component.data.kind
+                {
                     if let Some(value) = values.first() {
                         let mut configs = data.stream_configs.lock().expect("poisoned");
                         let entry = configs.entry(user_id).or_insert(("720p".into(), 30));
@@ -436,7 +470,10 @@ async fn handle_event(
 
             // Handle stream cancel
             if id == "stream-cancel" {
-                data.stream_configs.lock().expect("poisoned").remove(&user_id);
+                data.stream_configs
+                    .lock()
+                    .expect("poisoned")
+                    .remove(&user_id);
                 component
                     .create_response(
                         ctx,
@@ -453,7 +490,10 @@ async fn handle_event(
 
             // Handle stream start
             if id.starts_with("stream-start:") {
-                let title = id.strip_prefix("stream-start:").unwrap_or("Stream").to_string();
+                let title = id
+                    .strip_prefix("stream-start:")
+                    .unwrap_or("Stream")
+                    .to_string();
                 let (quality, fps) = data
                     .stream_configs
                     .lock()
@@ -495,7 +535,11 @@ async fn handle_event(
 
                 // Signal the app
                 let guild_name = if let Some(gid) = component.guild_id {
-                    gid.to_partial_guild(ctx).await.ok().map(|g| g.name).unwrap_or_default()
+                    gid.to_partial_guild(ctx)
+                        .await
+                        .ok()
+                        .map(|g| g.name)
+                        .unwrap_or_default()
                 } else {
                     String::new()
                 };
@@ -530,7 +574,11 @@ async fn handle_event(
 
                 match ticket {
                     Some(ticket) => {
-                        let display_name = component.user.global_name.as_deref().unwrap_or(&component.user.name);
+                        let display_name = component
+                            .user
+                            .global_name
+                            .as_deref()
+                            .unwrap_or(&component.user.name);
                         let avatar_url = component.user.avatar_url().unwrap_or_default();
 
                         let embed = CreateEmbed::new()

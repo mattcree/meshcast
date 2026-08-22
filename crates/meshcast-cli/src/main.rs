@@ -4,19 +4,24 @@ use futures_lite::StreamExt;
 use iroh_live::ticket::LiveTicket;
 use iroh_live::Live;
 use meshcast_signal::{
-    AppConfig, DaemonState, Event, LinkConfig, LinkState, PairCode, PairSignal, PairToken, Signal,
-    SignalNode, StreamRequest, derive_pairing_topic,
+    derive_pairing_topic, AppConfig, DaemonState, Event, LinkConfig, LinkState, PairCode,
+    PairSignal, PairToken, Signal, SignalNode, StreamRequest,
 };
 use moq_media::capture::ScreenCapturer;
 use moq_media::codec::h264::H264Encoder;
 use moq_media::codec::{AudioCodec, VideoCodec};
-use moq_media::format::{AudioPreset, DecoderBackend, PlaybackConfig, VideoEncoderConfig, VideoPreset};
+use moq_media::format::{
+    AudioPreset, DecoderBackend, PlaybackConfig, VideoEncoderConfig, VideoPreset,
+};
 use moq_media::publish::{LocalBroadcast, VideoRenditions};
 use moq_media::traits::VideoEncoderFactory;
 use moq_media::AudioBackend;
 
 #[derive(Parser)]
-#[command(name = "meshcast", about = "P2P screen streaming for Discord via iroh-live")]
+#[command(
+    name = "meshcast",
+    about = "P2P screen streaming for Discord via iroh-live"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -167,10 +172,16 @@ async fn cmd_link(input: String) -> Result<()> {
                 lookup.add(memory_lookup);
             }
             let peer_ids: Vec<_> = pair.peers.iter().map(|p| p.id).collect();
-            let _topic = node.gossip.subscribe_and_join(pair.topic, peer_ids.clone()).await
+            let _topic = node
+                .gossip
+                .subscribe_and_join(pair.topic, peer_ids.clone())
+                .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let state = LinkState::new(pair.topic, &node.endpoint.secret_key(), peer_ids[0]);
-            config.add_link(format!("Server {}", peer_ids[0].fmt_short()), LinkConfig::from(state));
+            config.add_link(
+                format!("Server {}", peer_ids[0].fmt_short()),
+                LinkConfig::from(state),
+            );
             config.save().await?;
             println!("Linked! Run `meshcast daemon` to start listening.");
             return Ok(());
@@ -182,7 +193,8 @@ async fn cmd_link(input: String) -> Result<()> {
 
     // Join the pairing topic derived from PIN
     let pairing_topic = derive_pairing_topic(&pin);
-    let pairing_sub = node.gossip
+    let pairing_sub = node
+        .gossip
         .subscribe_and_join(pairing_topic, vec![bot_id])
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -239,7 +251,11 @@ fn read_cmd() -> Option<String> {
         Ok(cmd) => {
             let _ = std::fs::remove_file(&path);
             let cmd = cmd.trim().to_string();
-            if cmd.is_empty() { None } else { Some(cmd) }
+            if cmd.is_empty() {
+                None
+            } else {
+                Some(cmd)
+            }
         }
         Err(_) => None,
     }
@@ -540,11 +556,7 @@ async fn daemon_loop(config: &mut AppConfig) -> Result<bool> {
 }
 
 /// Pair with a Discord bot using a pairing code (PIN or legacy token).
-async fn do_link(
-    node: &SignalNode,
-    input: &str,
-    config: &mut AppConfig,
-) -> Result<()> {
+async fn do_link(node: &SignalNode, input: &str, config: &mut AppConfig) -> Result<()> {
     let (bot_id, pin) = match PairCode::parse(input) {
         Ok((bot_id, pin)) => (bot_id, pin),
         Err(_) => {
@@ -594,11 +606,7 @@ async fn do_link(
     Ok(())
 }
 
-async fn do_link_legacy(
-    node: &SignalNode,
-    token: &str,
-    config: &mut AppConfig,
-) -> Result<()> {
+async fn do_link_legacy(node: &SignalNode, token: &str, config: &mut AppConfig) -> Result<()> {
     let pair = PairToken::decode(token)?;
 
     let memory_lookup = iroh::address_lookup::memory::MemoryLookup::new();
@@ -627,7 +635,11 @@ async fn do_link_legacy(
 }
 
 /// Start a stream with quality/fps passthrough and return the Live handle, broadcast, and ticket.
-async fn start_stream(name: String, quality: &str, fps: u32) -> Result<(Live, LocalBroadcast, String)> {
+async fn start_stream(
+    name: String,
+    quality: &str,
+    fps: u32,
+) -> Result<(Live, LocalBroadcast, String)> {
     let l = Live::from_env()
         .await
         .context("Failed to initialize iroh-live")?
@@ -691,19 +703,19 @@ async fn cmd_unlink() -> Result<()> {
         println!("Not linked.");
     }
     // Also clean up legacy link file if it exists
-    let legacy = dirs_next::home_dir().unwrap_or_default().join(".config/meshcast/link.json");
+    let legacy = dirs_next::home_dir()
+        .unwrap_or_default()
+        .join(".config/meshcast/link.json");
     let _ = tokio::fs::remove_file(&legacy).await;
     Ok(())
 }
 
 /// Watch command — sets up async connection, then runs eframe on the main thread.
 fn cmd_watch(raw: String, rt: &tokio::runtime::Runtime) -> Result<()> {
-    use moq_media_egui::{VideoTrackView, create_egui_wgpu_config};
+    use moq_media_egui::{create_egui_wgpu_config, VideoTrackView};
 
     let ticket_str = parse_ticket_uri(&raw);
-    let ticket: LiveTicket = ticket_str
-        .parse()
-        .context("Invalid ticket string")?;
+    let ticket: LiveTicket = ticket_str.parse().context("Invalid ticket string")?;
 
     // Async setup: connect and subscribe
     let (live, sub, tracks) = rt.block_on(async {
@@ -786,7 +798,11 @@ impl eframe::App for WatchApp {
         }
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().inner_margin(0.0).fill(egui::Color32::BLACK))
+            .frame(
+                egui::Frame::new()
+                    .inner_margin(0.0)
+                    .fill(egui::Color32::BLACK),
+            )
             .show(ctx, |ui| {
                 let avail = ui.available_size();
                 if self.stream_ended {
