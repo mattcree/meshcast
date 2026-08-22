@@ -1,8 +1,10 @@
 [package]
 name = "meshcast-bot"
-version = "0.1.0"
+description = "Discord bot for Meshcast: /link, /stream and the Watch button"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "meshcast-bot"
@@ -12,8 +14,8 @@ path = "src/main.rs"
 anyhow = "1"
 dirs-next = "2"
 futures-lite = "2"
-iroh = { git = "https://github.com/n0-computer/iroh", rev = "8af8370b567d9e9a89aaf25929b327a6a5b96de1" }
-iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", rev = "1038f721663ffddc526359e33757ba998046ff2d" }
+iroh = { workspace = true }
+iroh-gossip = { workspace = true }
 meshcast-signal = { path = "../meshcast-signal" }
 rand = "0.8"
 poise = "0.6"

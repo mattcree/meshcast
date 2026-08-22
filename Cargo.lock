@@ -4049,13 +4049,12 @@ dependencies = [
 
 [[package]]
 name = "meshcast-app"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "eframe",
  "libc",
  "meshcast-signal",
- "serde_json",
  "tracing",
  "tracing-subscriber",
  "tray-icon",
@@ -4064,7 +4063,7 @@ dependencies = [
 
 [[package]]
 name = "meshcast-bot"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "dirs-next",
@@ -4081,11 +4080,10 @@ dependencies = [
 
 [[package]]
 name = "meshcast-cli"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
- "dirs-next",
  "eframe",
  "futures-lite",
  "iroh",
@@ -4093,7 +4091,6 @@ dependencies = [
  "meshcast-signal",
  "moq-media",
  "moq-media-egui",
- "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4101,14 +4098,16 @@ dependencies = [
 
 [[package]]
 name = "meshcast-signal"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "bytes",
  "data-encoding",
  "dirs-next",
  "iroh",
  "iroh-gossip",
+ "libc",
  "postcard",
  "rand 0.8.5",
  "serde",
@@ -4116,6 +4115,7 @@ dependencies = [
  "tokio",
  "toml 0.8.2",
  "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9823,8 +9823,3 @@ dependencies = [
  "syn 2.0.117",
  "winnow 0.7.15",
 ]
-
-[[patch.unused]]
-name = "web-transport-noq"
-version = "0.0.3"
-source = "git+https://github.com/Frando/web-transport?rev=39fafa6ffddeda60b2726d9af98e8cc251bb3f51#39fafa6ffddeda60b2726d9af98e8cc251bb3f51"

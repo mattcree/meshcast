@@ -1,8 +1,10 @@
 [package]
 name = "meshcast-cli"
-version = "0.1.0"
+description = "Meshcast CLI: stream, watch, link and the background daemon"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "meshcast"
@@ -11,15 +13,13 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-dirs-next = "2"
 futures-lite = "2"
-serde_json = "1"
-iroh = { git = "https://github.com/n0-computer/iroh", rev = "8af8370b567d9e9a89aaf25929b327a6a5b96de1" }
+iroh = { workspace = true }
 meshcast-signal = { path = "../meshcast-signal" }
 eframe = { version = "0.33.0", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
-iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "edd9bcc530a615f3ab3a6919e96790a077905376", features = ["h264", "opus", "capture-screen"] }
-moq-media = { git = "https://github.com/n0-computer/iroh-live", rev = "edd9bcc530a615f3ab3a6919e96790a077905376" }
-moq-media-egui = { git = "https://github.com/n0-computer/iroh-live", rev = "edd9bcc530a615f3ab3a6919e96790a077905376" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+iroh-live = { workspace = true, features = ["h264", "opus", "capture-screen"] }
+moq-media = { workspace = true }
+moq-media-egui = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

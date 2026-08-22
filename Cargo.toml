@@ -1,10 +1,31 @@
 [workspace]
-members = ["crates/meshcast-bot", "crates/meshcast-cli", "crates/meshcast-signal", "crates/meshcast-app"]
+members = [
+    "crates/meshcast-signal",
+    "crates/meshcast-bot",
+    "crates/meshcast-cli",
+    "crates/meshcast-app",
+]
 resolver = "2"
 
 [workspace.package]
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/mattcree/meshcast"
+
+# Pinned git dependencies. All three must agree on the same iroh revision —
+# bump them together (see CONTRIBUTING.md "Updating iroh / iroh-live").
+[workspace.dependencies]
+iroh = { git = "https://github.com/n0-computer/iroh", rev = "8af8370b567d9e9a89aaf25929b327a6a5b96de1" }
+iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", rev = "1038f721663ffddc526359e33757ba998046ff2d" }
+iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "edd9bcc530a615f3ab3a6919e96790a077905376" }
+moq-media = { git = "https://github.com/n0-computer/iroh-live", rev = "edd9bcc530a615f3ab3a6919e96790a077905376" }
+moq-media-egui = { git = "https://github.com/n0-computer/iroh-live", rev = "edd9bcc530a615f3ab3a6919e96790a077905376" }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 4
 
 [patch.crates-io]
 noq = { git = "https://github.com/n0-computer/noq", rev = "93f421632b9bc61525e1d7559d51d40d77cc5149" }
@@ -15,6 +36,5 @@ iroh-base = { git = "https://github.com/n0-computer/iroh", rev = "8af8370b567d9e
 iroh-relay = { git = "https://github.com/n0-computer/iroh", rev = "8af8370b567d9e9a89aaf25929b327a6a5b96de1" }
 iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", rev = "1038f721663ffddc526359e33757ba998046ff2d" }
 web-transport-iroh = { git = "https://github.com/Frando/web-transport", rev = "39fafa6ffddeda60b2726d9af98e8cc251bb3f51" }
-web-transport-noq = { git = "https://github.com/Frando/web-transport", rev = "39fafa6ffddeda60b2726d9af98e8cc251bb3f51" }
 web-transport-proto = { git = "https://github.com/Frando/web-transport", rev = "39fafa6ffddeda60b2726d9af98e8cc251bb3f51" }
 web-transport-trait = { git = "https://github.com/Frando/web-transport", rev = "39fafa6ffddeda60b2726d9af98e8cc251bb3f51" }

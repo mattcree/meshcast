@@ -1,11 +1,26 @@
+//! `meshcast` — CLI and background daemon.
+//!
+//! * `meshcast daemon` is the long-running process that talks to the Discord
+//!   bot(s) over gossip, starts/stops screen capture and launches viewer
+//!   windows. The GUI (`meshcast-app`) and tray are thin clients of it.
+//! * `meshcast watch <ticket>` is the viewer window.
+//! * `meshcast stream` / `link` / `unlink` / `status` are manual equivalents.
+
+use std::path::PathBuf;
+use std::process::Child;
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures_lite::StreamExt;
 use iroh_live::ticket::LiveTicket;
 use iroh_live::Live;
+use meshcast_signal::ipc::{self, Command as IpcCommand};
+use meshcast_signal::process;
 use meshcast_signal::{
-    derive_pairing_topic, AppConfig, DaemonState, Event, LinkConfig, LinkState, PairCode,
-    PairSignal, PairToken, Signal, SignalNode, StreamRequest,
+    derive_pairing_topic, normalize_fps, normalize_quality, sanitize_title, AppConfig, DaemonState,
+    EndpointId, Event, GossipSender, LinkConfig, LinkState, PairCode, PairSignal, Signal,
+    SignalNode, StreamRequest, TopicId,
 };
 use moq_media::capture::ScreenCapturer;
 use moq_media::codec::h264::H264Encoder;
@@ -16,10 +31,23 @@ use moq_media::format::{
 use moq_media::publish::{LocalBroadcast, VideoRenditions};
 use moq_media::traits::VideoEncoderFactory;
 use moq_media::AudioBackend;
+use tokio::sync::mpsc;
+
+/// How long the user has to approve a stream request in the app.
+const CONSENT_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long pairing waits for the bot to answer.
+const PAIR_TIMEOUT: Duration = Duration::from_secs(20);
+/// Maximum simultaneously open viewer windows launched by the daemon.
+const MAX_VIEWER_WINDOWS: usize = 5;
+/// How often the daemon polls the command file and reaps viewer windows.
+const TICK: Duration = Duration::from_millis(250);
+/// Maximum time to wait for a stream to connect in `watch`.
+const WATCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(
     name = "meshcast",
+    version,
     about = "P2P screen streaming for Discord via iroh-live"
 )]
 struct Cli {
@@ -29,7 +57,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start streaming your screen
+    /// Start streaming your screen (manual mode, without Discord)
     Stream {
         /// Broadcast name (used in the ticket)
         #[arg(long, default_value = "meshcast")]
@@ -40,8 +68,12 @@ enum Commands {
         no_audio: bool,
 
         /// Video quality preset: 360p, 720p, 1080p
-        #[arg(long, default_value = "720p")]
+        #[arg(long, default_value = meshcast_signal::DEFAULT_QUALITY)]
         quality: String,
+
+        /// Frames per second: 30 or 60
+        #[arg(long, default_value_t = meshcast_signal::DEFAULT_FPS)]
+        fps: u32,
     },
 
     /// Watch a stream
@@ -50,17 +82,24 @@ enum Commands {
         ticket: String,
     },
 
-    /// Link this machine to the Discord bot for remote stream control
+    /// Link this machine to a Discord bot (paste the code from /link)
     Link {
-        /// Pairing token from `/link` command in Discord
-        token: String,
+        /// Pairing code from the `/link` command in Discord
+        code: String,
     },
 
-    /// Run as a daemon, waiting for the bot to signal stream start/stop
+    /// Run the background daemon that responds to the Discord bot
     Daemon,
 
-    /// Remove the link to the Discord bot
-    Unlink,
+    /// Remove the link to a Discord bot (all links if no name is given)
+    Unlink {
+        /// Name of the server link to remove
+        #[arg(long)]
+        name: Option<String>,
+    },
+
+    /// Show daemon status and configured links
+    Status,
 }
 
 fn main() -> Result<()> {
@@ -83,581 +122,59 @@ fn main() -> Result<()> {
             name,
             no_audio,
             quality,
-        } => rt.block_on(cmd_stream(name, no_audio, quality)),
+            fps,
+        } => rt.block_on(cmd_stream(name, no_audio, quality, fps)),
         Commands::Watch { ticket } => cmd_watch(ticket, &rt),
-        Commands::Link { token } => rt.block_on(cmd_link(token)),
+        Commands::Link { code } => rt.block_on(cmd_link(code)),
         Commands::Daemon => rt.block_on(cmd_daemon()),
-        Commands::Unlink => rt.block_on(cmd_unlink()),
+        Commands::Unlink { name } => rt.block_on(cmd_unlink(name)),
+        Commands::Status => cmd_status(),
     }
 }
 
-async fn cmd_stream(name: String, no_audio: bool, quality: String) -> Result<()> {
+// ---------------------------------------------------------------------------
+// Streaming (shared by `stream` and the daemon)
+// ---------------------------------------------------------------------------
+
+struct ActiveStream {
+    live: Live,
+    _broadcast: LocalBroadcast,
+    ticket: String,
+}
+
+impl ActiveStream {
+    async fn stop(self) {
+        self.live.shutdown().await;
+    }
+}
+
+/// Start screen capture + publish. Returns the live handle and ticket.
+async fn start_stream(name: &str, quality: &str, fps: u32, audio: bool) -> Result<ActiveStream> {
+    let quality = normalize_quality(quality);
+    let fps = normalize_fps(fps);
+
     let live = Live::from_env()
         .await
-        .context("Failed to initialize iroh-live")?
+        .context("Failed to initialise iroh-live")?
         .with_router()
         .spawn();
 
     let broadcast = LocalBroadcast::new();
 
-    // Screen capture
-    let screen = ScreenCapturer::new().context("Failed to initialize screen capture")?;
-    let preset = match quality.as_str() {
-        "360p" => VideoPreset::P360,
-        "720p" => VideoPreset::P720,
-        "1080p" => VideoPreset::P1080,
-        _ => {
-            tracing::warn!("Unknown quality '{quality}', defaulting to 720p");
-            VideoPreset::P720
-        }
-    };
-    broadcast
-        .video()
-        .set_source(screen, VideoCodec::H264, [preset])
-        .context("Failed to set video source")?;
-    tracing::info!("Screen capture started ({quality})");
-
-    // Audio (optional)
-    if !no_audio {
-        let audio_backend = AudioBackend::default();
-        match audio_backend.default_input().await {
-            Ok(mic) => {
-                broadcast
-                    .audio()
-                    .set(mic, AudioCodec::Opus, [AudioPreset::Hq])
-                    .context("Failed to set audio source")?;
-                tracing::info!("Audio capture started");
-            }
-            Err(e) => {
-                tracing::warn!("No audio input available: {e}");
-            }
-        }
-    }
-
-    // Publish and print ticket
-    live.publish(&name, &broadcast)
-        .await
-        .context("Failed to publish broadcast")?;
-
-    let ticket = LiveTicket::new(live.endpoint().addr(), &name);
-    let ticket_str = ticket.to_string();
-
-    println!("\nStreaming! Share this ticket to let others watch:\n");
-    println!("  {ticket_str}\n");
-    println!("  meshcast://watch/{ticket_str}\n");
-    println!("Press Ctrl+C to stop.\n");
-
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("Shutting down...");
-    live.shutdown().await;
-
-    Ok(())
-}
-
-async fn cmd_link(input: String) -> Result<()> {
-    let mut config = AppConfig::load().await.unwrap_or_default();
-
-    // Try PairCode first, fall back to legacy token
-    let (bot_id, pin) = match PairCode::parse(&input) {
-        Ok((bot_id, pin)) => (bot_id, pin),
-        Err(_) => {
-            // Legacy token format
-            let pair = PairToken::decode(&input).context("Invalid pairing code")?;
-            let memory_lookup = iroh::address_lookup::memory::MemoryLookup::new();
-            for peer in &pair.peers {
-                memory_lookup.add_endpoint_info(peer.clone());
-            }
-            let node = SignalNode::new(None).await?;
-            if let Ok(lookup) = node.endpoint.address_lookup() {
-                lookup.add(memory_lookup);
-            }
-            let peer_ids: Vec<_> = pair.peers.iter().map(|p| p.id).collect();
-            let _topic = node
-                .gossip
-                .subscribe_and_join(pair.topic, peer_ids.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let state = LinkState::new(pair.topic, &node.endpoint.secret_key(), peer_ids[0]);
-            config.add_link(
-                format!("Server {}", peer_ids[0].fmt_short()),
-                LinkConfig::from(state),
-            );
-            config.save().await?;
-            println!("Linked! Run `meshcast daemon` to start listening.");
-            return Ok(());
-        }
-    };
-
-    tracing::info!("Pairing with bot {} using PIN", bot_id.fmt_short());
-    let node = SignalNode::new(None).await?;
-
-    // Join the pairing topic derived from PIN
-    let pairing_topic = derive_pairing_topic(&pin);
-    let pairing_sub = node
-        .gossip
-        .subscribe_and_join(pairing_topic, vec![bot_id])
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let (pair_sender, mut pair_receiver) = pairing_sub.split();
-
-    // Send PairRequest
-    tracing::info!("Sending pairing request...");
-    pair_sender
-        .broadcast_neighbors(PairSignal::PairRequest { pin }.encode()?)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    // Wait for response
-    let real_topic = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        while let Some(event) = pair_receiver.next().await {
-            if let Ok(Event::Received(msg)) = event {
-                match PairSignal::decode(&msg.content) {
-                    Ok(PairSignal::PairAccepted { topic, server_name }) => {
-                        return Ok((meshcast_signal::TopicId::from_bytes(topic), server_name));
-                    }
-                    Ok(PairSignal::PairRejected { reason }) => {
-                        return Err(anyhow::anyhow!("Rejected: {reason}"));
-                    }
-                    _ => continue,
-                }
-            }
-        }
-        Err(anyhow::anyhow!("Connection lost"))
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("Timed out — is the bot running?"))??;
-
-    let (real_topic, server_name) = real_topic;
-    let state = LinkState::new(real_topic, &node.endpoint.secret_key(), bot_id);
-    config.add_link(server_name, LinkConfig::from(state));
-    config.save().await?;
-
-    println!("Linked! Run `meshcast daemon` to start listening.");
-    Ok(())
-}
-
-/// Write daemon state to `.tray-state` for the tray and app window to read.
-fn write_state(state: &DaemonState) {
-    let path = AppConfig::state_path();
-    if let Ok(json) = serde_json::to_string(state) {
-        let _ = std::fs::write(&path, json);
-    }
-}
-
-/// Read and delete `.tray-cmd`. Returns the command string if present.
-fn read_cmd() -> Option<String> {
-    let path = AppConfig::cmd_path();
-    match std::fs::read_to_string(&path) {
-        Ok(cmd) => {
-            let _ = std::fs::remove_file(&path);
-            let cmd = cmd.trim().to_string();
-            if cmd.is_empty() {
-                None
-            } else {
-                Some(cmd)
-            }
-        }
-        Err(_) => None,
-    }
-}
-
-async fn cmd_daemon() -> Result<()> {
-    // Write PID file
-    let pid_path = AppConfig::daemon_pid_path();
-    if let Some(parent) = pid_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&pid_path, std::process::id().to_string());
-
-    let result = daemon_task().await;
-
-    // Clean up PID and state files on exit
-    let _ = std::fs::remove_file(&pid_path);
-    let _ = std::fs::remove_file(AppConfig::state_path());
-
-    result
-}
-
-/// Outer loop: restarts daemon_loop when config changes (e.g. after linking).
-async fn daemon_task() -> Result<()> {
-    let mut config = AppConfig::load().await.unwrap_or_default();
-    loop {
-        match daemon_loop(&mut config).await {
-            Ok(true) => {
-                config = AppConfig::load().await.unwrap_or(config.clone());
-                tracing::info!("Restarting daemon loop with updated config");
-                continue;
-            }
-            Ok(false) => break Ok(()),
-            Err(e) => break Err(e),
-        }
-    }
-}
-
-/// Returns Ok(true) to restart, Ok(false) to exit.
-async fn daemon_loop(config: &mut AppConfig) -> Result<bool> {
-    let link_state = config.link_state();
-    let secret_key = link_state.as_ref().map(|l| l.secret_key());
-
-    let node = SignalNode::new(secret_key).await?;
-
-    // Build initial daemon state
-    let server_names: Vec<String> = config.links.iter().map(|l| l.name.clone()).collect();
-    let mut state = DaemonState {
-        linked_servers: server_names,
-        quality: config.video.quality.clone(),
-        fps: config.video.fps,
-        ..Default::default()
-    };
-
-    // If linked, join the gossip topic
-    let gossip_channel = if let Some(ref ls) = link_state {
-        let topic = ls.topic_id();
-        let peer_id = ls.peer_endpoint_id();
-
-        match node.gossip.subscribe_and_join(topic, vec![peer_id]).await {
-            Ok(gt) => {
-                tracing::info!("Joined gossip topic");
-                Some(gt.split())
-            }
-            Err(e) => {
-                tracing::warn!("Failed to join gossip: {e}");
-                None
-            }
-        }
-    } else {
-        tracing::info!("Not linked — waiting for link command");
-        None
-    };
-
-    let (sender, mut receiver) = match gossip_channel {
-        Some((s, r)) => (Some(s), Some(r)),
-        None => (None, None),
-    };
-
-    let mut live: Option<(Live, LocalBroadcast)> = None;
-    let mut pending_stream: Option<StreamRequest> = None;
-    let mut active_viewers: u32 = 0;
-    const MAX_VIEWERS: u32 = 5;
-    let expected_peer = link_state.as_ref().map(|ls| ls.peer_endpoint_id());
-
-    write_state(&state);
-    println!("Daemon running. Press Ctrl+C to stop.\n");
-
-    let mut cmd_interval = tokio::time::interval(std::time::Duration::from_millis(250));
-
-    loop {
-        tokio::select! {
-            // Gossip events
-            event = async {
-                match receiver.as_mut() {
-                    Some(rx) => rx.next().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                let event = match event {
-                    Some(Ok(e)) => e,
-                    Some(Err(e)) => {
-                        tracing::error!("Gossip error: {e}");
-                        state.connected = false;
-                        state.error = Some(format!("Gossip error: {e}"));
-                        write_state(&state);
-                        break;
-                    }
-                    None => break,
-                };
-
-                match event {
-                    Event::Received(msg) => {
-                        if let Some(ref expected) = expected_peer {
-                            if msg.delivered_from != *expected {
-                                tracing::warn!(
-                                    "Rejected message from unknown peer {}",
-                                    msg.delivered_from.fmt_short()
-                                );
-                                continue;
-                            }
-                        }
-
-                        tracing::info!("Received gossip message");
-                        match Signal::decode(&msg.content) {
-                            Ok(Signal::StartStream { title, quality, fps, server }) => {
-                                tracing::info!("Start stream requested: {title} ({quality} {fps}fps) from {server}");
-                                // Store request, wait for user consent
-                                let request = StreamRequest {
-                                    title: title.clone(),
-                                    server: server.clone(),
-                                    quality: quality.clone(),
-                                    fps,
-                                };
-                                pending_stream = Some(request.clone());
-                                state.pending_request = Some(request);
-                                state.quality = quality;
-                                state.fps = fps;
-                                write_state(&state);
-
-                                // Desktop notification
-                                let notify_server = server;
-                                let notify_title = title;
-                                std::thread::spawn(move || {
-                                    let _ = std::process::Command::new("notify-send")
-                                        .args([
-                                            "--app-name=Meshcast",
-                                            "--urgency=critical",
-                                            &format!("Stream Request from {notify_server}"),
-                                            &format!("\"{}\" — Open Meshcast to approve", notify_title),
-                                        ])
-                                        .spawn();
-                                });
-                            }
-                            Ok(Signal::StopStream) => {
-                                tracing::info!("Stop stream");
-                                if let Some((l, _bc)) = live.take() {
-                                    l.shutdown().await;
-                                    if let Some(ref s) = sender {
-                                        let _ = s.broadcast_neighbors(Signal::StreamStopped.encode()?).await;
-                                    }
-                                    state.streaming = false;
-                                    state.stream_ticket = None;
-                                    state.viewers = 0;
-                                    active_viewers = 0;
-                                    write_state(&state);
-                                    tracing::info!("Stream stopped");
-                                }
-                            }
-                            Ok(Signal::WatchStream { ticket }) => {
-                                if active_viewers >= MAX_VIEWERS {
-                                    tracing::warn!("Viewer limit reached ({MAX_VIEWERS}), ignoring WatchStream");
-                                } else {
-                                    tracing::info!("Watch: {ticket}");
-                                    let exe = std::env::current_exe()
-                                        .unwrap_or_else(|_| "meshcast".into());
-                                    match meshcast_signal::launch_viewer(&exe, &ticket) {
-                                        Ok(_) => {
-                                            active_viewers += 1;
-                                            tracing::info!("Viewer launched ({active_viewers}/{MAX_VIEWERS})");
-                                        }
-                                        Err(e) => tracing::error!("Failed to launch viewer: {e}"),
-                                    }
-                                }
-                            }
-                            Ok(Signal::ViewerUpdate { count }) => {
-                                tracing::info!("Viewer count: {count}");
-                                state.viewers = count;
-                                write_state(&state);
-                            }
-                            Ok(Signal::Ping) => {
-                                if let Some(ref s) = sender {
-                                    let _ = s.broadcast_neighbors(Signal::Pong.encode()?).await;
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!("Decode error: {e}"),
-                        }
-                    }
-                    Event::NeighborUp(id) => {
-                        tracing::info!(peer = %id.fmt_short(), "Bot connected");
-                        state.connected = true;
-                        state.error = None;
-                        write_state(&state);
-                    }
-                    Event::NeighborDown(id) => {
-                        tracing::warn!(peer = %id.fmt_short(), "Bot disconnected");
-                        state.connected = false;
-                        write_state(&state);
-                    }
-                    _ => {}
-                }
-            }
-
-            // Poll .tray-cmd for commands from tray/app
-            _ = cmd_interval.tick() => {
-                if let Some(cmd) = read_cmd() {
-                    match cmd.as_str() {
-                        "stop" => {
-                            if let Some((l, _bc)) = live.take() {
-                                l.shutdown().await;
-                                if let Some(ref s) = sender {
-                                    let _ = s.broadcast_neighbors(Signal::StreamStopped.encode()?).await;
-                                }
-                                state.streaming = false;
-                                state.stream_ticket = None;
-                                state.viewers = 0;
-                                active_viewers = 0;
-                                write_state(&state);
-                                tracing::info!("Stream stopped via command");
-                            }
-                        }
-                        "approve" => {
-                            if let Some(req) = pending_stream.take() {
-                                state.pending_request = None;
-                                match start_stream("meshcast".into(), &req.quality, req.fps).await {
-                                    Ok((l, bc, ticket)) => {
-                                        tracing::info!("Streaming: {ticket}");
-                                        if let Some(ref s) = sender {
-                                            let sig = Signal::StreamReady { ticket: ticket.clone() };
-                                            let _ = s.broadcast_neighbors(sig.encode()?).await;
-                                        }
-                                        state.streaming = true;
-                                        state.stream_ticket = Some(ticket);
-                                        write_state(&state);
-                                        live = Some((l, bc));
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Failed to start stream: {e}");
-                                        state.error = Some(format!("Stream failed: {e}"));
-                                        write_state(&state);
-                                    }
-                                }
-                            }
-                        }
-                        "reject" => {
-                            pending_stream = None;
-                            state.pending_request = None;
-                            write_state(&state);
-                            tracing::info!("Stream request declined");
-                        }
-                        "reload" => {
-                            tracing::info!("Reload requested");
-                            return Ok(true); // restart with new config
-                        }
-                        _ if cmd.starts_with("link:") => {
-                            let code = &cmd[5..];
-                            match do_link(&node, code, config).await {
-                                Ok(_) => {
-                                    tracing::info!("Link successful, restarting daemon loop");
-                                    return Ok(true); // restart with new config
-                                }
-                                Err(e) => {
-                                    tracing::error!("Link failed: {e}");
-                                    state.error = Some(format!("Link failed: {e}"));
-                                    write_state(&state);
-                                }
-                            }
-                        }
-                        other => {
-                            tracing::debug!("Unknown command: {other}");
-                        }
-                    }
-                }
-            }
-
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Shutting down daemon...");
-                if let Some((l, _bc)) = live.take() {
-                    l.shutdown().await;
-                }
-                break;
-            }
-        }
-    }
-
-    Ok(false)
-}
-
-/// Pair with a Discord bot using a pairing code (PIN or legacy token).
-async fn do_link(node: &SignalNode, input: &str, config: &mut AppConfig) -> Result<()> {
-    let (bot_id, pin) = match PairCode::parse(input) {
-        Ok((bot_id, pin)) => (bot_id, pin),
-        Err(_) => {
-            return do_link_legacy(node, input, config).await;
-        }
-    };
-
-    tracing::info!("Pairing with bot {} using PIN", bot_id.fmt_short());
-
-    let pairing_topic = derive_pairing_topic(&pin);
-    let pairing_sub = node
-        .gossip
-        .subscribe_and_join(pairing_topic, vec![bot_id])
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let (pair_sender, mut pair_receiver) = pairing_sub.split();
-
-    pair_sender
-        .broadcast_neighbors(PairSignal::PairRequest { pin }.encode()?)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let real_topic = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        while let Some(event) = pair_receiver.next().await {
-            if let Ok(Event::Received(msg)) = event {
-                match PairSignal::decode(&msg.content) {
-                    Ok(PairSignal::PairAccepted { topic, server_name }) => {
-                        return Ok((meshcast_signal::TopicId::from_bytes(topic), server_name));
-                    }
-                    Ok(PairSignal::PairRejected { reason }) => {
-                        return Err(anyhow::anyhow!("Rejected: {reason}"));
-                    }
-                    _ => continue,
-                }
-            }
-        }
-        Err(anyhow::anyhow!("Connection lost"))
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("Timed out — is the bot running?"))??;
-
-    let (real_topic, server_name) = real_topic;
-    let link_state = LinkState::new(real_topic, &node.endpoint.secret_key(), bot_id);
-    config.add_link(server_name, LinkConfig::from(link_state));
-    config.save().await?;
-
-    Ok(())
-}
-
-async fn do_link_legacy(node: &SignalNode, token: &str, config: &mut AppConfig) -> Result<()> {
-    let pair = PairToken::decode(token)?;
-
-    let memory_lookup = iroh::address_lookup::memory::MemoryLookup::new();
-    for peer in &pair.peers {
-        memory_lookup.add_endpoint_info(peer.clone());
-    }
-    if let Ok(lookup) = node.endpoint.address_lookup() {
-        lookup.add(memory_lookup);
-    }
-
-    let peer_ids: Vec<_> = pair.peers.iter().map(|p| p.id).collect();
-    let _topic = node
-        .gossip
-        .subscribe_and_join(pair.topic, peer_ids.clone())
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let link_state = LinkState::new(pair.topic, &node.endpoint.secret_key(), peer_ids[0]);
-    config.add_link(
-        format!("Server {}", peer_ids[0].fmt_short()),
-        LinkConfig::from(link_state),
-    );
-    config.save().await?;
-
-    Ok(())
-}
-
-/// Start a stream with quality/fps passthrough and return the Live handle, broadcast, and ticket.
-async fn start_stream(
-    name: String,
-    quality: &str,
-    fps: u32,
-) -> Result<(Live, LocalBroadcast, String)> {
-    let l = Live::from_env()
-        .await
-        .context("Failed to initialize iroh-live")?
-        .with_router()
-        .spawn();
-
-    let broadcast = LocalBroadcast::new();
-
-    let screen = ScreenCapturer::new().context("Failed to initialize screen capture")?;
+    let screen = ScreenCapturer::new().context("Failed to start screen capture")?;
     let preset = match quality {
         "360p" => VideoPreset::P360,
-        "720p" => VideoPreset::P720,
         "1080p" => VideoPreset::P1080,
         _ => VideoPreset::P720,
     };
 
-    if fps != 30 {
-        // Custom FPS: build renditions manually with VideoEncoderConfig
+    if fps == meshcast_signal::DEFAULT_FPS {
+        broadcast
+            .video()
+            .set_source(screen, VideoCodec::H264, [preset])
+            .context("Failed to set video source")?;
+    } else {
+        // Custom FPS: build the rendition manually so we can set the framerate.
         let enc_config = VideoEncoderConfig::from_preset(preset).framerate(fps);
         let video_config = H264Encoder::config_for(&enc_config);
         let mut renditions = VideoRenditions::empty(screen);
@@ -670,66 +187,743 @@ async fn start_stream(
             .video()
             .set(renditions)
             .context("Failed to set video source")?;
-    } else {
-        broadcast
-            .video()
-            .set_source(screen, VideoCodec::H264, [preset])
-            .context("Failed to set video source")?;
+    }
+    tracing::info!("Screen capture started ({quality} {fps}fps)");
+
+    if audio {
+        let audio_backend = AudioBackend::default();
+        match audio_backend.default_input().await {
+            Ok(mic) => match broadcast
+                .audio()
+                .set(mic, AudioCodec::Opus, [AudioPreset::Hq])
+            {
+                Ok(()) => tracing::info!("Audio capture started"),
+                Err(e) => tracing::warn!("Audio disabled: {e}"),
+            },
+            Err(e) => tracing::warn!("No audio input available: {e}"),
+        }
     }
 
-    let audio_backend = AudioBackend::default();
-    if let Ok(mic) = audio_backend.default_input().await {
-        let _ = broadcast
-            .audio()
-            .set(mic, AudioCodec::Opus, [AudioPreset::Hq]);
-    }
-
-    l.publish(&name, &broadcast)
+    live.publish(name, &broadcast)
         .await
-        .context("Failed to publish")?;
+        .context("Failed to publish broadcast")?;
 
-    let ticket = LiveTicket::new(l.endpoint().addr(), &name);
-    Ok((l, broadcast, ticket.to_string()))
+    let ticket = LiveTicket::new(live.endpoint().addr(), name).to_string();
+    Ok(ActiveStream {
+        live,
+        _broadcast: broadcast,
+        ticket,
+    })
 }
 
-async fn cmd_unlink() -> Result<()> {
-    let mut config = AppConfig::load().await.unwrap_or_default();
-    if !config.links.is_empty() || config.link.is_some() {
-        config.links.clear();
-        config.link = None;
-        config.save().await?;
-        println!("Unlinked from all servers.");
-    } else {
-        println!("Not linked.");
-    }
-    // Also clean up legacy link file if it exists
-    let legacy = dirs_next::home_dir()
-        .unwrap_or_default()
-        .join(".config/meshcast/link.json");
-    let _ = tokio::fs::remove_file(&legacy).await;
+async fn cmd_stream(name: String, no_audio: bool, quality: String, fps: u32) -> Result<()> {
+    let stream = start_stream(&name, &quality, fps, !no_audio).await?;
+
+    println!("\nStreaming! Share this ticket to let others watch:\n");
+    println!("  {}\n", stream.ticket);
+    println!("  {}\n", meshcast_signal::ticket_uri(&stream.ticket));
+    println!("Press Ctrl+C to stop.\n");
+
+    wait_for_shutdown_signal().await;
+    tracing::info!("Shutting down...");
+    stream.stop().await;
     Ok(())
 }
 
-/// Watch command — sets up async connection, then runs eframe on the main thread.
+/// Resolves on Ctrl+C, or SIGTERM on Unix.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Linking
+// ---------------------------------------------------------------------------
+
+async fn cmd_link(code: String) -> Result<()> {
+    let mut config = AppConfig::load().await?;
+    let node = SignalNode::new(None).await?;
+    let name = do_link(&node, &code, &mut config).await?;
+    node.shutdown().await;
+    println!(
+        "Linked to \"{name}\". Run `meshcast daemon` (or open the Meshcast app) to start listening."
+    );
+    Ok(())
+}
+
+/// Pair with a Discord bot using a pairing code. Saves the link into `config`
+/// and returns the server name reported by the bot.
+async fn do_link(node: &SignalNode, input: &str, config: &mut AppConfig) -> Result<String> {
+    let (bot_id, pin) = PairCode::parse(input)?;
+    tracing::info!("Pairing with bot {}", bot_id.fmt_short());
+
+    let pairing_topic = derive_pairing_topic(&pin);
+    let pairing_sub = node
+        .gossip
+        .subscribe(pairing_topic, vec![bot_id])
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (pair_sender, mut pair_receiver) = pairing_sub.split();
+
+    let request = PairSignal::PairRequest { pin }.encode()?;
+
+    let outcome = tokio::time::timeout(PAIR_TIMEOUT, async {
+        let mut sent = false;
+        while let Some(event) = pair_receiver.next().await {
+            match event {
+                Ok(Event::NeighborUp(_)) if !sent => {
+                    // We have a neighbour (the bot) — now the request can be delivered.
+                    pair_sender
+                        .broadcast_neighbors(request.clone())
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    sent = true;
+                }
+                Ok(Event::Received(msg)) => match PairSignal::decode(&msg.content) {
+                    Ok(PairSignal::PairAccepted { topic, server_name }) => {
+                        return Ok((TopicId::from_bytes(topic), server_name));
+                    }
+                    Ok(PairSignal::PairRejected { reason }) => {
+                        anyhow::bail!("Rejected: {reason}");
+                    }
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(e) => anyhow::bail!("Connection lost: {e}"),
+            }
+        }
+        anyhow::bail!("Connection closed")
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Timed out — is the bot running?"))??;
+
+    let (real_topic, server_name) = outcome;
+    let state = LinkState::new(real_topic, node.endpoint.secret_key(), bot_id);
+    config.add_link(server_name.clone(), LinkConfig::from(state));
+    config.save().await?;
+    Ok(server_name)
+}
+
+async fn cmd_unlink(name: Option<String>) -> Result<()> {
+    let mut config = AppConfig::load().await?;
+    match name {
+        Some(name) => {
+            if config.remove_link(&name) {
+                config.save().await?;
+                println!("Unlinked from \"{name}\".");
+            } else {
+                println!("No link named \"{name}\".");
+            }
+        }
+        None => {
+            if config.is_linked() {
+                config.links.clear();
+                config.save().await?;
+                println!("Unlinked from all servers.");
+            } else {
+                println!("Not linked.");
+            }
+        }
+    }
+    // Tell a running daemon to pick up the change.
+    if process::pid_file_alive(&AppConfig::daemon_pid_path()) {
+        let _ = ipc::send_command(&IpcCommand::Reload);
+    }
+    Ok(())
+}
+
+fn cmd_status() -> Result<()> {
+    let config = AppConfig::load_sync()?;
+    let daemon_running = process::pid_file_alive(&AppConfig::daemon_pid_path());
+    let state = ipc::read_state();
+    println!("Config:  {}", AppConfig::config_path().display());
+    println!(
+        "Daemon:  {}",
+        if daemon_running {
+            "running"
+        } else {
+            "not running"
+        }
+    );
+    if daemon_running {
+        println!(
+            "Bot:     {}",
+            if state.connected {
+                "connected"
+            } else {
+                "not connected"
+            }
+        );
+        println!(
+            "Stream:  {}",
+            if state.streaming {
+                format!(
+                    "LIVE {} {}fps, {} viewer(s)",
+                    state.quality, state.fps, state.viewers
+                )
+            } else {
+                "idle".into()
+            }
+        );
+        if let Some(err) = state.error {
+            println!("Error:   {err}");
+        }
+    }
+    if config.links.is_empty() {
+        println!("Links:   none (run /link in Discord, then `meshcast link <code>`)");
+    } else {
+        println!("Links:");
+        for l in &config.links {
+            println!("  - {}", l.name);
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Daemon
+// ---------------------------------------------------------------------------
+
+enum SessionEnd {
+    /// Config changed (link/unlink) — rebuild the session.
+    Restart,
+    /// Shut down the daemon.
+    Exit,
+}
+
+async fn cmd_daemon() -> Result<()> {
+    let pid_path = AppConfig::daemon_pid_path();
+    if process::pid_file_alive(&pid_path) {
+        anyhow::bail!(
+            "Another Meshcast daemon is already running (pid {}).",
+            process::read_pid_file(&pid_path).unwrap_or_default()
+        );
+    }
+    process::write_pid_file(&pid_path)?;
+
+    let result = async {
+        loop {
+            match run_session().await? {
+                SessionEnd::Restart => {
+                    tracing::info!("Restarting session with updated config");
+                }
+                SessionEnd::Exit => break Ok::<(), anyhow::Error>(()),
+            }
+        }
+    }
+    .await;
+
+    process::remove_own_pid_file(&pid_path);
+    ipc::clear_state();
+    result
+}
+
+/// One linked bot within a session.
+struct LinkConn {
+    name: String,
+    peer_id: EndpointId,
+    sender: GossipSender,
+    connected: bool,
+}
+
+impl LinkConn {
+    async fn send(&self, signal: Signal) {
+        match signal.encode() {
+            Ok(bytes) => {
+                if let Err(e) = self.sender.broadcast_neighbors(bytes).await {
+                    tracing::warn!(link = %self.name, "Failed to send {signal:?}: {e}");
+                }
+            }
+            Err(e) => tracing::error!("Failed to encode {signal:?}: {e}"),
+        }
+    }
+}
+
+struct Session {
+    config: AppConfig,
+    links: Vec<LinkConn>,
+    state: DaemonState,
+    active: Option<(usize, ActiveStream)>,
+    pending: Option<(usize, StreamRequest, Instant)>,
+    viewers: Vec<Child>,
+}
+
+impl Session {
+    fn publish_state(&mut self) {
+        self.state.connected = self.links.iter().any(|l| l.connected);
+        self.state.linked_servers = self.links.iter().map(|l| l.name.clone()).collect();
+        if let Err(e) = ipc::write_state(&self.state) {
+            tracing::warn!("Failed to write state file: {e}");
+        }
+    }
+
+    async fn send_to(&self, link_idx: usize, signal: Signal) {
+        if let Some(link) = self.links.get(link_idx) {
+            link.send(signal).await;
+        }
+    }
+
+    async fn stop_stream(&mut self, reason: &str) {
+        if let Some((idx, stream)) = self.active.take() {
+            stream.stop().await;
+            self.send_to(idx, Signal::StreamStopped).await;
+            self.state.streaming = false;
+            self.state.stream_ticket = None;
+            self.state.viewers = 0;
+            self.publish_state();
+            tracing::info!("Stream stopped ({reason})");
+        }
+    }
+
+    async fn approve_pending(&mut self) {
+        let Some((idx, req, _)) = self.pending.take() else {
+            return;
+        };
+        self.state.pending_request = None;
+        self.state.error = None;
+        if self.active.is_some() {
+            // Shouldn't happen (requests are rejected while streaming), but be safe.
+            self.stop_stream("replaced").await;
+        }
+        let audio = self.config.audio.enabled;
+        match start_stream("meshcast", &req.quality, req.fps, audio).await {
+            Ok(stream) => {
+                tracing::info!("Streaming: {}", stream.ticket);
+                self.send_to(
+                    idx,
+                    Signal::StreamReady {
+                        ticket: stream.ticket.clone(),
+                    },
+                )
+                .await;
+                self.state.streaming = true;
+                self.state.stream_ticket = Some(stream.ticket.clone());
+                self.state.quality = normalize_quality(&req.quality).to_string();
+                self.state.fps = normalize_fps(req.fps);
+                self.active = Some((idx, stream));
+            }
+            Err(e) => {
+                tracing::error!("Failed to start stream: {e:#}");
+                self.state.error = Some(format!("Stream failed: {e}"));
+                self.send_to(
+                    idx,
+                    Signal::StreamFailed {
+                        reason: format!("{e}"),
+                    },
+                )
+                .await;
+            }
+        }
+        self.publish_state();
+    }
+
+    async fn reject_pending(&mut self, reason: &str) {
+        if let Some((idx, _, _)) = self.pending.take() {
+            self.state.pending_request = None;
+            self.publish_state();
+            self.send_to(
+                idx,
+                Signal::StreamFailed {
+                    reason: reason.to_string(),
+                },
+            )
+            .await;
+            tracing::info!("Stream request dismissed ({reason})");
+        }
+    }
+
+    fn reap_viewers(&mut self) {
+        self.viewers
+            .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+    }
+
+    fn launch_viewer(&mut self, ticket: &str) {
+        self.reap_viewers();
+        if self.viewers.len() >= MAX_VIEWER_WINDOWS {
+            tracing::warn!("Too many viewer windows open ({MAX_VIEWER_WINDOWS}); ignoring Watch");
+            self.state.error = Some(format!(
+                "Close some viewer windows first (limit {MAX_VIEWER_WINDOWS})"
+            ));
+            self.publish_state();
+            return;
+        }
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("meshcast"));
+        match process::launch_viewer(&exe, ticket) {
+            Ok(child) => {
+                self.viewers.push(child);
+                tracing::info!("Viewer launched ({} open)", self.viewers.len());
+            }
+            Err(e) => {
+                tracing::error!("Failed to launch viewer: {e:#}");
+                self.state.error = Some(format!("Couldn't open viewer: {e}"));
+                self.publish_state();
+            }
+        }
+    }
+
+    async fn handle_signal(&mut self, idx: usize, signal: Signal) {
+        let link_name = self
+            .links
+            .get(idx)
+            .map(|l| l.name.clone())
+            .unwrap_or_default();
+        match signal {
+            Signal::StartStream {
+                title,
+                quality,
+                fps,
+                server,
+            } => {
+                if self.active.is_some() {
+                    tracing::warn!("StartStream while already streaming — rejecting");
+                    self.send_to(
+                        idx,
+                        Signal::StreamFailed {
+                            reason: "Already streaming. Stop the current stream first.".into(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                let title = {
+                    let t = sanitize_title(&title);
+                    if t.is_empty() {
+                        "Stream".to_string()
+                    } else {
+                        t
+                    }
+                };
+                let server = if server.trim().is_empty() {
+                    link_name
+                } else {
+                    server
+                };
+                tracing::info!("Stream requested: \"{title}\" ({quality} {fps}fps) from {server}");
+                let request = StreamRequest {
+                    title: title.clone(),
+                    server: server.clone(),
+                    quality: normalize_quality(&quality).to_string(),
+                    fps: normalize_fps(fps),
+                };
+                // A newer request supersedes an older unanswered one.
+                if let Some((old_idx, _, _)) = self.pending.take() {
+                    self.send_to(
+                        old_idx,
+                        Signal::StreamFailed {
+                            reason: "Superseded by a newer request".into(),
+                        },
+                    )
+                    .await;
+                }
+                self.pending = Some((idx, request.clone(), Instant::now()));
+                self.state.pending_request = Some(request);
+                self.state.error = None;
+                self.publish_state();
+                notify(
+                    &format!("Stream request from {server}"),
+                    &format!("\"{title}\" — open Meshcast to approve"),
+                );
+            }
+            Signal::StopStream => self.stop_stream("requested by bot").await,
+            Signal::WatchStream { ticket } => {
+                tracing::info!("Watch requested");
+                self.launch_viewer(&ticket);
+            }
+            Signal::ViewerUpdate { count } => {
+                self.state.viewers = count;
+                self.publish_state();
+            }
+            Signal::Ping => self.send_to(idx, Signal::Pong).await,
+            Signal::Pong
+            | Signal::StreamReady { .. }
+            | Signal::StreamStopped
+            | Signal::StreamFailed { .. } => {
+                // App-originated signals echoed back over gossip; ignore.
+            }
+        }
+    }
+
+    /// Handle a local command. `Link` is handled by the session loop because it
+    /// needs the signal node.
+    async fn handle_command(&mut self, cmd: IpcCommand) -> Option<SessionEnd> {
+        match cmd {
+            IpcCommand::Stop => self.stop_stream("requested locally").await,
+            IpcCommand::Approve => self.approve_pending().await,
+            IpcCommand::Reject => self.reject_pending("Declined in the Meshcast app").await,
+            IpcCommand::Reload => return Some(SessionEnd::Restart),
+            IpcCommand::Link(_) => {}
+            IpcCommand::Unknown(other) => tracing::debug!("Unknown command: {other}"),
+        }
+        None
+    }
+
+    async fn shutdown(mut self) {
+        self.stop_stream("daemon shutting down").await;
+    }
+}
+
+/// Notify the desktop user (best effort, platform dependent).
+fn notify(summary: &str, body: &str) {
+    let summary = summary.to_string();
+    let body = body.to_string();
+    std::thread::spawn(move || {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("notify-send")
+                .args(["--app-name=Meshcast", "--urgency=critical", &summary, &body])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+            let script = format!(
+                "display notification \"{}\" with title \"{}\"",
+                esc(&body),
+                esc(&summary)
+            );
+            let _ = std::process::Command::new("osascript")
+                .args(["-e", &script])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (&summary, &body);
+        }
+    });
+}
+
+/// Subscribe to every configured link and forward gossip events into one channel.
+async fn connect_links(
+    node: &SignalNode,
+    config: &AppConfig,
+    tx: &mpsc::Sender<(usize, Result<Event>)>,
+) -> Vec<LinkConn> {
+    let mut links = Vec::new();
+    for sl in config.links.iter() {
+        let ls = LinkState::from(sl.config.clone());
+        let peer_id = match ls.peer_endpoint_id() {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(link = %sl.name, "Skipping link: {e}");
+                continue;
+            }
+        };
+        // `subscribe` (not `subscribe_and_join`) so an offline bot doesn't block startup;
+        // connection state is tracked via NeighborUp/NeighborDown events.
+        match node.gossip.subscribe(ls.topic_id(), vec![peer_id]).await {
+            Ok(topic) => {
+                let idx = links.len();
+                let (sender, mut receiver) = topic.split();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = receiver.next().await {
+                        let item = event.map_err(|e| anyhow::anyhow!("{e}"));
+                        if tx.send((idx, item)).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                links.push(LinkConn {
+                    name: sl.name.clone(),
+                    peer_id,
+                    sender,
+                    connected: false,
+                });
+                tracing::info!(link = %sl.name, "Subscribed to bot topic");
+            }
+            Err(e) => tracing::warn!(link = %sl.name, "Failed to subscribe: {e}"),
+        }
+    }
+    links
+}
+
+async fn run_session() -> Result<SessionEnd> {
+    let config = AppConfig::load().await.unwrap_or_else(|e| {
+        tracing::error!("Config unreadable, using defaults: {e:#}");
+        AppConfig::default()
+    });
+
+    // The first link's key gives the daemon a stable identity; the bot does not
+    // verify app identity, so one key works for every link.
+    let secret_key = config.link_state().map(|l| l.secret_key());
+    let node = SignalNode::new(secret_key).await?;
+
+    let (tx, mut rx) = mpsc::channel::<(usize, Result<Event>)>(256);
+    let links = connect_links(&node, &config, &tx).await;
+    if links.is_empty() {
+        tracing::info!("Not linked — waiting for a pairing code (paste it into the Meshcast app)");
+    }
+
+    let mut session = Session {
+        state: DaemonState {
+            quality: config.video.quality.clone(),
+            fps: config.video.fps,
+            ..Default::default()
+        },
+        config,
+        links,
+        active: None,
+        pending: None,
+        viewers: Vec::new(),
+    };
+    session.publish_state();
+    println!("Daemon running. Press Ctrl+C to stop.");
+
+    let mut tick = tokio::time::interval(TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let shutdown = wait_for_shutdown_signal();
+    tokio::pin!(shutdown);
+
+    let end = loop {
+        tokio::select! {
+            biased;
+
+            _ = &mut shutdown => {
+                tracing::info!("Shutting down daemon...");
+                break SessionEnd::Exit;
+            }
+
+            Some((idx, event)) = rx.recv() => {
+                match event {
+                    Ok(Event::Received(msg)) => {
+                        let expected = session.links.get(idx).map(|l| l.peer_id);
+                        if expected != Some(msg.delivered_from) {
+                            tracing::warn!(
+                                "Rejected message from unexpected peer {}",
+                                msg.delivered_from.fmt_short()
+                            );
+                            continue;
+                        }
+                        match Signal::decode(&msg.content) {
+                            Ok(signal) => session.handle_signal(idx, signal).await,
+                            Err(e) => tracing::warn!("Undecodable signal: {e}"),
+                        }
+                    }
+                    Ok(Event::NeighborUp(id)) => {
+                        if let Some(link) = session.links.get_mut(idx) {
+                            tracing::info!(link = %link.name, peer = %id.fmt_short(), "Bot connected");
+                            link.connected = true;
+                        }
+                        session.state.error = None;
+                        session.publish_state();
+                    }
+                    Ok(Event::NeighborDown(id)) => {
+                        if let Some(link) = session.links.get_mut(idx) {
+                            tracing::warn!(link = %link.name, peer = %id.fmt_short(), "Bot disconnected");
+                            link.connected = false;
+                        }
+                        session.publish_state();
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!("Gossip error on link {idx}: {e}");
+                        if let Some(link) = session.links.get_mut(idx) {
+                            link.connected = false;
+                        }
+                        session.state.error = Some(format!("Connection error: {e}"));
+                        session.publish_state();
+                    }
+                }
+            }
+
+            _ = tick.tick() => {
+                // Expire unanswered consent prompts.
+                if let Some((_, _, since)) = &session.pending {
+                    if since.elapsed() > CONSENT_TIMEOUT {
+                        session.reject_pending("No response in the Meshcast app").await;
+                    }
+                }
+                session.reap_viewers();
+
+                if let Some(cmd) = ipc::take_command() {
+                    tracing::debug!("Command: {cmd:?}");
+                    match cmd {
+                        IpcCommand::Link(code) => {
+                            session.state.error = None;
+                            session.publish_state();
+                            match do_link(&node, &code, &mut session.config).await {
+                                Ok(name) => {
+                                    tracing::info!("Linked to \"{name}\"");
+                                    notify("Meshcast", &format!("Linked to {name}"));
+                                    break SessionEnd::Restart;
+                                }
+                                Err(e) => {
+                                    tracing::error!("Link failed: {e:#}");
+                                    session.state.error = Some(format!("Link failed: {e}"));
+                                    session.publish_state();
+                                }
+                            }
+                        }
+                        other => {
+                            if let Some(end) = session.handle_command(other).await {
+                                break end;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    // Either way the session is torn down; a restart rebuilds it from config.
+    session.shutdown().await;
+    node.shutdown().await;
+    Ok(end)
+}
+
+// ---------------------------------------------------------------------------
+// Viewer
+// ---------------------------------------------------------------------------
+
+/// Watch command — connects, then runs eframe on the main thread.
 fn cmd_watch(raw: String, rt: &tokio::runtime::Runtime) -> Result<()> {
     use moq_media_egui::{create_egui_wgpu_config, VideoTrackView};
 
-    let ticket_str = parse_ticket_uri(&raw);
-    let ticket: LiveTicket = ticket_str.parse().context("Invalid ticket string")?;
+    let ticket_str = meshcast_signal::parse_ticket_uri(&raw);
+    let ticket: LiveTicket = match meshcast_signal::validate_ticket(ticket_str)
+        .and_then(|t| t.parse().context("Invalid ticket string"))
+    {
+        Ok(t) => t,
+        Err(e) => return show_error_window(&format!("Invalid stream ticket.\n\n{e}")),
+    };
 
     // Async setup: connect and subscribe
-    let (live, sub, tracks) = rt.block_on(async {
+    let connected = rt.block_on(async {
         tracing::info!("Connecting to stream '{}'...", ticket.broadcast_name);
 
         let live = Live::from_env()
             .await
-            .context("Failed to initialize iroh-live")?
+            .context("Failed to initialise iroh-live")?
             .spawn();
 
-        let sub = live
-            .subscribe(ticket.endpoint, &ticket.broadcast_name)
-            .await
-            .context("Failed to subscribe to stream")?;
+        let sub = tokio::time::timeout(
+            WATCH_CONNECT_TIMEOUT,
+            live.subscribe(ticket.endpoint.clone(), &ticket.broadcast_name),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out connecting to the streamer"))?
+        .context("Failed to subscribe to stream")?;
 
         let audio_backend = AudioBackend::default();
         let playback_config = PlaybackConfig {
@@ -740,17 +934,31 @@ fn cmd_watch(raw: String, rt: &tokio::runtime::Runtime) -> Result<()> {
             .broadcast()
             .media(&audio_backend, playback_config)
             .await
-            .context("Failed to initialize media tracks")?;
+            .context("Failed to initialise media tracks")?;
 
         tracing::info!("Connected.");
         anyhow::Ok((live, sub, tracks))
-    })?;
+    });
+
+    let (live, sub, tracks) = match connected {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("{e:#}");
+            return show_error_window(&format!(
+                "Couldn't connect to the stream.\n\n{e:#}\n\nThe streamer may have stopped, or the network is blocking the connection."
+            ));
+        }
+    };
 
     // eframe must run on the main thread
     let _guard = rt.enter();
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: create_egui_wgpu_config(),
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_title(format!("Meshcast — {}", ticket.broadcast_name))
+            .with_inner_size([1280.0, 720.0])
+            .with_min_inner_size([320.0, 180.0]),
         ..Default::default()
     };
 
@@ -777,6 +985,44 @@ fn cmd_watch(raw: String, rt: &tokio::runtime::Runtime) -> Result<()> {
     Ok(())
 }
 
+/// Show a small window with an error message (the viewer is usually launched
+/// detached, so stderr is invisible to the user).
+fn show_error_window(message: &str) -> Result<()> {
+    let message = message.to_string();
+    let native_options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_title("Meshcast")
+            .with_inner_size([440.0, 200.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Meshcast",
+        native_options,
+        Box::new(move |_cc| Ok(Box::new(ErrorApp { message }))),
+    )
+    .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
+    Ok(())
+}
+
+struct ErrorApp {
+    message: String,
+}
+
+impl eframe::App for ErrorApp {
+    fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
+        use eframe::egui;
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Meshcast");
+            ui.add_space(8.0);
+            ui.label(&self.message);
+            ui.add_space(12.0);
+            if ui.button("Close").clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        });
+    }
+}
+
 struct WatchApp {
     video: Option<moq_media_egui::VideoTrackView>,
     _audio: Option<moq_media::subscribe::AudioTrack>,
@@ -790,7 +1036,7 @@ impl eframe::App for WatchApp {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         use eframe::egui;
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        ctx.request_repaint_after(Duration::from_millis(16));
 
         // Detect stream end
         if !self.stream_ended && self.broadcast.shutdown_token().is_cancelled() {
@@ -818,7 +1064,10 @@ impl eframe::App for WatchApp {
                     ui.add_sized(avail, img);
                 } else {
                     ui.centered_and_justified(|ui| {
-                        ui.label("Audio only — no video track");
+                        ui.label(
+                            egui::RichText::new("Audio only — no video track")
+                                .color(egui::Color32::WHITE),
+                        );
                     });
                 }
             });
@@ -827,13 +1076,5 @@ impl eframe::App for WatchApp {
     fn on_exit(&mut self) {
         tracing::info!("Exiting viewer");
         self.sub.session().close(0, b"bye");
-        // Can't block_on shutdown here cleanly, but dropping will clean up
     }
-}
-
-/// Strips the `meshcast://watch/` prefix if present.
-fn parse_ticket_uri(raw: &str) -> &str {
-    raw.strip_prefix("meshcast://watch/")
-        .or_else(|| raw.strip_prefix("meshcast:///watch/"))
-        .unwrap_or(raw)
 }
