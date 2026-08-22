@@ -21,14 +21,21 @@ use crate::{write_private_file, AppConfig, DaemonState};
 pub enum Command {
     /// Stop the active stream.
     Stop,
-    /// Approve the pending stream request and start capture.
-    Approve,
+    /// Approve the pending stream request and start capture; `control` enables
+    /// remote-control requests for this stream.
+    Approve { control: bool },
     /// Decline the pending stream request.
     Reject,
     /// Re-read config and reconnect (after links changed).
     Reload,
     /// Pair with a bot using a pairing code.
     Link(String),
+    /// Allow the pending remote-control request.
+    Grant,
+    /// Deny the pending remote-control request.
+    Deny,
+    /// End the current remote-control session.
+    Revoke,
     /// Unknown / malformed command.
     Unknown(String),
 }
@@ -38,9 +45,13 @@ impl Command {
         let s = s.trim();
         match s {
             "stop" => Command::Stop,
-            "approve" => Command::Approve,
+            "approve" => Command::Approve { control: false },
+            "approve:control" => Command::Approve { control: true },
             "reject" => Command::Reject,
             "reload" => Command::Reload,
+            "grant" => Command::Grant,
+            "deny" => Command::Deny,
+            "revoke" => Command::Revoke,
             _ => match s.strip_prefix("link:") {
                 Some(code) => Command::Link(code.trim().to_string()),
                 None => Command::Unknown(s.to_string()),
@@ -51,10 +62,14 @@ impl Command {
     pub fn to_wire(&self) -> String {
         match self {
             Command::Stop => "stop".into(),
-            Command::Approve => "approve".into(),
+            Command::Approve { control: false } => "approve".into(),
+            Command::Approve { control: true } => "approve:control".into(),
             Command::Reject => "reject".into(),
             Command::Reload => "reload".into(),
             Command::Link(code) => format!("link:{code}"),
+            Command::Grant => "grant".into(),
+            Command::Deny => "deny".into(),
+            Command::Revoke => "revoke".into(),
             Command::Unknown(s) => s.clone(),
         }
     }
@@ -112,10 +127,14 @@ mod tests {
     fn command_parse_roundtrip() {
         for c in [
             Command::Stop,
-            Command::Approve,
+            Command::Approve { control: false },
+            Command::Approve { control: true },
             Command::Reject,
             Command::Reload,
             Command::Link("ABCD-1234".into()),
+            Command::Grant,
+            Command::Deny,
+            Command::Revoke,
         ] {
             assert_eq!(Command::parse(&c.to_wire()), c);
         }
@@ -131,7 +150,10 @@ mod tests {
         let path = dir.join(".tray-cmd");
         assert!(take_command_from(&path).is_none());
         std::fs::write(&path, "approve").unwrap();
-        assert_eq!(take_command_from(&path), Some(Command::Approve));
+        assert_eq!(
+            take_command_from(&path),
+            Some(Command::Approve { control: false })
+        );
         assert!(!path.exists());
         std::fs::write(&path, "   ").unwrap();
         assert!(take_command_from(&path).is_none());

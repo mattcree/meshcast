@@ -12,12 +12,13 @@ Meshcast: a Discord bot + desktop app that lets friends screen-share peer-to-pee
 crates/meshcast-signal/   shared contract: Signal/PairSignal, PairCode, AppConfig, BotLinkStore,
                           ipc.rs (state/cmd files), process.rs (pids, detached spawn), SignalNode. Unit-tested.
 crates/meshcast-bot/      poise/serenity bot: /link /unlink /stream, Watch/Stop handlers (on_*)
-crates/meshcast-cli/      `meshcast`: daemon (Session state machine), watch (viewer), stream/link/unlink/status
+crates/meshcast-cli/      `meshcast`: daemon (Session state machine), watch (viewer), stream/link/unlink/status,
+                          control.rs (control server/client), inject_portal.rs (Linux), inject_enigo.rs (mac/win)
 crates/meshcast-app/      `meshcast-app`: egui window; tray module for macOS/Windows only
 scripts/                  install.sh / install.ps1 / uninstall.sh (desktop), deploy-bot.sh (server), meshcast-tray.py
 packaging/                linux/*.desktop templates, bot/{Dockerfile,docker-compose.yml}
 .github/workflows/        ci.yml (fmt/clippy/test + mac/win check), release.yml (archives, bot, image, checksums)
-docs/                     DESIGN.md, DISCORD-SETUP.md
+docs/                     DESIGN.md, DISCORD-SETUP.md, REMOTE-CONTROL.md
 ```
 
 ## Commands
@@ -43,7 +44,8 @@ CI runs the same. Releases: bump `[workspace.package].version`, changelog, `git 
 - **Secrets**: Discord token only via `DISCORD_TOKEN`; link topics/keys in `config.toml`/`state.json` (0600). Never commit, never log.
 - **Small steps**: one change → build → test → commit. Especially UI/tray.
 - **Docs are part of the change**: protocol/config/install changes → `docs/DESIGN.md` + `CHANGELOG.md`; new work → `BACKLOG.md`.
-- Pinned git deps (iroh, iroh-gossip, iroh-live) live in `[workspace.dependencies]` + `[patch.crates-io]`; bump together.
+- Pinned git deps (iroh, iroh-gossip, iroh-live) live in `[workspace.dependencies]` + `[patch.crates-io]`; bump together. iroh-live comes from the `mattcree/iroh-live` fork (branch `meshcast-0.5`, one patch) — see CONTRIBUTING.
+- Remote control: `ControlMsg`/`NamedKey` are append-only too; injection only through the `InjectCmd` channel; never arm the control server without a fresh token; every disconnect must `ReleaseAll`.
 
 ## Style
 

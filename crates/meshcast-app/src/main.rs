@@ -310,6 +310,18 @@ impl eframe::App for MeshcastApp {
                             );
                         }
                         ui.label(format!("\"{}\" — {} {}fps", req.title, req.quality, req.fps));
+                        ui.add_space(6.0);
+                        if ui
+                            .checkbox(
+                                &mut self.config.control.allow_requests,
+                                "Allow viewers to request remote control (you approve each one)",
+                            )
+                            .changed()
+                        {
+                            if let Err(e) = self.config.save_sync() {
+                                self.set_status(format!("Couldn't save config: {e}"));
+                            }
+                        }
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             let approve = ui
@@ -330,7 +342,9 @@ impl eframe::App for MeshcastApp {
                                 )
                                 .clicked();
                             if approve {
-                                self.send(Command::Approve);
+                                self.send(Command::Approve {
+                                    control: self.config.control.allow_requests,
+                                });
                                 self.set_status("Starting capture…");
                             }
                             if reject {
@@ -343,6 +357,52 @@ impl eframe::App for MeshcastApp {
                 }
 
                 if daemon.streaming {
+                    // Remote-control request / status
+                    if let Some(req) = &daemon.pending_control {
+                        ui.group(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "🎮 {} wants to control your screen",
+                                    req.viewer
+                                ))
+                                .color(YELLOW)
+                                .strong(),
+                            );
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("Allow").color(egui::Color32::WHITE),
+                                        )
+                                        .fill(BLURPLE),
+                                    )
+                                    .clicked()
+                                {
+                                    self.send(Command::Grant);
+                                }
+                                if ui.button("Deny").clicked() {
+                                    self.send(Command::Deny);
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                    } else if let Some(who) = &daemon.controller {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                YELLOW,
+                                egui::RichText::new(format!("🎮 {who} has control")).strong(),
+                            );
+                            if ui.small_button("Revoke").clicked() {
+                                self.send(Command::Revoke);
+                            }
+                        });
+                        ui.add_space(6.0);
+                    } else if daemon.control_allowed {
+                        ui.label(
+                            egui::RichText::new("🎮 Remote control requests allowed").color(MUTED),
+                        );
+                        ui.add_space(4.0);
+                    }
                     ui.label(
                         egui::RichText::new(format!(
                             "{} {}fps \u{2014} {} viewer{}",

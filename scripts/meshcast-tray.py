@@ -211,9 +211,12 @@ status_item.set_sensitive(False)
 stop_item = Gtk.MenuItem(label="Stop Stream")
 stop_item.connect("activate", stop_stream)
 stop_item.set_sensitive(False)
+revoke_item = Gtk.MenuItem(label="Revoke remote control")
+revoke_item.connect("activate", lambda _=None: send_cmd("revoke"))
+revoke_item.set_sensitive(False)
 quit_item = Gtk.MenuItem(label="Quit Meshcast")
 quit_item.connect("activate", quit_all)
-for item in (show_item, status_item, Gtk.SeparatorMenuItem(), stop_item,
+for item in (show_item, status_item, Gtk.SeparatorMenuItem(), stop_item, revoke_item,
              Gtk.SeparatorMenuItem(), quit_item):
     menu.append(item)
 menu.show_all()
@@ -250,14 +253,18 @@ def update_state():
     fps = state.get("fps", 30)
     viewers = state.get("viewers", 0)
     linked = bool(state.get("linked_servers"))
+    controller = state.get("controller")
 
     stop_item.set_sensitive(streaming)
+    revoke_item.set_sensitive(bool(controller))
 
     if not daemon_alive:
         icon, tip = "network-offline", "Meshcast — daemon not running"
     elif streaming:
         icon = "media-record"
         tip = f"LIVE: {quality} {fps}fps — {viewers} viewer{'s' if viewers != 1 else ''}"
+        if controller:
+            tip += f" — 🎮 {controller} has control"
     elif connected:
         icon, tip = "network-transmit-receive", "Meshcast — connected to Discord bot"
     elif linked:

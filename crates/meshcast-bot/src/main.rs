@@ -66,6 +66,77 @@ struct ActiveStream {
     ticket: String,
     title: String,
     viewers: HashSet<UserId>,
+    streamer: UserId,
+    streamer_name: String,
+    avatar_url: String,
+    quality: String,
+    fps: u32,
+    /// The streamer's app accepts remote-control requests for this stream.
+    control_available: bool,
+    /// Who currently has control (user id, display name).
+    controller: Option<(UserId, String)>,
+}
+
+impl ActiveStream {
+    fn embed(&self) -> CreateEmbed {
+        let mut desc = format!(
+            "🔴 Live at **{} {}fps**\nClick **Watch** to open it in Meshcast.",
+            self.quality, self.fps
+        );
+        if let Some((_, name)) = &self.controller {
+            desc.push_str(&format!("\n🎮 **{name}** has control."));
+        } else if self.control_available {
+            desc.push_str("\n🎮 Remote control available — click **Request control**.");
+        }
+        CreateEmbed::new()
+            .title(&self.title)
+            .description(desc)
+            .color(BLURPLE)
+            .author(CreateEmbedAuthor::new(&self.streamer_name).icon_url(&self.avatar_url))
+            .footer(CreateEmbedFooter::new("Started streaming"))
+            .timestamp(Timestamp::now())
+    }
+
+    fn components(&self) -> Vec<CreateActionRow> {
+        let id = self.streamer;
+        let mut buttons = vec![
+            CreateButton::new(format!("watch:{id}"))
+                .label("Watch")
+                .style(ButtonStyle::Primary),
+            CreateButton::new(format!("stop:{id}"))
+                .label("Stop")
+                .style(ButtonStyle::Secondary),
+        ];
+        if self.controller.is_some() {
+            buttons.push(
+                CreateButton::new(format!("revoke:{id}"))
+                    .label("Revoke control")
+                    .style(ButtonStyle::Danger),
+            );
+        } else if self.control_available {
+            buttons.push(
+                CreateButton::new(format!("control:{id}"))
+                    .label("Request control")
+                    .style(ButtonStyle::Secondary),
+            );
+        }
+        buttons.push(CreateButton::new_link(DOWNLOAD_URL).label("Get Meshcast"));
+        vec![CreateActionRow::Buttons(buttons)]
+    }
+}
+
+/// Re-render a stream's card after its state changed.
+async fn refresh_card(http: &serenity::Http, stream: &ActiveStream) {
+    let edit = EditMessage::new()
+        .embed(stream.embed())
+        .components(stream.components());
+    if let Err(e) = stream
+        .channel_id
+        .edit_message(http, stream.message_id, edit)
+        .await
+    {
+        tracing::warn!("Failed to refresh stream card: {e}");
+    }
 }
 
 struct Data {
@@ -441,6 +512,8 @@ async fn handle_event(
         "stream-start" => on_stream_start(ctx, component, data).await,
         _ if id.starts_with("watch:") => on_watch(ctx, component, data, &id[6..]).await,
         _ if id.starts_with("stop:") => on_stop(ctx, component, data, &id[5..]).await,
+        _ if id.starts_with("control:") => on_control_request(ctx, component, data, &id[8..]).await,
+        _ if id.starts_with("revoke:") => on_revoke(ctx, component, data, &id[7..]).await,
         _ => Ok(()),
     }
 }
@@ -592,9 +665,13 @@ async fn on_stream_start(
         Timeout,
     }
 
+    let mut control_available = false;
     let outcome = tokio::time::timeout(START_TIMEOUT, async {
         loop {
             match rx.recv().await {
+                Ok((uid, Signal::ControlAvailable { available })) if uid == user_id => {
+                    control_available = available;
+                }
                 Ok((uid, Signal::StreamReady { ticket })) if uid == user_id => {
                     return Outcome::Ready(ticket);
                 }
@@ -613,41 +690,31 @@ async fn on_stream_start(
     match outcome {
         Outcome::Ready(ticket) => {
             let display_name = c.user.global_name.as_deref().unwrap_or(&c.user.name);
-            let embed = CreateEmbed::new()
-                .title(&title)
-                .description(format!(
-                    "🔴 Live at **{quality} {fps}fps**\nClick **Watch** to open it in Meshcast."
-                ))
-                .color(BLURPLE)
-                .author(CreateEmbedAuthor::new(display_name).icon_url(c.user.face()))
-                .footer(CreateEmbedFooter::new("Started streaming"))
-                .timestamp(Timestamp::now());
-
-            let row = CreateActionRow::Buttons(vec![
-                CreateButton::new(format!("watch:{user_id}"))
-                    .label("Watch")
-                    .style(ButtonStyle::Primary),
-                CreateButton::new(format!("stop:{user_id}"))
-                    .label("Stop")
-                    .style(ButtonStyle::Secondary),
-                CreateButton::new_link(DOWNLOAD_URL).label("Get Meshcast"),
-            ]);
-
             let channel_id = c.channel_id;
+            let mut stream = ActiveStream {
+                channel_id,
+                message_id: MessageId::new(1),
+                ticket,
+                title: title.clone(),
+                viewers: HashSet::new(),
+                streamer: user_id,
+                streamer_name: display_name.to_string(),
+                avatar_url: c.user.face(),
+                quality: quality.clone(),
+                fps,
+                control_available,
+                controller: None,
+            };
             let msg = channel_id
-                .send_message(ctx, CreateMessage::new().embed(embed).components(vec![row]))
+                .send_message(
+                    ctx,
+                    CreateMessage::new()
+                        .embed(stream.embed())
+                        .components(stream.components()),
+                )
                 .await?;
-
-            lock(&data.streams).insert(
-                user_id,
-                ActiveStream {
-                    channel_id,
-                    message_id: msg.id,
-                    ticket,
-                    title: title.clone(),
-                    viewers: HashSet::new(),
-                },
-            );
+            stream.message_id = msg.id;
+            lock(&data.streams).insert(user_id, stream);
             tracing::info!(user = %user_id, "Stream live: {title}");
 
             c.edit_response(
@@ -678,6 +745,251 @@ async fn on_stream_start(
         }
     }
     Ok(())
+}
+
+/// A viewer asks the streamer for control.
+async fn on_control_request(
+    ctx: &serenity::Context,
+    c: &ComponentInteraction,
+    data: &Data,
+    streamer: &str,
+) -> Result<(), Error> {
+    let Ok(streamer_id) = streamer.parse::<u64>().map(UserId::new) else {
+        return ephemeral(ctx, c, "This stream post is no longer valid.").await;
+    };
+    let viewer_id = c.user.id;
+    let viewer_name = c
+        .user
+        .global_name
+        .clone()
+        .unwrap_or_else(|| c.user.name.clone());
+
+    let stream = lock(&data.streams).get(&streamer_id).cloned();
+    let Some(stream) = stream else {
+        return ephemeral(ctx, c, "This stream has ended.").await;
+    };
+    if viewer_id == streamer_id {
+        return ephemeral(ctx, c, "You can't request control of your own stream.").await;
+    }
+    if !stream.control_available {
+        return ephemeral(
+            ctx,
+            c,
+            "The streamer hasn't enabled remote control for this stream.",
+        )
+        .await;
+    }
+    if let Some((_, name)) = &stream.controller {
+        return ephemeral(ctx, c, format!("{name} already has control.")).await;
+    }
+    let viewer_sender = lock(&data.links).get(&viewer_id).cloned();
+    let Some(viewer_sender) = viewer_sender else {
+        return ephemeral(
+            ctx,
+            c,
+            format!("Link your Meshcast app first (`/link`) — control is delivered to your viewer window. [Install]({DOWNLOAD_URL})"),
+        )
+        .await;
+    };
+    let streamer_sender = lock(&data.links).get(&streamer_id).cloned();
+    let Some(streamer_sender) = streamer_sender else {
+        return ephemeral(ctx, c, "The streamer's app isn't linked any more.").await;
+    };
+
+    ephemeral(
+        ctx,
+        c,
+        format!(
+            "Asked **{}** for control — waiting for them to approve in Meshcast…",
+            stream.streamer_name
+        ),
+    )
+    .await?;
+
+    let request_id: u64 = rand::random();
+    let mut rx = data.signal_tx.subscribe();
+    if let Err(e) = streamer_sender
+        .broadcast_neighbors(
+            Signal::ControlRequest {
+                request_id,
+                viewer: viewer_name.clone(),
+            }
+            .encode()?,
+        )
+        .await
+    {
+        tracing::warn!("Failed to send ControlRequest: {e}");
+        c.edit_response(
+            ctx,
+            EditInteractionResponse::new().content("Couldn't reach the streamer's app."),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    enum Outcome {
+        Granted {
+            token: String,
+            addr: iroh::EndpointAddr,
+        },
+        Denied(String),
+        Timeout,
+    }
+    let outcome = tokio::time::timeout(START_TIMEOUT, async {
+        loop {
+            match rx.recv().await {
+                Ok((
+                    uid,
+                    Signal::ControlGranted {
+                        request_id: rid,
+                        token,
+                        addr,
+                    },
+                )) if uid == streamer_id && rid == request_id => {
+                    return Outcome::Granted { token, addr };
+                }
+                Ok((
+                    uid,
+                    Signal::ControlDenied {
+                        request_id: rid,
+                        reason,
+                    },
+                )) if uid == streamer_id && (rid == request_id || rid == 0) => {
+                    return Outcome::Denied(reason);
+                }
+                Ok((uid, Signal::StreamStopped)) if uid == streamer_id => {
+                    return Outcome::Denied("the stream ended".into());
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return Outcome::Timeout,
+            }
+        }
+    })
+    .await
+    .unwrap_or(Outcome::Timeout);
+
+    match outcome {
+        Outcome::Granted { token, addr } => {
+            let token_msg = Signal::ControlToken {
+                ticket: stream.ticket.clone(),
+                token,
+                addr,
+                streamer: stream.streamer_name.clone(),
+            }
+            .encode()?;
+            if let Err(e) = viewer_sender.broadcast_neighbors(token_msg).await {
+                tracing::warn!("Failed to deliver ControlToken: {e}");
+                c.edit_response(
+                    ctx,
+                    EditInteractionResponse::new().content(
+                        "Granted, but your Meshcast app couldn't be reached. Is it running?",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            let updated = {
+                let mut streams = lock(&data.streams);
+                match streams.get_mut(&streamer_id) {
+                    Some(s) => {
+                        s.controller = Some((viewer_id, viewer_name.clone()));
+                        Some(s.clone())
+                    }
+                    None => None,
+                }
+            };
+            if let Some(s) = updated {
+                refresh_card(&ctx.http, &s).await;
+            }
+            tracing::info!(viewer = %viewer_id, streamer = %streamer_id, "Control granted");
+            c.edit_response(
+                ctx,
+                EditInteractionResponse::new().content(
+                    "**You have control.** It activates in your Meshcast viewer window for this stream \
+                     (open it with **Watch** if you haven't). F8 pauses, Esc Esc releases.",
+                ),
+            )
+            .await?;
+        }
+        Outcome::Denied(reason) => {
+            c.edit_response(
+                ctx,
+                EditInteractionResponse::new().content(format!("Control not granted: {reason}")),
+            )
+            .await?;
+        }
+        Outcome::Timeout => {
+            c.edit_response(
+                ctx,
+                EditInteractionResponse::new()
+                    .content("The streamer didn't respond. You can ask again later."),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// The streamer takes control back from the card.
+async fn on_revoke(
+    ctx: &serenity::Context,
+    c: &ComponentInteraction,
+    data: &Data,
+    streamer: &str,
+) -> Result<(), Error> {
+    let Ok(streamer_id) = streamer.parse::<u64>().map(UserId::new) else {
+        return ephemeral(ctx, c, "This stream post is no longer valid.").await;
+    };
+    if c.user.id != streamer_id {
+        return ephemeral(ctx, c, "Only the streamer can revoke control.").await;
+    }
+    let has_controller = lock(&data.streams)
+        .get(&streamer_id)
+        .is_some_and(|s| s.controller.is_some());
+    if !has_controller {
+        return ephemeral(ctx, c, "Nobody has control right now.").await;
+    }
+    let sender = lock(&data.links).get(&streamer_id).cloned();
+    ephemeral(ctx, c, "Revoking control…").await?;
+    if let Some(s) = sender {
+        let _ = s.broadcast_neighbors(Signal::RevokeControl.encode()?).await;
+    }
+    // The app confirms with ControlRevoked (handled in the background task); if it
+    // doesn't, tidy the card anyway.
+    tokio::time::sleep(STOP_TIMEOUT).await;
+    let still = lock(&data.streams)
+        .get(&streamer_id)
+        .is_some_and(|s| s.controller.is_some());
+    if still {
+        clear_controller(&ctx.http, &data.streams, streamer_id).await;
+    }
+    c.edit_response(
+        ctx,
+        EditInteractionResponse::new().content("Control revoked."),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Forget the controller of a stream and refresh its card.
+async fn clear_controller(
+    http: &serenity::Http,
+    streams: &Arc<Mutex<HashMap<UserId, ActiveStream>>>,
+    streamer_id: UserId,
+) {
+    let updated = {
+        let mut st = lock(streams);
+        match st.get_mut(&streamer_id) {
+            Some(s) if s.controller.is_some() => {
+                s.controller = None;
+                Some(s.clone())
+            }
+            _ => None,
+        }
+    };
+    if let Some(s) = updated {
+        refresh_card(http, &s).await;
+    }
 }
 
 async fn on_watch(
@@ -950,6 +1262,24 @@ async fn main() -> anyhow::Result<()> {
                 match rx.recv().await {
                     Ok((user_id, Signal::StreamStopped)) => {
                         mark_stream_ended(&http, &streams, user_id).await;
+                    }
+                    Ok((user_id, Signal::ControlRevoked)) => {
+                        clear_controller(&http, &streams, user_id).await;
+                    }
+                    Ok((user_id, Signal::ControlAvailable { available })) => {
+                        let updated = {
+                            let mut st = lock(&streams);
+                            match st.get_mut(&user_id) {
+                                Some(s) if s.control_available != available => {
+                                    s.control_available = available;
+                                    Some(s.clone())
+                                }
+                                _ => None,
+                            }
+                        };
+                        if let Some(s) = updated {
+                            refresh_card(&http, &s).await;
+                        }
                     }
                     Ok((user_id, Signal::StreamReady { .. })) => {
                         // A StreamReady that arrives after the /stream flow gave up

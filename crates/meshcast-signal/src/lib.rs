@@ -26,6 +26,7 @@ pub use iroh::EndpointId;
 pub use iroh_gossip::api::{Event, GossipSender};
 pub use iroh_gossip::proto::TopicId;
 
+pub mod control;
 pub mod ipc;
 pub mod process;
 
@@ -64,6 +65,39 @@ pub enum Signal {
     /// App → bot: capture could not be started (user declined or an error).
     StreamFailed {
         reason: String,
+    },
+    /// Bot → streamer app: a viewer asks to control the screen.
+    ControlRequest {
+        request_id: u64,
+        viewer: String,
+    },
+    /// Streamer app → bot: the streamer approved; `addr` is where the viewer
+    /// connects (the streamer daemon's signal endpoint).
+    ControlGranted {
+        request_id: u64,
+        token: String,
+        addr: EndpointAddr,
+    },
+    /// Streamer app → bot: declined / expired.
+    ControlDenied {
+        request_id: u64,
+        reason: String,
+    },
+    /// Bot → viewer app: here is your token for this stream.
+    ControlToken {
+        ticket: String,
+        token: String,
+        addr: EndpointAddr,
+        streamer: String,
+    },
+    /// Streamer app → bot: control ended (revoked, disconnected, stream stopped).
+    ControlRevoked,
+    /// Bot → streamer app: the streamer pressed Revoke on the card.
+    RevokeControl,
+    /// Streamer app → bot (sent just before `StreamReady`): whether this stream
+    /// accepts remote-control requests.
+    ControlAvailable {
+        available: bool,
     },
 }
 
@@ -171,6 +205,22 @@ pub struct DaemonState {
     pub pending_request: Option<StreamRequest>,
     #[serde(default)]
     pub error: Option<String>,
+    /// This stream accepts remote-control requests.
+    #[serde(default)]
+    pub control_allowed: bool,
+    /// A viewer is asking for control (awaiting Allow/Deny).
+    #[serde(default)]
+    pub pending_control: Option<ControlRequestState>,
+    /// Display name of the viewer currently controlling, if any.
+    #[serde(default)]
+    pub controller: Option<String>,
+}
+
+/// A remote-control request awaiting the streamer's decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlRequestState {
+    pub request_id: u64,
+    pub viewer: String,
 }
 
 /// A pending stream request from the Discord bot, awaiting user consent.
@@ -343,6 +393,8 @@ pub struct AppConfig {
     pub video: VideoConfig,
     #[serde(default)]
     pub audio: AudioConfig,
+    #[serde(default)]
+    pub control: ControlConfig,
     /// Legacy single link (pre-0.4). Migrated into `links` on load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<LinkConfig>,
@@ -404,6 +456,14 @@ impl Default for AudioConfig {
     fn default() -> Self {
         Self { enabled: true }
     }
+}
+
+/// Remote-control settings.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ControlConfig {
+    /// Let viewers ask to control the screen (the streamer still approves each one).
+    #[serde(default)]
+    pub allow_requests: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -655,6 +715,15 @@ impl SignalNode {
     /// Create a new signal node. If `secret_key` is provided, uses it for
     /// stable identity across restarts.
     pub async fn new(secret_key: Option<SecretKey>) -> Result<Self> {
+        Self::with_protocols(secret_key, |r| r).await
+    }
+
+    /// Like [`Self::new`], but lets the caller register additional protocols
+    /// on the router (e.g. the remote-control ALPN) before it is spawned.
+    pub async fn with_protocols(
+        secret_key: Option<SecretKey>,
+        register: impl FnOnce(iroh::protocol::RouterBuilder) -> iroh::protocol::RouterBuilder,
+    ) -> Result<Self> {
         let mut builder = Endpoint::builder(presets::N0);
         if let Some(key) = secret_key {
             builder = builder.secret_key(key);
@@ -663,9 +732,8 @@ impl SignalNode {
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
-        let router = Router::builder(endpoint.clone())
-            .accept(GOSSIP_ALPN, gossip.clone())
-            .spawn();
+        let router =
+            register(Router::builder(endpoint.clone()).accept(GOSSIP_ALPN, gossip.clone())).spawn();
 
         // Wait for relay connection so our address includes the relay URL
         endpoint.online().await;
@@ -744,6 +812,15 @@ mod tests {
                 .unwrap()
                 .as_ref(),
             &[8, 0]
+        );
+        assert_eq!(Signal::ControlRevoked.encode().unwrap().as_ref(), &[13]);
+        assert_eq!(Signal::RevokeControl.encode().unwrap().as_ref(), &[14]);
+        assert_eq!(
+            Signal::ControlAvailable { available: true }
+                .encode()
+                .unwrap()
+                .as_ref(),
+            &[15, 1]
         );
         // PairSignal indices.
         assert_eq!(

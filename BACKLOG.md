@@ -28,6 +28,14 @@ Legend: **P1** needed for a smooth v1 experience · **P2** valuable · **P3** ni
 - [ ] **P3 — `/stream` in voice channels posts to the channel's text chat**; auto-stop when the streamer leaves the voice channel (needs `GUILD_VOICE_STATES`, non-privileged).
 - [ ] **P3 — Localisation** of bot strings.
 
+## Remote control (shipped in Unreleased — follow-ups)
+
+- [ ] **P1 — Field-test control** on GNOME Wayland (portal dialog, absolute pointer mapping, keysyms incl. non-ASCII text), GNOME X11, KDE; macOS (Accessibility prompt, main-display mapping). Measure glass-to-glass latency.
+- [ ] **P2 — Linux X11 without a RemoteDesktop portal** (KDE X11): XTest via `x11rb`.
+- [ ] **P2 — Multi-monitor mapping on macOS** (enigo maps to the main display only); window-capture → control should be limited to that window's bounds.
+- [ ] **P2 — Clipboard sync, file drop, gamepad; "laser pointer only" mode; control for streams started from the CLI.**
+- [ ] **P3 — Upstream the `from_portal_stream` constructor** to n0-computer/iroh-live and drop the fork.
+
 ## Streaming quality & features
 
 - [ ] **P1 — Desktop/system audio** (PipeWire monitor source on Linux, loopback on macOS) instead of/in addition to microphone; per-source toggles in the app and `/stream`.

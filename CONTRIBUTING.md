@@ -82,7 +82,7 @@ Compatibility rule: a new bot must keep working with the previous app release an
 
 ## Updating iroh / iroh-live
 
-These are git dependencies pinned by revision because the iroh ecosystem moves fast and crates.io releases lag. To bump:
+These are git dependencies pinned by revision because the iroh ecosystem moves fast and crates.io releases lag. `iroh-live` (and `moq-media`, `moq-media-egui`) currently point at **our fork** `github.com/mattcree/iroh-live`, branch `meshcast-0.5` = upstream `edd9bcc` + one commit adding `PipeWireScreenCapturer::from_portal_stream` (needed for remote control, see `docs/REMOTE-CONTROL.md`). When bumping, rebase that branch onto the new upstream rev (or drop it once the constructor is upstream). To bump:
 
 1. Pick a revision of iroh-live; read its `Cargo.toml` for the iroh / iroh-gossip revs it expects.
 2. Set all three in `[workspace.dependencies]` **and** the matching entries in `[patch.crates-io]` (plus `iroh-base`, `iroh-relay`, `noq*`, `web-transport-*` as needed).

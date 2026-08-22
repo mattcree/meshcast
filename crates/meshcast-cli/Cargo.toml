@@ -23,3 +23,12 @@ moq-media-egui = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Remote control: input injection backends.
+[target.'cfg(target_os = "linux")'.dependencies]
+# xdg-desktop-portal RemoteDesktop (+ ScreenCast in the same session). Same
+# features as rusty-capture so only one ashpd is built.
+ashpd = { version = "0.11", default-features = false, features = ["tokio"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+enigo = "0.6"

@@ -6,6 +6,12 @@
 //! * `meshcast watch <ticket>` is the viewer window.
 //! * `meshcast stream` / `link` / `unlink` / `status` are manual equivalents.
 
+mod control;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod inject_enigo;
+#[cfg(target_os = "linux")]
+mod inject_portal;
+
 use std::path::PathBuf;
 use std::process::Child;
 use std::time::{Duration, Instant};
@@ -13,8 +19,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures_lite::StreamExt;
+use iroh::EndpointAddr;
 use iroh_live::ticket::LiveTicket;
 use iroh_live::Live;
+use meshcast_signal::control::{self as ctrl, ControlGrant};
 use meshcast_signal::ipc::{self, Command as IpcCommand};
 use meshcast_signal::process;
 use meshcast_signal::{
@@ -33,6 +41,8 @@ use moq_media::traits::VideoEncoderFactory;
 use moq_media::AudioBackend;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::control::{ControlServer, InjectorHandle, ServerEvent};
+
 /// How long the user has to approve a stream request in the app.
 const CONSENT_TIMEOUT: Duration = Duration::from_secs(90);
 /// How long pairing waits for the bot to answer.
@@ -43,6 +53,8 @@ const MAX_VIEWER_WINDOWS: usize = 5;
 const TICK: Duration = Duration::from_millis(250);
 /// Maximum time to wait for a stream to connect in `watch`.
 const WATCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the streamer has to answer a remote-control request.
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Parser)]
 #[command(
@@ -140,6 +152,10 @@ struct ActiveStream {
     live: Live,
     _broadcast: LocalBroadcast,
     ticket: String,
+    /// Present when this stream accepts remote control.
+    injector: Option<InjectorHandle>,
+    /// Keeps the platform capture/injection session alive (portal session).
+    _control_guard: Option<Box<dyn std::any::Any + Send>>,
 }
 
 impl ActiveStream {
@@ -148,8 +164,57 @@ impl ActiveStream {
     }
 }
 
+/// Pick the screen source, optionally through a session that also allows
+/// input injection (remote control).
+async fn open_screen(
+    fps: u32,
+    control: bool,
+) -> Result<(
+    Box<dyn moq_media::capture::VideoSource>,
+    Option<InjectorHandle>,
+    Option<Box<dyn std::any::Any + Send>>,
+)> {
+    if control {
+        #[cfg(target_os = "linux")]
+        {
+            match inject_portal::start(fps).await {
+                Ok(pc) => {
+                    return Ok((
+                        Box::new(pc.capturer),
+                        Some(pc.injector),
+                        Some(Box::new(pc.guard) as Box<dyn std::any::Any + Send>),
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!("Remote control unavailable, streaming without it: {e:#}");
+                }
+            }
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let screen = ScreenCapturer::new().context("Failed to start screen capture")?;
+            return match inject_enigo::start() {
+                Ok(h) => Ok((Box::new(screen), Some(h), None)),
+                Err(e) => {
+                    tracing::warn!("Remote control unavailable, streaming without it: {e:#}");
+                    Ok((Box::new(screen), None, None))
+                }
+            };
+        }
+    }
+    let _ = fps;
+    let screen = ScreenCapturer::new().context("Failed to start screen capture")?;
+    Ok((Box::new(screen), None, None))
+}
+
 /// Start screen capture + publish. Returns the live handle and ticket.
-async fn start_stream(name: &str, quality: &str, fps: u32, audio: bool) -> Result<ActiveStream> {
+async fn start_stream(
+    name: &str,
+    quality: &str,
+    fps: u32,
+    audio: bool,
+    control: bool,
+) -> Result<ActiveStream> {
     let quality = normalize_quality(quality);
     let fps = normalize_fps(fps);
 
@@ -161,7 +226,7 @@ async fn start_stream(name: &str, quality: &str, fps: u32, audio: bool) -> Resul
 
     let broadcast = LocalBroadcast::new();
 
-    let screen = ScreenCapturer::new().context("Failed to start screen capture")?;
+    let (screen, injector, control_guard) = open_screen(fps, control).await?;
     let preset = match quality {
         "360p" => VideoPreset::P360,
         "1080p" => VideoPreset::P1080,
@@ -213,6 +278,8 @@ async fn start_stream(name: &str, quality: &str, fps: u32, audio: bool) -> Resul
         live,
         _broadcast: broadcast,
         ticket,
+        injector,
+        _control_guard: control_guard,
     })
 }
 
@@ -233,7 +300,7 @@ async fn cmd_stream(name: String, no_audio: bool, quality: String, fps: u32) -> 
     } else {
         name
     };
-    let stream = start_stream(&name, &quality, fps, !no_audio).await?;
+    let stream = start_stream(&name, &quality, fps, !no_audio, false).await?;
 
     println!("\nStreaming! Share this ticket to let others watch:\n");
     println!("  {}\n", stream.ticket);
@@ -531,10 +598,23 @@ struct Session {
     active: Option<(usize, ActiveStream)>,
     pending: Option<(usize, StreamRequest, Instant)>,
     viewers: Vec<Child>,
+    /// Remote-control server (armed per grant).
+    control: ControlServer,
+    /// Our address, sent to the bot with a grant so the viewer can dial us.
+    addr: EndpointAddr,
+    /// A viewer's control request awaiting Allow/Deny: (link, request_id, viewer, since).
+    pending_control: Option<(usize, u64, String, Instant)>,
+    /// Link through which the current grant was made (to report revocation).
+    control_link: Option<usize>,
 }
 
 impl Session {
     fn publish_state(&mut self) {
+        self.state.control_allowed = self
+            .active
+            .as_ref()
+            .is_some_and(|(_, s)| s.injector.is_some());
+        self.state.controller = self.control.controller();
         self.state.connected = self.links.iter().any(|l| l.is_active() && l.connected);
         self.state.linked_servers = self
             .links
@@ -606,6 +686,18 @@ impl Session {
     }
 
     async fn stop_stream(&mut self, reason: &str) {
+        self.revoke_control("stream stopped").await;
+        if let Some((idx, _, _, _)) = self.pending_control.take() {
+            self.send_to(
+                idx,
+                Signal::ControlDenied {
+                    request_id: 0,
+                    reason: "stream stopped".into(),
+                },
+            )
+            .await;
+            self.state.pending_control = None;
+        }
         if let Some((idx, stream)) = self.active.take() {
             stream.stop().await;
             self.send_to(idx, Signal::StreamStopped).await;
@@ -617,7 +709,7 @@ impl Session {
         }
     }
 
-    async fn approve_pending(&mut self) {
+    async fn approve_pending(&mut self, control: bool) {
         let Some((idx, req, _)) = self.pending.take() else {
             return;
         };
@@ -628,9 +720,16 @@ impl Session {
             self.stop_stream("replaced").await;
         }
         let audio = self.config.audio.enabled;
-        match start_stream("meshcast", &req.quality, req.fps, audio).await {
+        match start_stream("meshcast", &req.quality, req.fps, audio, control).await {
             Ok(stream) => {
                 tracing::info!("Streaming: {}", stream.ticket);
+                self.send_to(
+                    idx,
+                    Signal::ControlAvailable {
+                        available: stream.injector.is_some(),
+                    },
+                )
+                .await;
                 self.send_to(
                     idx,
                     Signal::StreamReady {
@@ -638,6 +737,10 @@ impl Session {
                     },
                 )
                 .await;
+                if control && stream.injector.is_none() {
+                    self.state.error =
+                        Some("Remote control unavailable on this desktop (see logs)".into());
+                }
                 self.state.streaming = true;
                 self.state.stream_ticket = Some(stream.ticket.clone());
                 self.state.quality = normalize_quality(&req.quality).to_string();
@@ -776,11 +879,171 @@ impl Session {
                 self.publish_state();
             }
             Signal::Ping => self.send_to(idx, Signal::Pong).await,
+            Signal::ControlRequest { request_id, viewer } => {
+                self.on_control_request(idx, request_id, viewer).await;
+            }
+            Signal::RevokeControl => self.revoke_control("revoked from Discord").await,
+            Signal::ControlToken {
+                ticket,
+                token,
+                addr,
+                streamer,
+            } => {
+                // We are the viewer: hand the token to the viewer window for this stream.
+                let grant = ControlGrant {
+                    ticket,
+                    token,
+                    addr,
+                    streamer: streamer.clone(),
+                };
+                match ctrl::write_grant(&grant) {
+                    Ok(()) => {
+                        tracing::info!("Control granted by {streamer}; handed to viewer window")
+                    }
+                    Err(e) => tracing::error!("Failed to store control grant: {e:#}"),
+                }
+            }
             Signal::Pong
             | Signal::StreamReady { .. }
             | Signal::StreamStopped
-            | Signal::StreamFailed { .. } => {
+            | Signal::StreamFailed { .. }
+            | Signal::ControlGranted { .. }
+            | Signal::ControlDenied { .. }
+            | Signal::ControlRevoked
+            | Signal::ControlAvailable { .. } => {
                 // App-originated signals echoed back over gossip; ignore.
+            }
+        }
+    }
+
+    async fn on_control_request(&mut self, idx: usize, request_id: u64, viewer: String) {
+        let viewer = sanitize_title(&viewer);
+        let viewer = if viewer.is_empty() {
+            "A viewer".to_string()
+        } else {
+            viewer
+        };
+        let available = self
+            .active
+            .as_ref()
+            .is_some_and(|(_, s)| s.injector.is_some());
+        if !available {
+            self.send_to(
+                idx,
+                Signal::ControlDenied {
+                    request_id,
+                    reason: "remote control isn't enabled for this stream".into(),
+                },
+            )
+            .await;
+            return;
+        }
+        if let Some(current) = self.control.controller() {
+            self.send_to(
+                idx,
+                Signal::ControlDenied {
+                    request_id,
+                    reason: format!("{current} already has control"),
+                },
+            )
+            .await;
+            return;
+        }
+        if let Some((old_idx, old_id, _, _)) = self.pending_control.take() {
+            self.send_to(
+                old_idx,
+                Signal::ControlDenied {
+                    request_id: old_id,
+                    reason: "superseded by a newer request".into(),
+                },
+            )
+            .await;
+        }
+        tracing::info!("Control requested by {viewer}");
+        self.pending_control = Some((idx, request_id, viewer.clone(), Instant::now()));
+        self.state.pending_control = Some(meshcast_signal::ControlRequestState {
+            request_id,
+            viewer: viewer.clone(),
+        });
+        self.publish_state();
+        notify(
+            &format!("{viewer} wants to control your screen"),
+            "Open Meshcast to allow or deny",
+        );
+    }
+
+    async fn grant_control(&mut self) {
+        let Some((idx, request_id, viewer, _)) = self.pending_control.take() else {
+            return;
+        };
+        self.state.pending_control = None;
+        let injector = self.active.as_ref().and_then(|(_, s)| s.injector.clone());
+        let Some(injector) = injector else {
+            self.send_to(
+                idx,
+                Signal::ControlDenied {
+                    request_id,
+                    reason: "remote control is no longer available".into(),
+                },
+            )
+            .await;
+            self.publish_state();
+            return;
+        };
+        let token = ctrl::generate_token();
+        self.control.arm(token.clone(), viewer.clone(), injector);
+        self.control_link = Some(idx);
+        self.send_to(
+            idx,
+            Signal::ControlGranted {
+                request_id,
+                token,
+                addr: self.addr.clone(),
+            },
+        )
+        .await;
+        tracing::info!("Control granted to {viewer}");
+        self.publish_state();
+    }
+
+    async fn deny_control(&mut self, reason: &str) {
+        if let Some((idx, request_id, viewer, _)) = self.pending_control.take() {
+            self.state.pending_control = None;
+            self.send_to(
+                idx,
+                Signal::ControlDenied {
+                    request_id,
+                    reason: reason.to_string(),
+                },
+            )
+            .await;
+            tracing::info!("Control request from {viewer} denied ({reason})");
+            self.publish_state();
+        }
+    }
+
+    async fn revoke_control(&mut self, reason: &str) {
+        if let Some(who) = self.control.disarm(reason) {
+            if let Some(idx) = self.control_link.take() {
+                self.send_to(idx, Signal::ControlRevoked).await;
+            }
+            tracing::info!("Control of {who} ended ({reason})");
+            self.publish_state();
+        }
+    }
+
+    async fn on_server_event(&mut self, ev: ServerEvent) {
+        match ev {
+            ServerEvent::ControllerConnected { controller } => {
+                notify(
+                    "Meshcast",
+                    &format!("{controller} is now controlling your screen"),
+                );
+            }
+            ServerEvent::ControllerDisconnected { controller, reason } => {
+                tracing::info!("{controller} disconnected: {reason}");
+                self.revoke_control(&format!("viewer disconnected: {reason}"))
+                    .await;
             }
         }
     }
@@ -794,7 +1057,10 @@ impl Session {
     ) {
         match cmd {
             IpcCommand::Stop => self.stop_stream("requested locally").await,
-            IpcCommand::Approve => self.approve_pending().await,
+            IpcCommand::Approve { control } => self.approve_pending(control).await,
+            IpcCommand::Grant => self.grant_control().await,
+            IpcCommand::Deny => self.deny_control("declined by the streamer").await,
+            IpcCommand::Revoke => self.revoke_control("revoked in the app").await,
             IpcCommand::Reject => self.reject_pending("Declined in the Meshcast app").await,
             IpcCommand::Reload => match AppConfig::load().await {
                 Ok(cfg) => {
@@ -881,7 +1147,10 @@ fn notify(summary: &str, body: &str) {
 fn command_label(cmd: &IpcCommand) -> &'static str {
     match cmd {
         IpcCommand::Stop => "stop",
-        IpcCommand::Approve => "approve",
+        IpcCommand::Approve { .. } => "approve",
+        IpcCommand::Grant => "grant",
+        IpcCommand::Deny => "deny",
+        IpcCommand::Revoke => "revoke",
         IpcCommand::Reject => "reject",
         IpcCommand::Reload => "reload",
         IpcCommand::Link(_) => "link",
@@ -898,7 +1167,13 @@ async fn run_session() -> Result<()> {
     // The first link's key gives the daemon a stable identity; the bot does not
     // verify app identity, so one key works for every link.
     let secret_key = config.link_state().map(|l| l.secret_key());
-    let node = SignalNode::new(secret_key).await?;
+    let (control, mut control_rx) = ControlServer::new();
+    let control_for_router = control.clone();
+    let node = SignalNode::with_protocols(secret_key, move |r| {
+        r.accept(ctrl::CONTROL_ALPN, control_for_router)
+    })
+    .await?;
+    ctrl::clear_all_grants();
 
     let (tx, mut rx) = mpsc::channel::<LinkEvent>(256);
 
@@ -909,6 +1184,10 @@ async fn run_session() -> Result<()> {
         active: None,
         pending: None,
         viewers: Vec::new(),
+        addr: node.addr(),
+        control,
+        pending_control: None,
+        control_link: None,
     };
     session.apply_config(&node, &tx, config).await;
     if session.links.is_empty() {
@@ -928,6 +1207,10 @@ async fn run_session() -> Result<()> {
             _ = &mut shutdown => {
                 tracing::info!("Shutting down daemon...");
                 break;
+            }
+
+            Some(ev) = control_rx.recv() => {
+                session.on_server_event(ev).await;
             }
 
             Some((idx, event)) = rx.recv() => {
@@ -983,6 +1266,11 @@ async fn run_session() -> Result<()> {
                         session.reject_pending("No response in the Meshcast app").await;
                     }
                 }
+                if let Some((_, _, _, since)) = &session.pending_control {
+                    if since.elapsed() > CONTROL_REQUEST_TIMEOUT {
+                        session.deny_control("no response from the streamer").await;
+                    }
+                }
                 session.reap_viewers();
 
                 if let Some(cmd) = ipc::take_command() {
@@ -995,6 +1283,7 @@ async fn run_session() -> Result<()> {
 
     session.shutdown().await;
     node.shutdown().await;
+    ctrl::clear_all_grants();
     Ok(())
 }
 
@@ -1006,8 +1295,8 @@ async fn run_session() -> Result<()> {
 fn cmd_watch(raw: String, rt: &tokio::runtime::Runtime) -> Result<()> {
     use moq_media_egui::{create_egui_wgpu_config, VideoTrackView};
 
-    let ticket_str = meshcast_signal::parse_ticket_uri(&raw);
-    let ticket: LiveTicket = match meshcast_signal::validate_ticket(ticket_str)
+    let ticket_str = meshcast_signal::parse_ticket_uri(&raw).to_string();
+    let ticket: LiveTicket = match meshcast_signal::validate_ticket(&ticket_str)
         .and_then(|t| t.parse().context("Invalid ticket string"))
     {
         Ok(t) => t,
@@ -1068,6 +1357,8 @@ fn cmd_watch(raw: String, rt: &tokio::runtime::Runtime) -> Result<()> {
         ..Default::default()
     };
 
+    let endpoint = live.endpoint().clone();
+    let rt_handle = rt.handle().clone();
     eframe::run_native(
         "Meshcast",
         native_options,
@@ -1083,6 +1374,7 @@ fn cmd_watch(raw: String, rt: &tokio::runtime::Runtime) -> Result<()> {
                 sub,
                 _live: live,
                 stream_ended: false,
+                control: viewer::ControlUi::new(endpoint, ticket_str, rt_handle),
             }))
         }),
     )
@@ -1136,6 +1428,7 @@ struct WatchApp {
     sub: iroh_live::Subscription,
     _live: Live,
     stream_ended: bool,
+    control: viewer::ControlUi,
 }
 
 impl eframe::App for WatchApp {
@@ -1147,8 +1440,13 @@ impl eframe::App for WatchApp {
         // Detect stream end
         if !self.stream_ended && self.broadcast.shutdown_token().is_cancelled() {
             self.stream_ended = true;
+            self.control.stream_ended();
         }
 
+        self.control.poll_grant();
+        self.control.banner(ctx);
+
+        let mut video_rect: Option<egui::Rect> = None;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -1167,7 +1465,8 @@ impl eframe::App for WatchApp {
                     });
                 } else if let Some(video) = self.video.as_mut() {
                     let (img, _) = video.render(ctx, avail);
-                    ui.add_sized(avail, img);
+                    let resp = ui.add_sized(avail, img);
+                    video_rect = Some(resp.rect);
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.label(
@@ -1177,10 +1476,418 @@ impl eframe::App for WatchApp {
                     });
                 }
             });
+
+        if let Some(rect) = video_rect {
+            self.control.forward_input(ctx, rect);
+        }
     }
 
     fn on_exit(&mut self) {
         tracing::info!("Exiting viewer");
+        self.control.release();
         self.sub.session().close(0, b"bye");
+    }
+}
+
+/// Remote-control UI glue for the viewer window: grant polling, the control
+/// connection, input forwarding and the banner.
+mod viewer {
+    use std::time::{Duration, Instant};
+
+    use eframe::egui;
+    use iroh::Endpoint;
+    use meshcast_signal::control::{self as proto, ControlMsg, NamedKey, PointerButton};
+
+    use crate::control::{ClientStatus, ControlClient};
+
+    /// Grants older than this are ignored (stale file from an earlier stream).
+    const GRANT_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+    const GRANT_POLL: Duration = Duration::from_secs(1);
+    const DOUBLE_ESC: Duration = Duration::from_millis(700);
+
+    pub struct ControlUi {
+        endpoint: Endpoint,
+        ticket: String,
+        rt: tokio::runtime::Handle,
+        client: Option<ControlClient>,
+        /// Token we already acted on, so a Denied/Ended grant isn't retried forever.
+        seen_token: Option<String>,
+        streamer: String,
+        last_poll: Instant,
+        paused: bool,
+        last_esc: Option<Instant>,
+        modifiers: egui::Modifiers,
+        notice: Option<(String, Instant)>,
+        ended: bool,
+    }
+
+    impl ControlUi {
+        pub fn new(endpoint: Endpoint, ticket: String, rt: tokio::runtime::Handle) -> Self {
+            Self {
+                endpoint,
+                ticket,
+                rt,
+                client: None,
+                seen_token: None,
+                streamer: String::new(),
+                last_poll: Instant::now() - GRANT_POLL,
+                paused: false,
+                last_esc: None,
+                modifiers: egui::Modifiers::NONE,
+                notice: None,
+                ended: false,
+            }
+        }
+
+        pub fn stream_ended(&mut self) {
+            self.ended = true;
+            self.release();
+            proto::clear_grant(&self.ticket);
+        }
+
+        /// Stop controlling (viewer-initiated).
+        pub fn release(&mut self) {
+            if let Some(c) = self.client.take() {
+                c.send(ControlMsg::Release);
+                c.disconnect();
+                self.set_notice("Control released");
+            }
+            self.paused = false;
+        }
+
+        fn set_notice(&mut self, text: impl Into<String>) {
+            self.notice = Some((text.into(), Instant::now()));
+        }
+
+        fn active(&self) -> bool {
+            self.client.as_ref().is_some_and(|c| c.is_active())
+        }
+
+        /// Look for a grant file written by our daemon and connect.
+        pub fn poll_grant(&mut self) {
+            if self.ended || self.last_poll.elapsed() < GRANT_POLL {
+                return;
+            }
+            self.last_poll = Instant::now();
+
+            // Report status changes of an existing client.
+            if let Some(c) = &self.client {
+                match c.status() {
+                    ClientStatus::Denied(r) => {
+                        self.set_notice(format!("Control denied: {r}"));
+                        self.client = None;
+                    }
+                    ClientStatus::Ended(r) => {
+                        self.set_notice(format!("Control ended: {r}"));
+                        self.client = None;
+                        self.paused = false;
+                    }
+                    _ => {}
+                }
+            }
+            if self.client.is_some() {
+                return;
+            }
+
+            let Some(grant) = proto::read_grant(&self.ticket) else {
+                return;
+            };
+            if self.seen_token.as_deref() == Some(grant.token.as_str()) {
+                return;
+            }
+            // Ignore stale grant files.
+            if let Ok(meta) = std::fs::metadata(proto::grant_path(&self.ticket)) {
+                if let Ok(modified) = meta.modified() {
+                    if modified.elapsed().unwrap_or_default() > GRANT_MAX_AGE {
+                        return;
+                    }
+                }
+            }
+            self.seen_token = Some(grant.token.clone());
+            self.streamer = grant.streamer.clone();
+            let _enter = self.rt.enter();
+            self.client = Some(ControlClient::connect(self.endpoint.clone(), grant));
+            self.set_notice("Connecting control…");
+        }
+
+        /// Top banner while control is pending/active, or a transient notice.
+        pub fn banner(&mut self, ctx: &egui::Context) {
+            let active = self.active();
+            let connecting = self
+                .client
+                .as_ref()
+                .is_some_and(|c| c.status() == ClientStatus::Connecting);
+            let notice = self
+                .notice
+                .clone()
+                .filter(|(_, at)| at.elapsed() < Duration::from_secs(6))
+                .map(|(t, _)| t);
+            if !active && !connecting && notice.is_none() {
+                return;
+            }
+            let fill = if active && !self.paused {
+                egui::Color32::from_rgb(46, 125, 50)
+            } else if active {
+                egui::Color32::from_rgb(120, 100, 20)
+            } else {
+                egui::Color32::from_rgb(50, 52, 58)
+            };
+            let mut release_clicked = false;
+            let mut pause_clicked = false;
+            egui::TopBottomPanel::top("control-banner")
+                .frame(
+                    egui::Frame::new()
+                        .fill(fill)
+                        .inner_margin(egui::Margin::symmetric(10, 6)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        let who = if self.streamer.is_empty() {
+                            "the streamer".to_string()
+                        } else {
+                            self.streamer.clone()
+                        };
+                        let text = if active && !self.paused {
+                            format!("🎮 You control {who}'s screen — F8 pause · Esc Esc release")
+                        } else if active {
+                            format!("⏸ Control paused ({who}) — F8 to resume")
+                        } else if connecting {
+                            "Connecting remote control…".to_string()
+                        } else {
+                            notice.clone().unwrap_or_default()
+                        };
+                        ui.label(
+                            egui::RichText::new(text)
+                                .color(egui::Color32::WHITE)
+                                .strong(),
+                        );
+                        if active {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Release").clicked() {
+                                        release_clicked = true;
+                                    }
+                                    if ui
+                                        .button(if self.paused { "Resume" } else { "Pause" })
+                                        .clicked()
+                                    {
+                                        pause_clicked = true;
+                                    }
+                                },
+                            );
+                        }
+                    });
+                });
+            if release_clicked {
+                self.release();
+            }
+            if pause_clicked {
+                self.toggle_pause();
+            }
+        }
+
+        fn toggle_pause(&mut self) {
+            self.paused = !self.paused;
+            if self.paused {
+                if let Some(c) = &self.client {
+                    c.send(ControlMsg::Release);
+                }
+            }
+        }
+
+        /// Translate this frame's egui input into control messages.
+        pub fn forward_input(&mut self, ctx: &egui::Context, video_rect: egui::Rect) {
+            if !self.active() {
+                return;
+            }
+            let events = ctx.input(|i| i.events.clone());
+            let mods = ctx.input(|i| i.modifiers);
+            let Some(client) = self.client.clone() else {
+                return;
+            };
+
+            // Hotkeys are handled even when paused.
+            for ev in &events {
+                if let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    ..
+                } = ev
+                {
+                    match key {
+                        egui::Key::F8 => {
+                            self.toggle_pause();
+                            return;
+                        }
+                        egui::Key::Escape => {
+                            if self.last_esc.is_some_and(|t| t.elapsed() < DOUBLE_ESC) {
+                                self.release();
+                                return;
+                            }
+                            self.last_esc = Some(Instant::now());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if self.paused {
+                return;
+            }
+
+            // Modifier transitions → key press/release.
+            let pairs = [
+                (self.modifiers.shift, mods.shift, NamedKey::Shift),
+                (self.modifiers.ctrl, mods.ctrl, NamedKey::Control),
+                (self.modifiers.alt, mods.alt, NamedKey::Alt),
+                (self.modifiers.mac_cmd, mods.mac_cmd, NamedKey::Super),
+            ];
+            for (was, now, key) in pairs {
+                if was != now {
+                    client.send(ControlMsg::Key { key, pressed: now });
+                }
+            }
+            self.modifiers = mods;
+            let chord = mods.ctrl || mods.alt || mods.mac_cmd;
+
+            let norm = |pos: egui::Pos2| -> Option<(f32, f32)> {
+                if video_rect.width() <= 0.0 || video_rect.height() <= 0.0 {
+                    return None;
+                }
+                let x = (pos.x - video_rect.left()) / video_rect.width();
+                let y = (pos.y - video_rect.top()) / video_rect.height();
+                Some((x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)))
+            };
+
+            for ev in events {
+                match ev {
+                    egui::Event::PointerMoved(pos) => {
+                        if video_rect.contains(pos) {
+                            if let Some((x, y)) = norm(pos) {
+                                client.send(ControlMsg::PointerMove { x, y });
+                            }
+                        }
+                    }
+                    egui::Event::PointerButton {
+                        pos,
+                        button,
+                        pressed,
+                        ..
+                    } => {
+                        // Presses only inside the video; releases always (so nothing sticks).
+                        if pressed && !video_rect.contains(pos) {
+                            continue;
+                        }
+                        if let Some(b) = map_button(button) {
+                            if let Some((x, y)) = norm(pos) {
+                                client.send(ControlMsg::PointerMove { x, y });
+                            }
+                            client.send(ControlMsg::PointerButton { button: b, pressed });
+                        }
+                    }
+                    egui::Event::MouseWheel { unit, delta, .. } => {
+                        // egui: positive y = content moves down (wheel rolled up).
+                        let lines = match unit {
+                            egui::MouseWheelUnit::Line => delta,
+                            egui::MouseWheelUnit::Point => delta / 40.0,
+                            egui::MouseWheelUnit::Page => delta * 10.0,
+                        };
+                        client.send(ControlMsg::Scroll {
+                            dx: lines.x,
+                            dy: -lines.y,
+                        });
+                    }
+                    egui::Event::Key {
+                        key,
+                        pressed,
+                        repeat,
+                        ..
+                    } => {
+                        if repeat && !pressed {
+                            continue;
+                        }
+                        if matches!(key, egui::Key::F8) {
+                            continue;
+                        }
+                        if let Some(k) = map_key(key) {
+                            client.send(ControlMsg::Key { key: k, pressed });
+                        } else if chord {
+                            if let Some(c) = key_char(key) {
+                                client.send(ControlMsg::Key {
+                                    key: NamedKey::Char(c),
+                                    pressed,
+                                });
+                            }
+                        }
+                    }
+                    egui::Event::Text(text) => {
+                        if !chord && !text.is_empty() {
+                            client.send(ControlMsg::Text { text });
+                        }
+                    }
+                    egui::Event::WindowFocused(false) => {
+                        client.send(ControlMsg::Release);
+                        self.modifiers = egui::Modifiers::NONE;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn map_button(b: egui::PointerButton) -> Option<PointerButton> {
+        Some(match b {
+            egui::PointerButton::Primary => PointerButton::Left,
+            egui::PointerButton::Secondary => PointerButton::Right,
+            egui::PointerButton::Middle => PointerButton::Middle,
+            egui::PointerButton::Extra1 => PointerButton::Back,
+            egui::PointerButton::Extra2 => PointerButton::Forward,
+        })
+    }
+
+    fn map_key(k: egui::Key) -> Option<NamedKey> {
+        use egui::Key as K;
+        Some(match k {
+            K::Escape => NamedKey::Escape,
+            K::Enter => NamedKey::Enter,
+            K::Tab => NamedKey::Tab,
+            K::Backspace => NamedKey::Backspace,
+            K::Delete => NamedKey::Delete,
+            K::Insert => NamedKey::Insert,
+            K::Space => NamedKey::Space,
+            K::ArrowLeft => NamedKey::ArrowLeft,
+            K::ArrowRight => NamedKey::ArrowRight,
+            K::ArrowUp => NamedKey::ArrowUp,
+            K::ArrowDown => NamedKey::ArrowDown,
+            K::Home => NamedKey::Home,
+            K::End => NamedKey::End,
+            K::PageUp => NamedKey::PageUp,
+            K::PageDown => NamedKey::PageDown,
+            K::F1 => NamedKey::F1,
+            K::F2 => NamedKey::F2,
+            K::F3 => NamedKey::F3,
+            K::F4 => NamedKey::F4,
+            K::F5 => NamedKey::F5,
+            K::F6 => NamedKey::F6,
+            K::F7 => NamedKey::F7,
+            K::F9 => NamedKey::F9,
+            K::F10 => NamedKey::F10,
+            K::F11 => NamedKey::F11,
+            K::F12 => NamedKey::F12,
+            _ => return None,
+        })
+    }
+
+    /// Printable character for a key, for chords like Ctrl+C.
+    fn key_char(k: egui::Key) -> Option<char> {
+        let name = k.symbol_or_name();
+        let mut chars = name.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) if c.is_ascii_alphanumeric() || c.is_ascii_punctuation() => {
+                Some(c.to_ascii_lowercase())
+            }
+            _ => None,
+        }
     }
 }

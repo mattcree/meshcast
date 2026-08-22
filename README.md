@@ -84,6 +84,17 @@ That's it; the link survives restarts on both sides.
 - **Watch:** click **Watch** on the card. If you're linked, the viewer opens by itself. If you're not, the bot tells you how to install and gives you the stream ticket for `meshcast watch <ticket>`.
 - **Stop:** click **Stop** on the card, press **Stop Stream** in the app or tray, or run `/stream` again. The card updates to "Stream ended" and viewers see "Stream ended".
 
+### Remote control (let a friend drive)
+
+A viewer can ask to control your mouse and keyboard — handy for "click here, let me show you" moments.
+
+1. When you approve a stream in the Meshcast window, tick **Allow viewers to request remote control**. (On Linux the system dialog will mention remote desktop; that's expected.)
+2. Viewers get a **Request control** button on the card. You see "*X wants to control your screen — Allow / Deny*" in the window (and a notification).
+3. While someone has control the card, the window and the tray all say so; **Revoke** in any of them (or stopping the stream, or the viewer closing the window) ends it instantly and releases any held keys.
+4. In the viewer window: **F8** pauses/resumes, **Esc Esc** releases.
+
+One controller at a time; requests expire after 90 s; idle controllers are dropped after 10 min. Works on Linux (GNOME/KDE via the desktop portal), macOS (needs the Accessibility permission, prompted once) and, for viewers, Windows. Details and the trust model: [docs/REMOTE-CONTROL.md](docs/REMOTE-CONTROL.md).
+
 ## What's running on your machine
 
 | Process | Role |
@@ -161,6 +172,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev loop, lint/test commands and 
 ## Documentation
 
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture, the Discord integration and why it looks the way it does, trust model, scaling
+- [docs/REMOTE-CONTROL.md](docs/REMOTE-CONTROL.md) — remote-control design: consent flow, protocol, injection backends
 - [docs/DISCORD-SETUP.md](docs/DISCORD-SETUP.md) — creating the Discord application and inviting the bot
 - [CONTRIBUTING.md](CONTRIBUTING.md) — dev setup, standards, releasing
 - [BACKLOG.md](BACKLOG.md) — what's next

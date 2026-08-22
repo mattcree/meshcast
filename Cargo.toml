@@ -13,14 +13,16 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/mattcree/meshcast"
 
-# Pinned git dependencies. All three must agree on the same iroh revision —
+# Pinned git dependencies. All must agree on the same iroh revision —
+# iroh-live comes from our fork (branch meshcast-0.5): upstream edd9bcc + one patch
+# (PipeWireScreenCapturer::from_portal_stream) needed for remote control.
 # bump them together (see CONTRIBUTING.md "Updating iroh / iroh-live").
 [workspace.dependencies]
 iroh = { git = "https://github.com/n0-computer/iroh", rev = "8af8370b567d9e9a89aaf25929b327a6a5b96de1" }
 iroh-gossip = { git = "https://github.com/n0-computer/iroh-gossip", rev = "1038f721663ffddc526359e33757ba998046ff2d" }
-iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "edd9bcc530a615f3ab3a6919e96790a077905376" }
-moq-media = { git = "https://github.com/n0-computer/iroh-live", rev = "edd9bcc530a615f3ab3a6919e96790a077905376" }
-moq-media-egui = { git = "https://github.com/n0-computer/iroh-live", rev = "edd9bcc530a615f3ab3a6919e96790a077905376" }
+iroh-live = { git = "https://github.com/mattcree/iroh-live", rev = "3d9622a064aa324bdfa5b6195625128a70d09cc2" }
+moq-media = { git = "https://github.com/mattcree/iroh-live", rev = "3d9622a064aa324bdfa5b6195625128a70d09cc2" }
+moq-media-egui = { git = "https://github.com/mattcree/iroh-live", rev = "3d9622a064aa324bdfa5b6195625128a70d09cc2" }
 
 [profile.release]
 strip = true
