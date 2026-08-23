@@ -111,11 +111,12 @@ pub fn take_command() -> Option<Command> {
 
 pub fn take_command_from(path: &Path) -> Option<Command> {
     let raw = std::fs::read_to_string(path).ok()?;
-    let _ = std::fs::remove_file(path);
     let raw = raw.trim();
     if raw.is_empty() {
+        // A writer may still be filling the file; leave it for the next tick.
         return None;
     }
+    let _ = std::fs::remove_file(path);
     Some(Command::parse(raw))
 }
 
@@ -157,6 +158,8 @@ mod tests {
         assert!(!path.exists());
         std::fs::write(&path, "   ").unwrap();
         assert!(take_command_from(&path).is_none());
+        assert!(path.exists(), "empty file must not be consumed");
+        let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

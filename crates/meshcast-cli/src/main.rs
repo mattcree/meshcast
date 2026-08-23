@@ -26,9 +26,9 @@ use meshcast_signal::control::{self as ctrl, ControlGrant};
 use meshcast_signal::ipc::{self, Command as IpcCommand};
 use meshcast_signal::process;
 use meshcast_signal::{
-    derive_pairing_topic, normalize_fps, normalize_quality, sanitize_title, AppConfig, DaemonState,
-    EndpointId, Event, GossipSender, LinkConfig, LinkState, PairCode, PairSignal, ServerLink,
-    Signal, SignalNode, StreamRequest, TopicId,
+    derive_pairing_topic, normalize_fps, normalize_quality, relay_only, sanitize_title, AppConfig,
+    DaemonState, DeliveryScope, EndpointId, Event, GossipSender, LinkConfig, LinkState, PairCode,
+    PairSignal, ServerLink, Signal, SignalNode, StreamRequest, TopicId,
 };
 use moq_media::capture::ScreenCapturer;
 use moq_media::codec::h264::H264Encoder;
@@ -282,7 +282,9 @@ async fn start_stream(
         .await
         .context("Failed to publish broadcast")?;
 
-    let ticket = LiveTicket::new(live.endpoint().addr(), name).to_string();
+    // Relay-only address: the ticket is posted to a whole channel; don't hand out
+    // the streamer's direct IPs with it (connected peers still hole-punch).
+    let ticket = LiveTicket::new(relay_only(live.endpoint().addr()), name).to_string();
     Ok(ActiveStream {
         live,
         _broadcast: broadcast,
@@ -525,6 +527,13 @@ struct LinkConn {
     /// Dropping this stops the receiver task (and thus the subscription).
     stop: Option<oneshot::Sender<()>>,
     connected: bool,
+    /// Removed from config (never resubscribe) vs. merely disconnected.
+    removed: bool,
+    /// Last time we asked gossip to (re)join the bot, and the current backoff.
+    last_join: Instant,
+    join_backoff: Duration,
+    /// Signals queued while the bot was unreachable; flushed on NeighborUp.
+    outbox: Vec<Signal>,
 }
 
 impl LinkConn {
@@ -532,7 +541,24 @@ impl LinkConn {
         self.sender.is_some()
     }
 
-    async fn send(&self, signal: Signal) {
+    async fn send(&mut self, signal: Signal) {
+        if !self.is_active() {
+            return;
+        }
+        if !self.connected {
+            // `broadcast_neighbors` with no neighbours silently sends nothing, so
+            // keep it for when the bot is back (bounded; newest wins).
+            tracing::debug!(link = %self.name, "Bot not connected; queueing {}", signal.name());
+            if self.outbox.len() >= 32 {
+                self.outbox.remove(0);
+            }
+            self.outbox.push(signal);
+            return;
+        }
+        self.send_now(signal).await;
+    }
+
+    async fn send_now(&self, signal: Signal) {
         let Some(sender) = &self.sender else {
             return;
         };
@@ -546,10 +572,31 @@ impl LinkConn {
         }
     }
 
+    /// Deliver anything queued while disconnected.
+    async fn flush_outbox(&mut self) {
+        let queued = std::mem::take(&mut self.outbox);
+        for s in queued {
+            self.send_now(s).await;
+        }
+    }
+
+    /// Ask gossip to dial the bot again (it does not retry on its own).
+    async fn rejoin(&mut self) {
+        if let Some(sender) = &self.sender {
+            tracing::info!(link = %self.name, "Re-joining bot");
+            if let Err(e) = sender.join_peers(vec![self.peer_id]).await {
+                tracing::debug!(link = %self.name, "join_peers: {e}");
+            }
+        }
+        self.last_join = Instant::now();
+        self.join_backoff = (self.join_backoff * 2).min(Duration::from_secs(60));
+    }
+
     fn deactivate(&mut self) {
         self.sender = None;
         self.stop = None; // drops the oneshot → receiver task exits
         self.connected = false;
+        self.outbox.clear();
     }
 }
 
@@ -579,8 +626,13 @@ async fn subscribe_link(
         loop {
             tokio::select! {
                 _ = &mut stop_rx => break,
-                event = receiver.next() => {
-                    let Some(event) = event else { break };
+                                event = receiver.next() => {
+                    let Some(event) = event else {
+                        // Subscription ended (gossip shut the topic) — tell the loop so
+                        // the link can be re-subscribed rather than silently dead.
+                        let _ = tx.send((idx, Err(anyhow::anyhow!("subscription ended")))).await;
+                        break;
+                    };
                     let item = event.map_err(|e| anyhow::anyhow!("{e}"));
                     if tx.send((idx, item)).await.is_err() {
                         break;
@@ -597,6 +649,10 @@ async fn subscribe_link(
         sender: Some(sender),
         stop: Some(stop_tx),
         connected: false,
+        removed: false,
+        last_join: Instant::now(),
+        join_backoff: Duration::from_secs(5),
+        outbox: Vec::new(),
     })
 }
 
@@ -649,7 +705,7 @@ impl Session {
         // Remove links that are gone from the config.
         let mut removed = Vec::new();
         for (idx, conn) in self.links.iter_mut().enumerate() {
-            if conn.is_active()
+            if !conn.removed
                 && !new_config
                     .links
                     .iter()
@@ -657,6 +713,7 @@ impl Session {
             {
                 tracing::info!(link = %conn.name, "Link removed");
                 conn.deactivate();
+                conn.removed = true;
                 removed.push(idx);
             }
         }
@@ -674,7 +731,7 @@ impl Session {
             let already = self
                 .links
                 .iter()
-                .any(|c| c.is_active() && c.topic == sl.config.topic);
+                .any(|c| !c.removed && c.topic == sl.config.topic);
             if already {
                 continue;
             }
@@ -690,9 +747,50 @@ impl Session {
         self.publish_state();
     }
 
-    async fn send_to(&self, link_idx: usize, signal: Signal) {
-        if let Some(link) = self.links.get(link_idx) {
+    async fn send_to(&mut self, link_idx: usize, signal: Signal) {
+        if let Some(link) = self.links.get_mut(link_idx) {
             link.send(signal).await;
+        }
+    }
+
+    /// Is this link the one the active stream belongs to?
+    fn owns_stream(&self, idx: usize) -> bool {
+        self.active.as_ref().is_some_and(|(i, _)| *i == idx)
+    }
+
+    /// Periodic link maintenance: re-join bots we've lost, resubscribe ended
+    /// subscriptions.
+    async fn maintain_links(&mut self, node: &SignalNode, tx: &mpsc::Sender<LinkEvent>) {
+        for idx in 0..self.links.len() {
+            let (due, active, removed, name, topic) = {
+                let l = &self.links[idx];
+                (
+                    !l.connected && l.last_join.elapsed() >= l.join_backoff,
+                    l.is_active(),
+                    l.removed,
+                    l.name.clone(),
+                    l.topic,
+                )
+            };
+            if removed || !due {
+                continue;
+            }
+            if active {
+                self.links[idx].rejoin().await;
+            } else if let Some(sl) = self.config.links.iter().find(|l| l.config.topic == topic) {
+                match subscribe_link(node, sl, idx, tx).await {
+                    Ok(conn) => {
+                        tracing::info!(link = %name, "Re-subscribed");
+                        self.links[idx] = conn;
+                    }
+                    Err(e) => {
+                        tracing::warn!(link = %name, "Re-subscribe failed: {e}");
+                        let l = &mut self.links[idx];
+                        l.last_join = Instant::now();
+                        l.join_backoff = (l.join_backoff * 2).min(Duration::from_secs(60));
+                    }
+                }
+            }
         }
     }
 
@@ -741,7 +839,7 @@ impl Session {
         let audio = self.config.audio.enabled;
         match start_stream("meshcast", &req.quality, req.fps, audio, control).await {
             Ok(stream) => {
-                tracing::info!("Streaming: {}", stream.ticket);
+                tracing::info!("Streaming ({} chars ticket)", stream.ticket.len());
                 self.send_to(
                     idx,
                     Signal::ControlAvailable {
@@ -888,20 +986,38 @@ impl Session {
                     &format!("\"{title}\" — open Meshcast to approve"),
                 );
             }
-            Signal::StopStream => self.stop_stream("requested by bot").await,
+            Signal::StopStream => {
+                if self.pending.as_ref().is_some_and(|(i, _, _)| *i == idx) {
+                    self.reject_pending("cancelled by the bot").await;
+                }
+                if self.owns_stream(idx) {
+                    self.stop_stream("requested by bot").await;
+                } else if self.active.is_some() {
+                    tracing::debug!(link = %link_name, "StopStream from a link that doesn't own the stream; ignored");
+                } else {
+                    // Nothing running: answer so the bot's card converges anyway.
+                    self.send_to(idx, Signal::StreamStopped).await;
+                }
+            }
             Signal::WatchStream { ticket } => {
                 tracing::info!("Watch requested");
                 self.launch_viewer(&ticket);
             }
             Signal::ViewerUpdate { count } => {
-                self.state.viewers = count;
-                self.publish_state();
+                if self.owns_stream(idx) {
+                    self.state.viewers = count;
+                    self.publish_state();
+                }
             }
             Signal::Ping => self.send_to(idx, Signal::Pong).await,
             Signal::ControlRequest { request_id, viewer } => {
                 self.on_control_request(idx, request_id, viewer).await;
             }
-            Signal::RevokeControl => self.revoke_control("revoked from Discord").await,
+            Signal::RevokeControl => {
+                if self.owns_stream(idx) {
+                    self.revoke_control("revoked from Discord").await;
+                }
+            }
             Signal::ControlToken {
                 ticket,
                 token,
@@ -1018,7 +1134,7 @@ impl Session {
             Signal::ControlGranted {
                 request_id,
                 token,
-                addr: self.addr.clone(),
+                addr: relay_only(self.addr.clone()),
             },
         )
         .await;
@@ -1055,8 +1171,9 @@ impl Session {
 
     async fn on_server_event(&mut self, ev: ServerEvent) {
         match ev {
-            ServerEvent::ControllerConnected { controller } => {
+            ServerEvent::ControllerConnected { controller, peer } => {
                 self.armed_at = None;
+                tracing::info!("{controller} ({peer}) is now controlling the screen");
                 notify(
                     "Meshcast",
                     &format!("{controller} is now controlling your screen"),
@@ -1139,7 +1256,13 @@ fn notify(summary: &str, body: &str) {
         #[cfg(target_os = "linux")]
         {
             let _ = std::process::Command::new("notify-send")
-                .args(["--app-name=Meshcast", "--urgency=critical", &summary, &body])
+                .args([
+                    "--app-name=Meshcast",
+                    "--urgency=critical",
+                    "--",
+                    &summary,
+                    &body,
+                ])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
@@ -1243,11 +1366,17 @@ async fn run_session(shutdown: impl std::future::Future<Output = ()>) -> Result<
                     continue; // stale event from a removed link
                 }
                 match event {
-                    Ok(Event::Received(msg)) => {
-                        if msg.delivered_from != link.peer_id {
+                                        Ok(Event::Received(msg)) => {
+                        // Only direct, neighbours-scoped messages from the bot itself:
+                        // `delivered_from` is the last hop, so swarm-relayed messages
+                        // could originate from anyone on the topic.
+                        if msg.delivered_from != link.peer_id
+                            || !matches!(msg.scope, DeliveryScope::Neighbors)
+                        {
                             tracing::warn!(
-                                "Rejected message from unexpected peer {}",
-                                msg.delivered_from.fmt_short()
+                                "Rejected message from unexpected peer {} ({:?})",
+                                msg.delivered_from.fmt_short(),
+                                msg.scope
                             );
                             continue;
                         }
@@ -1256,12 +1385,13 @@ async fn run_session(shutdown: impl std::future::Future<Output = ()>) -> Result<
                             Err(e) => tracing::warn!("Undecodable signal: {e}"),
                         }
                     }
-                    Ok(Event::NeighborUp(id)) => {
+                                        Ok(Event::NeighborUp(id)) => {
                         if let Some(link) = session.links.get_mut(idx) {
                             tracing::info!(link = %link.name, peer = %id.fmt_short(), "Bot connected");
                             link.connected = true;
+                            link.join_backoff = Duration::from_secs(5);
+                            link.flush_outbox().await;
                         }
-                        session.state.error = None;
                         session.publish_state();
                     }
                     Ok(Event::NeighborDown(id)) => {
@@ -1272,12 +1402,14 @@ async fn run_session(shutdown: impl std::future::Future<Output = ()>) -> Result<
                         session.publish_state();
                     }
                     Ok(_) => {}
-                    Err(e) => {
-                        tracing::error!("Gossip error on link {idx}: {e}");
+                                        Err(e) => {
+                        tracing::warn!("Gossip error on link {idx}: {e}; will re-subscribe");
                         if let Some(link) = session.links.get_mut(idx) {
-                            link.connected = false;
+                            // Keep the slot (indices are stable) but drop the dead
+                            // subscription; maintain_links re-subscribes with backoff.
+                            link.deactivate();
+                            link.last_join = Instant::now();
                         }
-                        session.state.error = Some(format!("Connection error: {e}"));
                         session.publish_state();
                     }
                 }
@@ -1302,7 +1434,8 @@ async fn run_session(shutdown: impl std::future::Future<Output = ()>) -> Result<
                         session.revoke_control("viewer never connected").await;
                     }
                 }
-                session.reap_viewers();
+                                session.reap_viewers();
+                session.maintain_links(&node, &tx).await;
 
                 if let Some(cmd) = ipc::take_command() {
                     tracing::debug!("Command: {}", command_label(&cmd));

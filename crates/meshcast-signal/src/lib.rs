@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 // Re-exports for consumers
 pub use iroh::EndpointId;
 pub use iroh_gossip::api::{Event, GossipSender};
-pub use iroh_gossip::proto::TopicId;
+pub use iroh_gossip::proto::{DeliveryScope, TopicId};
 
 pub mod control;
 pub mod ipc;
@@ -195,6 +195,8 @@ pub fn sanitize_title(title: &str) -> String {
         .chars()
         .filter(|c| !c.is_control())
         .collect::<String>()
+        .trim()
+        .trim_start_matches(['-', '\u{2013}', '\u{2014}'])
         .trim()
         .to_string();
     if cleaned.is_empty() {
@@ -367,11 +369,20 @@ impl LinkState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BotLink {
     pub topic: [u8; 32],
+    /// Endpoint id of the paired app (learned at pairing). Messages from any
+    /// other endpoint on this topic are ignored. `None` for links made before
+    /// this field existed.
+    #[serde(default)]
+    pub app_id: Option<[u8; 32]>,
 }
 
 impl BotLink {
     pub fn topic_id(&self) -> TopicId {
         TopicId::from_bytes(self.topic)
+    }
+
+    pub fn app_endpoint_id(&self) -> Option<EndpointId> {
+        self.app_id.and_then(|b| EndpointId::from_bytes(&b).ok())
     }
 }
 
@@ -660,6 +671,12 @@ pub fn write_private_file(path: &Path, data: &[u8]) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&parent)
         .with_context(|| format!("Failed to create {}", parent.display()))?;
+    // Our directories hold secrets and consent state: keep other users out.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700));
+    }
     let tmp = parent.join(format!(
         ".{}.tmp-{}",
         path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
@@ -726,6 +743,23 @@ pub fn ticket_uri(ticket: &str) -> String {
 // Signal node
 // ---------------------------------------------------------------------------
 
+/// Strip direct (IP) addresses from an endpoint address, keeping id + relay
+/// URLs. Used for anything shared widely (stream tickets, control grants) so a
+/// channel full of strangers doesn't learn the streamer's home IP. Peers that
+/// actually connect still learn each other's addresses (inherent to P2P). If
+/// no relay is known yet (offline start), the full address is returned.
+pub fn relay_only(addr: EndpointAddr) -> EndpointAddr {
+    let relays: Vec<_> = addr.relay_urls().cloned().collect();
+    if relays.is_empty() {
+        return addr;
+    }
+    let mut out = EndpointAddr::new(addr.id);
+    for r in relays {
+        out = out.with_relay_url(r);
+    }
+    out
+}
+
 /// Lightweight iroh node for gossip-only communication.
 pub struct SignalNode {
     pub endpoint: Endpoint,
@@ -757,8 +791,14 @@ impl SignalNode {
         let router =
             register(Router::builder(endpoint.clone()).accept(GOSSIP_ALPN, gossip.clone())).spawn();
 
-        // Wait for relay connection so our address includes the relay URL
-        endpoint.online().await;
+        // Wait for the relay so our address includes a relay URL — but don't hang
+        // forever when offline; gossip reconnects once the network is back.
+        if tokio::time::timeout(std::time::Duration::from_secs(15), endpoint.online())
+            .await
+            .is_err()
+        {
+            tracing::warn!("No relay connection after 15 s (offline?); continuing");
+        }
 
         tracing::info!(
             endpoint_id = %endpoint.id().fmt_short(),
@@ -919,7 +959,25 @@ mod tests {
     }
 
     #[test]
+    fn relay_only_strips_ips() {
+        let key = SecretKey::from_bytes(&[3u8; 32]);
+        let id = key.public();
+        let relay: iroh::RelayUrl = "https://relay.example.com".parse().unwrap();
+        let addr = EndpointAddr::new(id)
+            .with_relay_url(relay.clone())
+            .with_ip_addr("10.0.0.5:1234".parse().unwrap());
+        let out = relay_only(addr);
+        assert_eq!(out.id, id);
+        assert_eq!(out.ip_addrs().count(), 0);
+        assert_eq!(out.relay_urls().next(), Some(&relay));
+        // No relay known → unchanged (can't drop the only way to reach us).
+        let bare = EndpointAddr::new(id).with_ip_addr("10.0.0.5:1234".parse().unwrap());
+        assert_eq!(relay_only(bare.clone()), bare);
+    }
+
+    #[test]
     fn title_sanitising() {
+        assert_eq!(sanitize_title("--icon=evil Game"), "icon=evil Game");
         assert_eq!(sanitize_title("  Game\nNight  "), "GameNight");
         assert_eq!(sanitize_title(""), "");
         assert_eq!(sanitize_title("   "), "");

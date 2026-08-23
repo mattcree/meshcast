@@ -7,11 +7,12 @@ Please report vulnerabilities privately via [GitHub's private vulnerability repo
 ## Scope and model (short version — full detail in `docs/DESIGN.md` §5)
 
 - **Consent**: nothing is captured until the streamer clicks *Share Screen* in the app (and picks a source in the OS portal on Wayland). Requests name the Discord server and expire after 90 s.
-- **Credentials**: each bot↔user link is a random 32-byte gossip topic exchanged during a one-shot, 10-minute, 8-char-PIN pairing over QUIC/TLS. The daemon only accepts signals from the paired bot's endpoint ID.
+- **Credentials**: each bot↔user link is a random 32-byte gossip topic exchanged during a one-shot, 10-minute, 8-char-PIN pairing over QUIC/TLS (each pairing topic accepts only its own PIN and closes after 3 wrong attempts). The daemon only accepts signals delivered directly by the paired bot's endpoint ID; the bot only accepts signals delivered directly by the paired app's endpoint ID.
 - **Secrets at rest**: `~/.config/meshcast/config.toml` (link topics + daemon keys), bot `state.json` (bot key + topics), bot token env file — all `0600`, written atomically. They are never logged.
 - **Discord**: non-privileged intents only, no message-content access, only *Send Messages* + *Embed Links* requested.
 - **Viewer launch**: `WatchStream` from a paired bot opens `meshcast watch <ticket>`; tickets are validated (character set, length) and concurrently open viewers are capped at 5. The viewer only connects to the ticket's endpoint and renders media.
-- **Transport**: all network traffic is iroh QUIC (TLS 1.3, endpoint keys). iroh's public relays may carry encrypted traffic when hole-punching fails; they can't read it.
+- **Transport**: all network traffic is iroh QUIC (TLS 1.3, endpoint keys). iroh's public relays may carry encrypted traffic when hole-punching fails; they can't read it. Tickets and control grants carry relay-only addresses (no direct IPs); connected peers still learn each other's addresses.
+- **Remote control**: one-time tokens (consumed on first use), per-stream, streamer-revocable; all held keys released on disconnect. A compromised bot host could misuse a granted token once — see `docs/REMOTE-CONTROL.md` "Trust model".
 
 ## Known limitations
 

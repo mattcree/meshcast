@@ -4,6 +4,23 @@ All notable changes to Meshcast. Format follows [Keep a Changelog](https://keepa
 
 ## [Unreleased]
 
+Hardening round 1 (see `docs/HARDENING-PLAN.md`, Batch A).
+
+### Fixed
+- **Daemon re-joins the bot** after a bot restart, a network partition, or starting while the bot is down (iroh-gossip never retries bootstrap on its own); ended subscriptions are re-subscribed with backoff. Signals emitted while the bot is unreachable are queued and flushed on reconnect instead of being silently dropped.
+- Bot answers immediately when the user's app isn't connected (`/stream`, Request control) instead of waiting for a timeout; `START_TIMEOUT` raised to 240 s to cover consent + the portal dialog; a `StreamReady` racing the timeout is now stopped; a failed card post stops the stream and says why; invalid tickets from an app are rejected.
+- Bot aborts the old gossip receiver on re-`/link`/`/unlink` (no more cross-machine state corruption / task leak).
+- Daemon only honours `StopStream`/`RevokeControl`/`ViewerUpdate` from the link that owns the stream; `StopStream` also cancels a pending consent prompt.
+- Startup no longer hangs forever offline (`online()` bounded to 15 s).
+- Tray writes commands atomically; the daemon no longer consumes a half-written (empty) command file.
+
+### Security
+- Pairing: each `/link` topic accepts only its own PIN and closes after 3 wrong attempts (was a global, un-rate-limited oracle over all pending PINs); the bot records the paired app's endpoint id and ignores messages from anyone else on the topic; both sides ignore swarm-relayed (non-direct) gossip messages.
+- Remote control: the token is consumed by the first successful `Hello` (a reuse is refused and the live session untouched); the connecting endpoint is logged.
+- Stream tickets and control-grant addresses are relay-only — no direct IPs posted to the channel.
+- Config/control directories are created `0700`; `notify-send` arguments can't be mistaken for options; names lose leading dashes; the stream ticket is no longer logged.
+- Docs (`SECURITY.md`, `docs/DESIGN.md` §5, `docs/REMOTE-CONTROL.md`) corrected to describe the real trust boundaries.
+
 ## [0.6.0] - 2026-08-22
 
 Remote control. New feature — field reports welcome (see `docs/REMOTE-CONTROL.md`). Default streaming/watching behaviour is unchanged unless you tick the new checkbox.

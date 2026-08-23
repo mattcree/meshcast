@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use futures_lite::StreamExt;
 use meshcast_signal::{
-    derive_pairing_topic, normalize_fps, normalize_quality, sanitize_title, BotLink, BotLinkStore,
-    Event, GossipSender, PairCode, PairSignal, Signal, SignalNode, TopicId, DEFAULT_FPS,
-    DEFAULT_QUALITY, FPS_OPTIONS, QUALITIES,
+    derive_pairing_topic, normalize_fps, normalize_quality, sanitize_title, validate_ticket,
+    BotLink, BotLinkStore, DeliveryScope, EndpointId, Event, GossipSender, PairCode, PairSignal,
+    Signal, SignalNode, TopicId, DEFAULT_FPS, DEFAULT_QUALITY, FPS_OPTIONS, QUALITIES,
 };
 use poise::serenity_prelude as serenity;
 use serenity::all::{
@@ -39,7 +39,7 @@ const PAIR_CODE_TTL: Duration = Duration::from_secs(600);
 /// How long we wait for the app to approve and start capture after Start is clicked.
 /// Must comfortably exceed the daemon's consent timeout (90s) plus capture start-up
 /// (portal picker, encoder init) so its StreamFailed/StreamReady arrives first.
-const START_TIMEOUT: Duration = Duration::from_secs(120);
+const START_TIMEOUT: Duration = Duration::from_secs(240);
 /// How long Stop waits for the app to confirm before forcing the card to "ended".
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long an unfinished `/stream` setup card is kept.
@@ -150,8 +150,10 @@ async fn refresh_card(http: &serenity::Http, stream: &ActiveStream) {
 
 struct Data {
     signal_node: SignalNode,
-    /// Gossip senders per linked user.
-    links: Arc<Mutex<HashMap<UserId, GossipSender>>>,
+    /// Gossip links per user.
+    links: Arc<Mutex<HashMap<UserId, UserLink>>>,
+    /// Users whose app is currently connected (NeighborUp seen, no NeighborDown).
+    connected: Arc<Mutex<HashSet<UserId>>>,
     pending_pins: Arc<Mutex<HashMap<String, PendingPin>>>,
     setups: Mutex<HashMap<UserId, StreamSetup>>,
     /// Active streams keyed by streamer.
@@ -178,28 +180,54 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// One user's gossip link on the bot side.
+struct UserLink {
+    sender: GossipSender,
+    /// Aborting this ends the receiver task and drops the subscription.
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for UserLink {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Spawn a gossip receiver task that routes signals from one user's app to the
-/// broadcast channel.
+/// broadcast channel. Only messages delivered directly (neighbours scope) by
+/// the paired app are accepted.
 fn spawn_receiver(
     user_id: UserId,
+    app_id: Option<EndpointId>,
     mut receiver: iroh_gossip::api::GossipReceiver,
     signal_tx: broadcast::Sender<(UserId, Signal)>,
-) {
+    connected: Arc<Mutex<HashSet<UserId>>>,
+) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
         while let Some(event) = receiver.next().await {
             match event {
-                Ok(Event::Received(msg)) => match Signal::decode(&msg.content) {
-                    Ok(signal) => {
-                        tracing::debug!(signal = signal.name(), user = %user_id, "Signal from app");
-                        let _ = signal_tx.send((user_id, signal));
+                Ok(Event::Received(msg)) => {
+                    let from_app = app_id.is_none_or(|id| id == msg.delivered_from);
+                    if !from_app || !matches!(msg.scope, DeliveryScope::Neighbors) {
+                        tracing::warn!(user = %user_id, peer = %msg.delivered_from.fmt_short(),
+                            "Ignoring message not from the paired app");
+                        continue;
                     }
-                    Err(e) => tracing::warn!(user = %user_id, "Undecodable signal: {e}"),
-                },
+                    match Signal::decode(&msg.content) {
+                        Ok(signal) => {
+                            tracing::debug!(signal = signal.name(), user = %user_id, "Signal from app");
+                            let _ = signal_tx.send((user_id, signal));
+                        }
+                        Err(e) => tracing::warn!(user = %user_id, "Undecodable signal: {e}"),
+                    }
+                }
                 Ok(Event::NeighborUp(id)) => {
                     tracing::info!(peer = %id.fmt_short(), user = %user_id, "App connected");
+                    lock(&connected).insert(user_id);
                 }
                 Ok(Event::NeighborDown(id)) => {
                     tracing::info!(peer = %id.fmt_short(), user = %user_id, "App disconnected");
+                    lock(&connected).remove(&user_id);
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -208,26 +236,47 @@ fn spawn_receiver(
                 }
             }
         }
+        lock(&connected).remove(&user_id);
         tracing::debug!(user = %user_id, "Receiver task ended");
-    });
+    })
+    .abort_handle()
 }
 
-/// Subscribe to a user's link topic and register it.
+/// Subscribe to a user's link topic and register it (replacing and aborting
+/// any previous link for that user).
 async fn activate_link(
-    data_links: &Arc<Mutex<HashMap<UserId, GossipSender>>>,
+    data_links: &Arc<Mutex<HashMap<UserId, UserLink>>>,
+    connected: &Arc<Mutex<HashSet<UserId>>>,
     signal_tx: &broadcast::Sender<(UserId, Signal)>,
     gossip: &iroh_gossip::net::Gossip,
     user_id: UserId,
     topic: TopicId,
+    app_id: Option<EndpointId>,
 ) -> anyhow::Result<()> {
     let sub = gossip
         .subscribe(topic, vec![])
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let (sender, receiver) = sub.split();
-    lock(data_links).insert(user_id, sender);
-    spawn_receiver(user_id, receiver, signal_tx.clone());
+    let task = spawn_receiver(
+        user_id,
+        app_id,
+        receiver,
+        signal_tx.clone(),
+        connected.clone(),
+    );
+    // Dropping a previous UserLink aborts its receiver.
+    lock(data_links).insert(user_id, UserLink { sender, task });
+    lock(connected).remove(&user_id);
     Ok(())
+}
+
+fn sender_for(data: &Data, user: UserId) -> Option<GossipSender> {
+    lock(&data.links).get(&user).map(|l| l.sender.clone())
+}
+
+fn is_connected(data: &Data, user: UserId) -> bool {
+    lock(&data.connected).contains(&user)
 }
 
 async fn persist_store(store: &Arc<Mutex<BotLinkStore>>, path: &std::path::Path) {
@@ -273,9 +322,11 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
     let gossip = data.signal_node.gossip.clone();
     let pending_pins = data.pending_pins.clone();
     let links = data.links.clone();
+    let connected = data.connected.clone();
     let signal_tx = data.signal_tx.clone();
     let store = data.store.clone();
     let store_path = data.store_path.clone();
+    let my_pin = pin.clone();
 
     tokio::spawn(async move {
         let pairing_sub = match gossip.subscribe(pairing_topic, vec![]).await {
@@ -287,6 +338,7 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
         };
         let (pair_sender, mut pair_receiver) = pairing_sub.split();
 
+        let mut wrong_attempts = 0u32;
         let result = tokio::time::timeout(PAIR_CODE_TTL, async {
             while let Some(event) = pair_receiver.next().await {
                 let Ok(Event::Received(msg)) = event else {
@@ -297,15 +349,21 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
                 else {
                     continue;
                 };
+                let app_id = msg.delivered_from;
 
-                let accepted = {
+                // This topic only ever accepts *its own* PIN (never an oracle for
+                // other users' codes), and only a few attempts.
+                let accepted = if received_pin.trim().eq_ignore_ascii_case(&my_pin) {
                     let mut pins = lock(&pending_pins);
-                    match pins.remove(&received_pin) {
+                    match pins.remove(&my_pin) {
                         Some(p) if p.created.elapsed() < PAIR_CODE_TTL => {
                             Some((p.topic, p.user_id))
                         }
                         _ => None,
                     }
+                } else {
+                    wrong_attempts += 1;
+                    None
                 };
 
                 match accepted {
@@ -317,12 +375,23 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
                         if let Ok(bytes) = accept.encode() {
                             let _ = pair_sender.broadcast_neighbors(bytes).await;
                         }
-                        match activate_link(&links, &signal_tx, &gossip, uid, topic).await {
+                                                match activate_link(
+                            &links,
+                            &connected,
+                            &signal_tx,
+                            &gossip,
+                            uid,
+                            topic,
+                            Some(app_id),
+                        )
+                        .await
+                        {
                             Ok(()) => {
                                 lock(&store).links.insert(
                                     uid.to_string(),
                                     BotLink {
                                         topic: *topic.as_bytes(),
+                                        app_id: Some(*app_id.as_bytes()),
                                     },
                                 );
                                 persist_store(&store, &store_path).await;
@@ -332,13 +401,18 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
                         }
                         return;
                     }
-                    None => {
-                        tracing::warn!("Invalid or expired pairing code");
+                                        None => {
+                        tracing::warn!(peer = %app_id.fmt_short(), "Invalid or expired pairing code ({wrong_attempts} wrong)");
                         let reject = PairSignal::PairRejected {
                             reason: "Invalid or expired code. Run /link again.".into(),
                         };
                         if let Ok(bytes) = reject.encode() {
                             let _ = pair_sender.broadcast_neighbors(bytes).await;
+                        }
+                        if wrong_attempts >= 3 {
+                            tracing::warn!("Too many wrong pairing attempts; closing pairing topic");
+                            lock(&pending_pins).remove(&my_pin);
+                            return;
                         }
                     }
                 }
@@ -366,7 +440,8 @@ async fn link(ctx: Context<'_>) -> Result<(), Error> {
 async fn unlink(ctx: Context<'_>) -> Result<(), Error> {
     let user_id = ctx.author().id;
     let data = ctx.data();
-    let existed = lock(&data.links).remove(&user_id).is_some();
+    let existed = lock(&data.links).remove(&user_id).is_some(); // Drop aborts the receiver
+    lock(&data.connected).remove(&user_id);
     lock(&data.store).links.remove(&user_id.to_string());
     persist_store(&data.store, &data.store_path).await;
     ctx.say(if existed {
@@ -610,10 +685,19 @@ async fn on_stream_start(
         ..
     } = setup;
 
-    let sender = lock(&data.links).get(&user_id).cloned();
+    let sender = sender_for(data, user_id);
     let Some(sender) = sender else {
         return update_message(ctx, c, "Your app isn't linked any more. Run `/link` again.").await;
     };
+    if !is_connected(data, user_id) {
+        return update_message(
+            ctx,
+            c,
+            "Meshcast isn't connected on your computer right now. Open the Meshcast window, \
+             wait for it to say *Connected*, then run `/stream` again.",
+        )
+        .await;
+    }
 
     let already_live = lock(&data.streams).contains_key(&user_id);
     if already_live {
@@ -715,14 +799,46 @@ async fn on_stream_start(
                 controller: None,
                 started_at: Timestamp::now(),
             };
-            let msg = channel_id
+            if let Err(e) = validate_ticket(&stream.ticket) {
+                tracing::warn!(user = %user_id, "App sent an invalid ticket: {e}");
+                let _ = sender
+                    .broadcast_neighbors(Signal::StopStream.encode()?)
+                    .await;
+                c.edit_response(
+                    ctx,
+                    EditInteractionResponse::new()
+                        .content("Your app sent an invalid stream ticket; stream stopped."),
+                )
+                .await?;
+                return Ok(());
+            }
+            let msg = match channel_id
                 .send_message(
                     ctx,
                     CreateMessage::new()
                         .embed(stream.embed())
                         .components(stream.components()),
                 )
-                .await?;
+                .await
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    // Don't leave the desktop capturing with no card and no Stop.
+                    tracing::warn!(user = %user_id, "Couldn't post stream card: {e}");
+                    let _ = sender
+                        .broadcast_neighbors(Signal::StopStream.encode()?)
+                        .await;
+                    c.edit_response(
+                        ctx,
+                        EditInteractionResponse::new().content(
+                            "I couldn't post the stream card in this channel (missing permission?). \
+                             Stream stopped — try in a channel where I can send messages and embeds.",
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
             stream.message_id = msg.id;
             lock(&data.streams).insert(user_id, stream);
             tracing::info!(user = %user_id, "Stream live: {title}");
@@ -745,10 +861,16 @@ async fn on_stream_start(
             .await?;
         }
         Outcome::Timeout => {
+            // Stop waiting *before* telling the app to stop, so a StreamReady that
+            // races in is treated as stray (and stopped) rather than expected.
+            drop(_unregister);
+            let _ = sender
+                .broadcast_neighbors(Signal::StopStream.encode()?)
+                .await;
             c.edit_response(
                 ctx,
                 EditInteractionResponse::new().content(
-                    "Your Meshcast app didn't respond. Make sure it's open and linked, then try again.",
+                    "Your Meshcast app didn't respond in time. Make sure it's open and says *Connected*, then try again.",
                 ),
             )
             .await?;
@@ -792,7 +914,7 @@ async fn on_control_request(
     if let Some((_, name)) = &stream.controller {
         return ephemeral(ctx, c, format!("{name} already has control.")).await;
     }
-    let viewer_sender = lock(&data.links).get(&viewer_id).cloned();
+    let viewer_sender = sender_for(data, viewer_id);
     let Some(viewer_sender) = viewer_sender else {
         return ephemeral(
             ctx,
@@ -801,10 +923,18 @@ async fn on_control_request(
         )
         .await;
     };
-    let streamer_sender = lock(&data.links).get(&streamer_id).cloned();
+    let streamer_sender = sender_for(data, streamer_id);
     let Some(streamer_sender) = streamer_sender else {
         return ephemeral(ctx, c, "The streamer's app isn't linked any more.").await;
     };
+    if !is_connected(data, viewer_id) {
+        return ephemeral(
+            ctx,
+            c,
+            "Meshcast isn't connected on your computer — open the Meshcast window first.",
+        )
+        .await;
+    }
 
     ephemeral(
         ctx,
@@ -963,7 +1093,7 @@ async fn on_revoke(
     if !has_controller {
         return ephemeral(ctx, c, "Nobody has control right now.").await;
     }
-    let sender = lock(&data.links).get(&streamer_id).cloned();
+    let sender = sender_for(data, streamer_id);
     ephemeral(ctx, c, "Revoking control…").await?;
     let mut rx = data.signal_tx.subscribe();
     if let Some(s) = sender {
@@ -1035,7 +1165,7 @@ async fn on_watch(
         return ephemeral(ctx, c, "That's your own stream 🙂").await;
     }
 
-    let sender = lock(&data.links).get(&viewer_id).cloned();
+    let sender = sender_for(data, viewer_id);
     let Some(sender) = sender else {
         return ephemeral(
             ctx,
@@ -1086,7 +1216,7 @@ async fn on_watch(
             None => 0,
         }
     };
-    let streamer_sender = lock(&data.links).get(&streamer_id).cloned();
+    let streamer_sender = sender_for(data, streamer_id);
     if let Some(ss) = streamer_sender {
         let _ = ss
             .broadcast_neighbors(Signal::ViewerUpdate { count }.encode()?)
@@ -1119,7 +1249,7 @@ async fn on_stop(
     if !is_live {
         return ephemeral(ctx, c, "This stream has already ended.").await;
     }
-    let sender = lock(&data.links).get(&streamer_id).cloned();
+    let sender = sender_for(data, streamer_id);
     let Some(sender) = sender else {
         // No link any more: at least tidy up the post.
         mark_stream_ended(&ctx.http, &data.streams, streamer_id).await;
@@ -1242,8 +1372,9 @@ async fn main() -> anyhow::Result<()> {
         signal_node.endpoint.id().fmt_short()
     );
 
-    let (signal_tx, _) = broadcast::channel(256);
-    let links: Arc<Mutex<HashMap<UserId, GossipSender>>> = Arc::new(Mutex::new(HashMap::new()));
+    let (signal_tx, _) = broadcast::channel(1024);
+    let links: Arc<Mutex<HashMap<UserId, UserLink>>> = Arc::new(Mutex::new(HashMap::new()));
+    let connected: Arc<Mutex<HashSet<UserId>>> = Arc::new(Mutex::new(HashSet::new()));
 
     // Restore saved links
     for (user_id_str, link) in &store.links {
@@ -1254,10 +1385,12 @@ async fn main() -> anyhow::Result<()> {
         let user_id = UserId::new(id);
         match activate_link(
             &links,
+            &connected,
             &signal_tx,
             &signal_node.gossip,
             user_id,
             link.topic_id(),
+            link.app_endpoint_id(),
         )
         .await
         {
@@ -1311,7 +1444,7 @@ async fn main() -> anyhow::Result<()> {
                             || lock(&streams).contains_key(&user_id);
                         if !waiting {
                             tracing::warn!(user = %user_id, "Late StreamReady with no pending start; stopping it");
-                            let sender = lock(&links).get(&user_id).cloned();
+                            let sender = lock(&links).get(&user_id).map(|l| l.sender.clone());
                             if let (Some(s), Ok(bytes)) = (sender, Signal::StopStream.encode()) {
                                 let _ = s.broadcast_neighbors(bytes).await;
                             }
@@ -1335,6 +1468,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(Data {
                     signal_node,
                     links,
+                    connected,
                     pending_pins: Arc::new(Mutex::new(HashMap::new())),
                     setups: Mutex::new(HashMap::new()),
                     streams,

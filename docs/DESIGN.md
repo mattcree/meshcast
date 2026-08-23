@@ -129,7 +129,7 @@ user      Discord         bot                                   daemon
 
 Remote control itself (input events) does not go over gossip — see `docs/REMOTE-CONTROL.md` for the direct control channel.
 
-The daemon only accepts messages whose gossip `delivered_from` is the bot's endpoint ID for that link. The bot does not verify app identity (the topic is the credential). All signals are idempotent or safely ignorable; duplicates do no harm.
+The daemon only accepts messages delivered *directly* (neighbours scope) by the bot's endpoint ID for that link; the bot only accepts messages delivered directly by the app endpoint it paired with (recorded at pairing; links made before 0.7 accept any sender on the topic until re-paired). Swarm-relayed messages are ignored on both sides, so knowing a topic is not enough to impersonate either party. All signals are idempotent or safely ignorable; duplicates do no harm. The daemon queues state-bearing signals while the bot is unreachable and flushes them on reconnect, and re-joins the bot with backoff (iroh-gossip does not retry bootstrap on its own).
 
 ### 4.4 Streaming and watching
 
@@ -144,7 +144,8 @@ Each viewer is a separate QUIC session to the streamer, so upload scales linearl
 
 - **Who can make my screen stream?** Only a bot I've paired with, and only after I click *Share Screen* in the app (plus the OS portal picker on Wayland). Requests expire after 90 s. Stream requests show the server name so a request from an unexpected server is obvious.
 - **Who can make my machine open a viewer?** Anyone who can click Watch in a channel where a paired bot posted a card. The viewer only ever connects to the ticket's endpoint and renders video; tickets are validated for character set and length before spawning, and viewer windows are capped at 5.
-- **Bot compromise** = ability to request streams (still gated by consent) and open viewers for linked users. Unlink in the app cuts this.
+- **Bot compromise** = ability to request streams (still gated by consent), open viewers for linked users, and — for a stream where the streamer clicked Allow on a forged control request — drive the desktop until revoked (see `docs/REMOTE-CONTROL.md`). Unlink in the app cuts this. Pairing PINs are checked only against the one pairing topic they belong to and the topic closes after 3 wrong attempts, so a `/link` holder can't probe other users' codes.
+- **Addresses**: stream tickets and control grants carry relay-only addresses, so a channel full of strangers doesn't learn the streamer's home IP; peers that actually connect still learn each other's addresses (inherent to P2P).
 - **Secrets on disk**: `config.toml` (link topics + daemon keys), bot `state.json` (bot key + topics), bot token env file. All written `0600`, atomically. Never log them.
 - **Discord-side abuse**: titles are sanitised and capped (80 chars); all bot state is per-user in memory; no privileged intents; no message content access.
 - Known gap: stream tickets are visible to anyone who can ask the bot for them (unlinked-viewer fallback), so "private" streams are as private as the channel. A role-gated Watch is on the backlog.

@@ -155,10 +155,15 @@ def show_app(_=None):
 
 
 def send_cmd(cmd):
+    """Write the command atomically (temp + rename, 0600) so the daemon never
+    reads a half-written file and other users can't read it."""
     try:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(CMD_PATH, "w") as f:
+        os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+        tmp = f"{CMD_PATH}.tmp-{os.getpid()}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(cmd)
+        os.replace(tmp, CMD_PATH)
     except OSError as e:
         print(f"meshcast-tray: failed to write command: {e}", file=sys.stderr)
 

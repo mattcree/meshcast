@@ -138,12 +138,20 @@ impl ScrollAccumulator {
 /// Events the server reports to the daemon loop.
 #[derive(Debug, Clone)]
 pub enum ServerEvent {
-    ControllerConnected { controller: String },
-    ControllerDisconnected { controller: String, reason: String },
+    ControllerConnected {
+        controller: String,
+        /// iroh endpoint id of the connected viewer (for the notification/log).
+        peer: String,
+    },
+    ControllerDisconnected {
+        controller: String,
+        reason: String,
+    },
 }
 
 struct Armed {
-    token: String,
+    /// One-time token; taken on the first successful `Hello`.
+    token: Option<String>,
     controller: String,
     injector: InjectorHandle,
 }
@@ -194,7 +202,7 @@ impl ControlServer {
         let old = {
             let mut st = lock(&self.state);
             st.armed = Some(Armed {
-                token,
+                token: Some(token),
                 controller,
                 injector,
             });
@@ -273,6 +281,8 @@ impl ControlServer {
         // Authorise (no awaits while the lock is held).
         enum Auth {
             NotArmed,
+            /// Token already consumed by an earlier connection (single use).
+            Used,
             BadToken,
             Ok {
                 controller: String,
@@ -282,24 +292,29 @@ impl ControlServer {
         }
         let auth = {
             let mut st = lock(&self.state);
-            match st.armed.as_ref() {
+            match st.armed.as_mut() {
                 None => Auth::NotArmed,
-                Some(armed)
-                    if !validate_token(&token)
-                        || !constant_time_eq(armed.token.as_bytes(), token.as_bytes()) =>
-                {
-                    Auth::BadToken
-                }
-                Some(armed) => {
-                    let controller = armed.controller.clone();
-                    let injector = armed.injector.clone();
-                    let replaced = st.active.replace(ActiveConn { conn: conn.clone() });
-                    Auth::Ok {
-                        controller,
-                        injector,
-                        replaced,
+                Some(armed) => match armed.token.as_deref() {
+                    None => Auth::Used,
+                    Some(expected)
+                        if !validate_token(&token)
+                            || !constant_time_eq(expected.as_bytes(), token.as_bytes()) =>
+                    {
+                        Auth::BadToken
                     }
-                }
+                    Some(_) => {
+                        // Consume: the token authorises exactly one connection.
+                        armed.token = None;
+                        let controller = armed.controller.clone();
+                        let injector = armed.injector.clone();
+                        let replaced = st.active.replace(ActiveConn { conn: conn.clone() });
+                        Auth::Ok {
+                            controller,
+                            injector,
+                            replaced,
+                        }
+                    }
+                },
             }
         };
         let (controller, injector, replaced) = match auth {
@@ -313,6 +328,17 @@ impl ControlServer {
                 .await
                 .ok();
                 anyhow::bail!("not armed");
+            }
+            Auth::Used => {
+                write_frame(
+                    &mut send,
+                    &ControlMsg::Denied {
+                        reason: "this grant was already used — ask for control again".into(),
+                    },
+                )
+                .await
+                .ok();
+                anyhow::bail!("token reuse from {}", remote.fmt_short());
             }
             Auth::BadToken => {
                 write_frame(
@@ -345,6 +371,7 @@ impl ControlServer {
         .await?;
         let _ = self.events.send(ServerEvent::ControllerConnected {
             controller: controller.clone(),
+            peer: remote.fmt_short().to_string(),
         });
         tracing::info!(controller = %controller, peer = %remote.fmt_short(), "Controller connected");
 
@@ -700,8 +727,8 @@ mod tests {
             ep_c.clone(),
             ControlGrant {
                 ticket: "t".into(),
-                token,
-                addr,
+                token: token.clone(),
+                addr: addr.clone(),
                 streamer: "S".into(),
             },
         );
@@ -748,6 +775,34 @@ mod tests {
         );
         let c = inj_rx.recv().await.unwrap();
         assert_eq!(c, InjectCmd::Text("hi".into()));
+
+        // The token is single use: a second Hello with it is refused.
+        let again = ControlClient::connect(
+            ep_c.clone(),
+            ControlGrant {
+                ticket: "t".into(),
+                token: token.clone(),
+                addr: addr.clone(),
+                streamer: "S".into(),
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match again.status() {
+                ClientStatus::Denied(_) | ClientStatus::Ended(_) => break,
+                _ if Instant::now() > deadline => panic!("reused token not refused"),
+                _ => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        assert!(
+            matches!(again.status(), ClientStatus::Denied(_)),
+            "{:?}",
+            again.status()
+        );
+        assert!(
+            good.is_active(),
+            "original controller must survive a reuse attempt"
+        );
 
         assert_eq!(server.disarm("test revoke"), Some("Tester".into()));
         // Server releases everything it thinks is held on disconnect.

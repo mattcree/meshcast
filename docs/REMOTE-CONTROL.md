@@ -32,10 +32,10 @@ One controller at a time; a new grant replaces the previous one. The streamer ke
 ### Trust model
 
 - Off by default, per stream; explicit approval of a named Discord user; OS-level portal consent on Wayland.
-- Token (32 random bytes, base32) is single-use, bound to the stream, known only to bot + both daemons; the control connection is QUIC/TLS; `Hello` must be the first message and arrive within 5 s.
+- Token (32 random bytes, base32) authorises exactly **one** connection: it is consumed by the first successful `Hello` (a second `Hello` with it is refused, and the live session is not disturbed); a new request is needed to reconnect. The control connection is QUIC/TLS; `Hello` must be the first message and arrive within 5 s. The streamer's log/notification names the connecting endpoint.
 - Visible state everywhere: card badge, app banner, tray tooltip/menu, viewer banner. Revoke is one click in three places.
 - Safety: all pressed keys/buttons released on any disconnect/revoke; event rate limited (~500 events/s, events beyond that dropped); a 10-minute idle auto-revoke; "mouse only for the first N seconds" is a backlog option.
-- A compromised bot could request control but not obtain it without the streamer clicking Allow.
+- Trust boundary, honestly: the token transits the bot, so a **compromised bot host** that also forges a `ControlRequest` under a friendly name could use the token itself once the streamer clicks Allow (it would then hold control until revoked — visible in card/app/tray). The consent prompt therefore names the requester; binding the grant to the viewer's endpoint id (so the bot can't substitute itself) is the next step. Addresses in grants are relay-only, so a grant doesn't disclose the streamer's IPs.
 
 ### Wire protocol (control channel)
 
