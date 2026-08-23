@@ -57,23 +57,25 @@ try {
     $zip = Join-Path $tmp $Asset
     Invoke-WebRequest -Uri "$base/$Asset" -OutFile $zip -UseBasicParsing
 
-    try {
-        $sums = Join-Path $tmp "SHA256SUMS"
-        Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile $sums -UseBasicParsing
-        $expected = (Get-Content $sums | Where-Object { $_ -match " $([regex]::Escape($Asset))$" }) -split "\s+" | Select-Object -First 1
-        $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-        if ($expected -and ($expected.ToLower() -ne $actual)) { throw "Checksum mismatch for $Asset" }
-        Write-Step "Checksum OK"
-    } catch {
-        if ($_.Exception.Message -like "Checksum mismatch*") { throw }
-        Write-Warning "No SHA256SUMS published for this release; skipping verification."
-    }
+    $sums = Join-Path $tmp "SHA256SUMS"
+    Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile $sums -UseBasicParsing
+    $expected = (Get-Content $sums | Where-Object { $_ -match ([regex]::Escape($Asset) + '$') }) -split "\s+" | Select-Object -First 1
+    if (-not $expected) { throw "SHA256SUMS has no entry for $Asset - refusing to install." }
+    $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+    if ($expected.ToLower() -ne $actual) { throw "Checksum mismatch for $Asset" }
+    Write-Step "Checksum verified"
 
     Write-Step "Installing to $InstallDir"
     Get-Process meshcast, meshcast-app -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Expand-Archive -Path $zip -DestinationPath $tmp -Force
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     Copy-Item (Join-Path $tmp "meshcast\*") $InstallDir -Recurse -Force
+
+    # Smoke test: fail loudly if the binary can't run on this machine.
+    $exeCheck = Join-Path $InstallDir "meshcast.exe"
+    $ver = (& $exeCheck --version 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw "The Meshcast binary won't run on this system: $ver" }
+    Write-Step "Installed $ver"
 
     # PATH
     $path = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -107,6 +109,7 @@ try {
     Write-Host ""
     Write-Host "Meshcast installed." -ForegroundColor Green
     Write-Host "  Next: in Discord type /link, then paste the code into the Meshcast window."
+    Write-Host "  (If Windows shows 'Windows protected your PC', click More info -> Run anyway — the binary is unsigned.)" -ForegroundColor DarkGray
     if (-not $NoLaunch) { Start-Process $app }
 }
 finally {

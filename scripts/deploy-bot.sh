@@ -139,12 +139,13 @@ if [ "$FROM_SOURCE" = 0 ]; then
     fi
     info "Downloading $ASSET ($VERSION)…"
     if curl -fsSL --retry 3 -o "$WORK/$ASSET" "$BASE/$ASSET"; then
-        if curl -fsSL --retry 3 -o "$WORK/SHA256SUMS" "$BASE/SHA256SUMS" 2>/dev/null; then
-            EXPECTED="$(grep " $ASSET\$" "$WORK/SHA256SUMS" | awk '{print $1}')"
-            ACTUAL="$(sha256sum "$WORK/$ASSET" | awk '{print $1}')"
-            [ -z "$EXPECTED" ] || [ "$EXPECTED" = "$ACTUAL" ] || die "Checksum mismatch for $ASSET"
-            info "Checksum OK"
-        fi
+                curl -fsSL --retry 3 -o "$WORK/SHA256SUMS" "$BASE/SHA256SUMS" 2>/dev/null \
+            || die "Couldn't fetch SHA256SUMS for $VERSION — refusing to install an unverified binary."
+        EXPECTED="$(awk -v a="$ASSET" '$2 == a || $2 == "*"a {print $1}' "$WORK/SHA256SUMS")"
+        [ -n "$EXPECTED" ] || die "SHA256SUMS has no entry for $ASSET — refusing to install."
+        ACTUAL="$(sha256sum "$WORK/$ASSET" | awk '{print $1}')"
+        [ "$EXPECTED" = "$ACTUAL" ] || die "Checksum mismatch for $ASSET"
+        info "Checksum verified"
         tar xzf "$WORK/$ASSET" -C "$WORK"
         install -m 0755 "$WORK/meshcast-bot/meshcast-bot" "$BIN_DIR/meshcast-bot"
     else

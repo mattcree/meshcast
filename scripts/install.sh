@@ -84,20 +84,17 @@ else
     info "Downloading $ASSET ($VERSION)…"
     curl -fsSL --retry 3 -o "$WORK/$ASSET" "$BASE/$ASSET" \
         || die "Download failed. Check https://github.com/$REPO/releases"
-    if curl -fsSL --retry 3 -o "$WORK/SHA256SUMS" "$BASE/SHA256SUMS" 2>/dev/null; then
-        EXPECTED="$(grep " $ASSET\$" "$WORK/SHA256SUMS" | awk '{print $1}')"
-        if command -v sha256sum >/dev/null 2>&1; then
-            ACTUAL="$(sha256sum "$WORK/$ASSET" | awk '{print $1}')"
-        else
-            ACTUAL="$(shasum -a 256 "$WORK/$ASSET" | awk '{print $1}')"
-        fi
-        if [ -n "$EXPECTED" ] && [ "$EXPECTED" != "$ACTUAL" ]; then
-            die "Checksum mismatch for $ASSET (expected $EXPECTED, got $ACTUAL)"
-        fi
-        info "Checksum OK"
+        curl -fsSL --retry 3 -o "$WORK/SHA256SUMS" "$BASE/SHA256SUMS" 2>/dev/null \
+        || die "Couldn't fetch SHA256SUMS for $VERSION — refusing to install an unverified download. Retry, or check the release page."
+    EXPECTED="$(awk -v a="$ASSET" '$2 == a || $2 == "*"a {print $1}' "$WORK/SHA256SUMS")"
+    [ -n "$EXPECTED" ] || die "SHA256SUMS has no entry for $ASSET — refusing to install."
+    if command -v sha256sum >/dev/null 2>&1; then
+        ACTUAL="$(sha256sum "$WORK/$ASSET" | awk '{print $1}')"
     else
-        warn "No SHA256SUMS published for this release; skipping verification."
+        ACTUAL="$(shasum -a 256 "$WORK/$ASSET" | awk '{print $1}')"
     fi
+    [ "$EXPECTED" = "$ACTUAL" ] || die "Checksum mismatch for $ASSET (expected $EXPECTED, got $ACTUAL)"
+    info "Checksum verified"
     tar xzf "$WORK/$ASSET" -C "$WORK"
     SRC_DIR="$WORK/meshcast"
 fi
