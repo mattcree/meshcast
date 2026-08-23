@@ -499,20 +499,13 @@ impl Default for VideoConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AudioConfig {
-    #[serde(default = "default_true")]
+    /// Capture the microphone. Off by default: a screen-share shouldn't
+    /// silently start broadcasting your mic, and desktop audio isn't captured
+    /// anyway (that's on the backlog).
+    #[serde(default)]
     pub enabled: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl Default for AudioConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
 }
 
 /// Remote-control settings.

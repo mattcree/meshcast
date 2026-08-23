@@ -200,13 +200,15 @@ async fn open_screen(
                 // Dialog cancelled / session failed → that *is* the answer; don't
                 // open a second screen-share dialog.
                 Err(inject_portal::PortalError::Failed(e)) => {
-                    return Err(e.context("Screen sharing (with remote control) failed"));
+                    return Err(e);
                 }
             }
         }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            let screen = open_capturer(fps).context("Failed to start screen capture")?;
+            let screen = open_capturer(fps).context(
+                "Couldn’t start screen capture (is xdg-desktop-portal / PipeWire running?)",
+            )?;
             return match inject_enigo::start() {
                 Ok(h) => Ok((Box::new(screen), Some(h), None)),
                 Err(e) => {
@@ -216,7 +218,8 @@ async fn open_screen(
             };
         }
     }
-    let screen = open_capturer(fps).context("Failed to start screen capture")?;
+    let screen = open_capturer(fps)
+        .context("Couldn’t start screen capture (is xdg-desktop-portal / PipeWire running?)")?;
     Ok((Box::new(screen), None, None))
 }
 
@@ -1015,6 +1018,7 @@ impl Session {
         }
     }
 
+    #[cfg_attr(target_os = "windows", allow(unreachable_code))]
     async fn handle_signal(&mut self, idx: usize, signal: Signal) {
         let link_name = self
             .links
@@ -1028,6 +1032,20 @@ impl Session {
                 fps,
                 server,
             } => {
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = (&title, &quality, &fps, &server);
+                    self.send_to(
+                        idx,
+                        Signal::StreamFailed {
+                            reason: "Streaming from Windows isn't supported yet (iroh-live has no                                      Windows capture) — you can still watch other people's streams."
+                                .into(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                #[cfg(not(target_os = "windows"))]
                 if self.active.is_some() {
                     tracing::warn!("StartStream while already streaming — rejecting");
                     self.send_to(

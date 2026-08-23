@@ -305,34 +305,57 @@ impl eframe::App for MeshcastApp {
                 // Consent dialog for an incoming stream request
                 if let Some(req) = &daemon.pending_request {
                     ui.group(|ui| {
-                        ui.label(egui::RichText::new("Stream request").color(YELLOW).heading());
-                        if !req.server.is_empty() {
-                            ui.label(
-                                egui::RichText::new(&req.server)
-                                    .color(egui::Color32::WHITE)
-                                    .strong(),
-                            );
-                        }
-                        ui.label(format!("\"{}\" — {} {}fps", req.title, req.quality, req.fps));
+                        ui.label(
+                            egui::RichText::new("Share your screen?")
+                                .color(YELLOW)
+                                .heading(),
+                        );
+                        let where_ = if req.server.is_empty() {
+                            "Discord".to_string()
+                        } else {
+                            req.server.clone()
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("You ran /stream in {where_}"))
+                                .color(LIGHT),
+                        );
+                        ui.label(format!("\u{201c}{}\u{201d} — {} {}fps", req.title, req.quality, req.fps));
                         ui.add_space(6.0);
-                        if ui
+                        ui.label(egui::RichText::new("Sharing:").color(LIGHT).small());
+                        ui.label("• Your screen (you'll pick which on the next dialog)");
+                        let mut config_changed = false;
+                        ui.horizontal(|ui| {
+                            config_changed |= ui
+                                .checkbox(&mut self.config.audio.enabled, "")
+                                .changed();
+                            ui.label("• Your microphone");
+                        });
+                        config_changed |= ui
                             .checkbox(
                                 &mut self.config.control.allow_requests,
-                                "Allow viewers to request remote control (you approve each one)",
+                                "Let viewers ask to control your screen (you approve each one)",
                             )
-                            .changed()
-                        {
-                            if let Err(e) = self.config.save_sync() {
-                                self.set_status(format!("Couldn't save config: {e}"));
+                            .changed();
+                        if config_changed {
+                            match self.config.save_sync() {
+                                // Reload so the daemon picks up the mic choice before Approve.
+                                Ok(()) => self.send(Command::Reload),
+                                Err(e) => self.set_status(format!("Couldn't save config: {e}")),
                             }
                         }
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("Approve within about 90 seconds.")
+                                .color(MUTED)
+                                .small(),
+                        );
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             let approve = ui
                                 .add_sized(
                                     [130.0, 32.0],
                                     egui::Button::new(
-                                        egui::RichText::new("Share Screen")
+                                        egui::RichText::new("Start sharing")
                                             .color(egui::Color32::WHITE),
                                     )
                                     .fill(BLURPLE),
@@ -341,7 +364,7 @@ impl eframe::App for MeshcastApp {
                             let reject = ui
                                 .add_sized(
                                     [110.0, 32.0],
-                                    egui::Button::new("Decline")
+                                    egui::Button::new("Not now")
                                         .fill(egui::Color32::from_rgb(55, 57, 63)),
                                 )
                                 .clicked();

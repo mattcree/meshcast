@@ -6,6 +6,15 @@ All notable changes to Meshcast. Format follows [Keep a Changelog](https://keepa
 
 Hardening rounds 1–3 (see `docs/HARDENING-PLAN.md`, batches A–C).
 
+### Product / UX
+- Stream card is now two rows: **Watch** / **Request control** / **Open in app** for viewers, **End stream** / **Revoke control** for the streamer — Watch is no longer sitting next to a Stop that scolds most clickers. "Stop" is "End stream" everywhere.
+- Consent dialog rewritten: "You ran /stream in <server>", an explicit "Sharing: your screen • your microphone" with the **mic toggle inline**, the remote-control opt-in, and an "approve within ~90 s" note. Buttons are **Start sharing** / **Not now**.
+- **Microphone is now off by default** (a screen-share shouldn't silently broadcast your mic; desktop audio isn't captured yet anyway).
+- Windows: `/stream` fails fast with "streaming from Windows isn't supported yet — you can still watch" instead of four steps to a capture error.
+- `/link` when already linked explains that one link covers every server the bot is in (no more dead per-server entries).
+- Remote-control requests name the viewer as "Display Name (@username)" (harder to spoof); capture-failure copy points at the real cause.
+- "Open in app" page is platform-aware: a Copy-command button on macOS (no `meshcast://` there yet), a browser-prompt hint on Linux/Windows.
+
 ### Performance
 - Hardware H.264 encoding (VAAPI on Linux, VideoToolbox on macOS) when a usable device is present, probed with a graceful fall back to software openh264. New `video.codec` setting: `auto` (default), `h264`, `h264-vaapi`, `h264-vtb`. The encoder in use is logged.
 - Fixed: a 60 fps stream *without* remote control was actually captured at 30 fps (`ScreenCapturer::new()` pinned 30) — capture now uses the requested rate.

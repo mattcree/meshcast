@@ -103,34 +103,37 @@ impl ActiveStream {
 
     fn components(&self) -> Vec<CreateActionRow> {
         let id = self.streamer;
-        let mut buttons = vec![
-            CreateButton::new(format!("watch:{id}"))
-                .label("Watch")
-                .style(ButtonStyle::Primary),
-            CreateButton::new(format!("stop:{id}"))
-                .label("Stop")
-                .style(ButtonStyle::Secondary),
-        ];
-        if self.controller.is_some() {
-            buttons.push(
-                CreateButton::new(format!("revoke:{id}"))
-                    .label("Revoke control")
-                    .style(ButtonStyle::Danger),
-            );
-        } else if self.control_available {
-            buttons.push(
+        // Row 1 — what a viewer wants: watch, maybe ask for control, open in app.
+        let mut viewer_row = vec![CreateButton::new(format!("watch:{id}"))
+            .label("Watch")
+            .style(ButtonStyle::Primary)];
+        if self.controller.is_none() && self.control_available {
+            viewer_row.push(
                 CreateButton::new(format!("control:{id}"))
                     .label("Request control")
                     .style(ButtonStyle::Secondary),
             );
         }
-        // Direct link for people who have the app but haven't linked (or can't).
         let watch_url = format!("{WATCH_PAGE_URL}#{}", self.ticket);
         if watch_url.len() <= 512 {
-            buttons.push(CreateButton::new_link(watch_url).label("Open in app"));
+            viewer_row.push(CreateButton::new_link(watch_url).label("Open in app"));
         }
-        buttons.push(CreateButton::new_link(DOWNLOAD_URL).label("Get Meshcast"));
-        vec![CreateActionRow::Buttons(buttons)]
+        // Row 2 — streamer/meta controls, kept away from the Watch button.
+        let mut owner_row = vec![CreateButton::new(format!("stop:{id}"))
+            .label("End stream")
+            .style(ButtonStyle::Danger)];
+        if self.controller.is_some() {
+            owner_row.push(
+                CreateButton::new(format!("revoke:{id}"))
+                    .label("Revoke control")
+                    .style(ButtonStyle::Secondary),
+            );
+        }
+        owner_row.push(CreateButton::new_link(DOWNLOAD_URL).label("Get Meshcast"));
+        vec![
+            CreateActionRow::Buttons(viewer_row),
+            CreateActionRow::Buttons(owner_row),
+        ]
     }
 }
 
@@ -295,6 +298,13 @@ async fn persist_store(store: &Arc<Mutex<BotLinkStore>>, path: &std::path::Path)
 async fn link(ctx: Context<'_>) -> Result<(), Error> {
     let user_id = ctx.author().id;
     let data = ctx.data();
+    if lock(&data.links).contains_key(&user_id) {
+        ctx.say(
+            "You're already linked — one link works in **every** server this bot is in,              so you don't need to /link again per server. To re-pair (e.g. a new computer),              run `/unlink` first.",
+        )
+        .await?;
+        return Ok(());
+    }
     let server_name = ctx
         .guild()
         .map(|g| g.name.clone())
@@ -488,7 +498,7 @@ async fn stream(
     let active = lock(&data.streams).get(&user_id).cloned();
     if let Some(active) = active {
         let stop_btn = CreateButton::new(format!("stop:{user_id}"))
-            .label("Stop Stream")
+            .label("End stream")
             .style(ButtonStyle::Danger);
         ctx.send(
             poise::CreateReply::default()
@@ -890,11 +900,10 @@ async fn on_control_request(
         return ephemeral(ctx, c, "This stream post is no longer valid.").await;
     };
     let viewer_id = c.user.id;
-    let viewer_name = c
-        .user
-        .global_name
-        .clone()
-        .unwrap_or_else(|| c.user.name.clone());
+    let viewer_name = match &c.user.global_name {
+        Some(display) => format!("{display} (@{})", c.user.name),
+        None => format!("@{}", c.user.name),
+    };
 
     let stream = lock(&data.streams).get(&streamer_id).cloned();
     let Some(stream) = stream else {

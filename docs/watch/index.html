@@ -64,9 +64,34 @@
   var uri = 'meshcast://watch/' + raw;
   open.href = uri;
   cmd.textContent = 'meshcast watch ' + raw;
+
+  var ua = navigator.userAgent || '';
+  var isMac = /Mac/i.test(ua) && !/iPhone|iPad/i.test(ua);
+  var isWin = /Windows/i.test(ua);
+
+  if (isMac) {
+    // macOS can't register the meshcast:// scheme yet (needs an .app bundle),
+    // so don't pretend — hand them the command with a Copy button.
+    status.textContent = "On macOS, open the stream from a terminal:";
+    open.textContent = 'Copy command';
+    open.href = '#';
+    open.addEventListener('click', function (e) {
+      e.preventDefault();
+      navigator.clipboard && navigator.clipboard.writeText('meshcast watch ' + raw);
+      open.textContent = 'Copied ✓';
+      setTimeout(function () { open.textContent = 'Copy command'; }, 1500);
+    });
+    // Show the manual section expanded.
+    var det = cmd.closest('details'); if (det) det.open = true;
+    return;
+  }
+
+  status.textContent = isWin
+    ? 'Opening Meshcast… your browser may ask permission — click Open.'
+    : 'Opening Meshcast… allow your browser to open the Meshcast Viewer.';
   // Try the protocol handler straight away; leave the button for retries.
   var t = setTimeout(function () {
-    status.textContent = 'If Meshcast did not open, use the button below.';
+    status.textContent = "If Meshcast didn't open, click the button below (install it first if you haven't).";
   }, 1500);
   try { location.href = uri; } catch (e) { clearTimeout(t); }
 })();
