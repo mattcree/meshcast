@@ -110,7 +110,7 @@ Config lives in `~/.config/meshcast/config.toml` (Linux), `~/Library/Application
 [video]
 quality = "720p"   # 360p, 720p, 1080p  (per-stream choice in /stream overrides this)
 fps = 30           # 30 or 60
-codec = "h264"
+codec = "auto"    # auto (hardware if available, else software) · h264 · h264-vaapi · h264-vtb
 
 [audio]
 enabled = true     # microphone. Desktop audio capture is on the backlog.

@@ -152,7 +152,19 @@ Each viewer is a separate QUIC session to the streamer, so upload scales linearl
 
 ## 6. Scaling to more viewers
 
-P2P means every viewer costs the streamer one copy of the stream (~3 Mbit/s at 720p30, ~8–10 Mbit/s at 1080p60). Two to four viewers is fine on typical home upload. Beyond that, the answer is a fan-out relay (iroh-live ships `irl relay`): the streamer publishes once to the relay, viewers subscribe to the relay. The relay must have its own upstream bandwidth (a VPS, not the homelab on the same home connection). Integrating "publish via relay" into `/stream` is a backlog item; nothing in the protocol needs to change for it (the ticket would simply point at the relay).
+P2P means every viewer costs the streamer one copy of the stream. iroh-live's default bitrate is `pixels × 0.07 × (30 + (fps−30)/2)`, so per viewer (video + 128 kbit/s audio, ~10 % transport/keyframe overhead):
+
+| Preset | ≈ upload / viewer | Viewers on a 10 Mbit/s upload |
+|---|---|---|
+| 360p30 | ~0.6 Mbit/s | many |
+| **720p30 (default)** | ~2.5 Mbit/s | 3–4 |
+| 720p60 | ~4 Mbit/s | 2 |
+| 1080p30 | ~5 Mbit/s | 1–2 |
+| 1080p60 | ~7–8 Mbit/s | 1 |
+
+So 1080p60 is effectively a one-viewer preset on a typical home upload; a friends-server audience of 4–8 wants 720p30. Encoding is hardware (VAAPI on Linux, VideoToolbox on macOS) when a usable device is present — `video.codec = auto` (default; also `h264` to force software, `h264-vaapi`/`h264-vtb` to force hardware) — otherwise software openh264, which is ~1–1.5 CPU cores at 1080p and marginal at 1080p60.
+
+Beyond a handful of viewers the answer is a fan-out relay (iroh-live ships `irl relay`): the streamer publishes once to the relay, viewers subscribe to the relay, and upload stays constant. The relay needs its own upstream bandwidth (a VPS, not the homelab on the same home connection). Integrating "publish via relay" into `/stream` is a backlog item; nothing in the protocol needs to change (the ticket would point at the relay).
 
 ## 7. Failure modes and what happens
 

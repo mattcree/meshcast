@@ -30,14 +30,18 @@ use meshcast_signal::{
     DaemonState, DeliveryScope, EndpointId, Event, GossipSender, LinkConfig, LinkState, PairCode,
     PairSignal, ServerLink, Signal, SignalNode, StreamRequest, TopicId,
 };
-use moq_media::capture::ScreenCapturer;
+use moq_media::capture::{ScreenCapturer, ScreenConfig};
 use moq_media::codec::h264::H264Encoder;
+#[cfg(target_os = "linux")]
+use moq_media::codec::VaapiEncoder;
+#[cfg(target_os = "macos")]
+use moq_media::codec::VtbEncoder;
 use moq_media::codec::{AudioCodec, VideoCodec};
 use moq_media::format::{
     AudioPreset, DecoderBackend, PlaybackConfig, VideoEncoderConfig, VideoPreset,
 };
 use moq_media::publish::{LocalBroadcast, VideoRenditions};
-use moq_media::traits::VideoEncoderFactory;
+use moq_media::traits::{VideoEncoderFactory, VideoSource};
 use moq_media::AudioBackend;
 use tokio::sync::{mpsc, oneshot};
 
@@ -202,7 +206,7 @@ async fn open_screen(
         }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            let screen = ScreenCapturer::new().context("Failed to start screen capture")?;
+            let screen = open_capturer(fps).context("Failed to start screen capture")?;
             return match inject_enigo::start() {
                 Ok(h) => Ok((Box::new(screen), Some(h), None)),
                 Err(e) => {
@@ -212,10 +216,97 @@ async fn open_screen(
             };
         }
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = fps;
-    let screen = ScreenCapturer::new().context("Failed to start screen capture")?;
+    let screen = open_capturer(fps).context("Failed to start screen capture")?;
     Ok((Box::new(screen), None, None))
+}
+
+/// Open the default screen at the requested frame rate. `ScreenCapturer::new()`
+/// pins 30 fps, so a "60 fps" stream without remote control was actually
+/// captured at 30 — pass the fps through explicitly.
+fn open_capturer(fps: u32) -> Result<ScreenCapturer> {
+    let config = ScreenConfig {
+        target_fps: Some(fps as f32),
+        ..Default::default()
+    };
+    ScreenCapturer::open(None, None, &config)
+}
+
+/// Which H.264 encoder to use. `auto` prefers hardware (VAAPI/VideoToolbox)
+/// when a device is actually usable, else software openh264.
+#[derive(Clone, Copy)]
+enum Encoder {
+    Openh264,
+    #[cfg(target_os = "linux")]
+    Vaapi,
+    #[cfg(target_os = "macos")]
+    Vtb,
+}
+
+impl Encoder {
+    fn label(self) -> &'static str {
+        match self {
+            Encoder::Openh264 => "openh264 (software)",
+            #[cfg(target_os = "linux")]
+            Encoder::Vaapi => "VAAPI (hardware)",
+            #[cfg(target_os = "macos")]
+            Encoder::Vtb => "VideoToolbox (hardware)",
+        }
+    }
+}
+
+/// Resolve the config's `codec` setting to an encoder that can actually be
+/// constructed on this machine (probes the hardware encoder and falls back).
+fn resolve_encoder(setting: &str, preset: VideoPreset, fps: u32) -> Encoder {
+    let _probe = VideoEncoderConfig::from_preset(preset).framerate(fps);
+    let _setting = setting.trim().to_ascii_lowercase();
+    let _want_hw = matches!(_setting.as_str(), "auto" | "" | "hardware");
+
+    #[cfg(target_os = "linux")]
+    if _want_hw || _setting == "h264-vaapi" || _setting == "vaapi" {
+        match VaapiEncoder::with_config(_probe.clone()) {
+            Ok(_) => return Encoder::Vaapi,
+            Err(e) if !_want_hw => {
+                tracing::warn!("VAAPI requested but unavailable ({e}); using software");
+            }
+            Err(e) => tracing::info!("No usable VAAPI encoder ({e}); using software"),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if _want_hw || _setting == "h264-vtb" || _setting == "videotoolbox" {
+        match VtbEncoder::with_config(_probe.clone()) {
+            Ok(_) => return Encoder::Vtb,
+            Err(e) if !_want_hw => {
+                tracing::warn!("VideoToolbox requested but unavailable ({e}); using software");
+            }
+            Err(e) => tracing::info!("No usable VideoToolbox encoder ({e}); using software"),
+        }
+    }
+    Encoder::Openh264
+}
+
+/// Build a single rendition for the chosen encoder at the given quality/fps.
+fn build_renditions(
+    screen: Box<dyn VideoSource>,
+    enc: Encoder,
+    quality: &str,
+    preset: VideoPreset,
+    fps: u32,
+) -> VideoRenditions {
+    fn add<E: VideoEncoderFactory>(r: &mut VideoRenditions, name: String, cfg: VideoEncoderConfig) {
+        let track = E::config_for(&cfg);
+        r.add_with_callback(name, track.into(), move || E::with_config(cfg.clone()));
+    }
+    let cfg = VideoEncoderConfig::from_preset(preset).framerate(fps);
+    let mut r = VideoRenditions::empty(screen);
+    let name = format!("video/{quality}-{fps}fps");
+    match enc {
+        Encoder::Openh264 => add::<H264Encoder>(&mut r, name, cfg),
+        #[cfg(target_os = "linux")]
+        Encoder::Vaapi => add::<VaapiEncoder>(&mut r, name, cfg),
+        #[cfg(target_os = "macos")]
+        Encoder::Vtb => add::<VtbEncoder>(&mut r, name, cfg),
+    }
+    r
 }
 
 /// Start screen capture + publish. Returns the live handle and ticket.
@@ -225,6 +316,7 @@ async fn start_stream(
     fps: u32,
     audio: bool,
     control: bool,
+    codec: &str,
 ) -> Result<ActiveStream> {
     let quality = normalize_quality(quality);
     let fps = normalize_fps(fps);
@@ -244,27 +336,15 @@ async fn start_stream(
         _ => VideoPreset::P720,
     };
 
-    if fps == meshcast_signal::DEFAULT_FPS {
-        broadcast
-            .video()
-            .set_source(screen, VideoCodec::H264, [preset])
-            .context("Failed to set video source")?;
-    } else {
-        // Custom FPS: build the rendition manually so we can set the framerate.
-        let enc_config = VideoEncoderConfig::from_preset(preset).framerate(fps);
-        let video_config = H264Encoder::config_for(&enc_config);
-        let mut renditions = VideoRenditions::empty(screen);
-        renditions.add_with_callback(
-            format!("video/h264-openh264-{quality}-{fps}fps"),
-            video_config.into(),
-            move || H264Encoder::with_config(enc_config.clone()),
-        );
-        broadcast
-            .video()
-            .set(renditions)
-            .context("Failed to set video source")?;
-    }
-    tracing::info!("Screen capture started ({quality} {fps}fps)");
+    let enc = resolve_encoder(codec, preset, fps);
+    let renditions = build_renditions(screen, enc, quality, preset, fps);
+    broadcast
+        .video()
+        .set(renditions)
+        .context("Failed to set video source")?;
+    tracing::info!("Streaming {quality} {fps}fps via {}", enc.label());
+    // Keep VideoCodec imported (used by tests / manual paths).
+    let _ = VideoCodec::H264;
 
     if audio {
         let audio_backend = AudioBackend::default();
@@ -313,7 +393,7 @@ async fn cmd_stream(name: String, no_audio: bool, quality: String, fps: u32) -> 
     } else {
         name
     };
-    let stream = start_stream(&name, &quality, fps, !no_audio, false).await?;
+    let stream = start_stream(&name, &quality, fps, !no_audio, false, "auto").await?;
 
     println!("\nStreaming! Share this ticket to let others watch:\n");
     println!("  {}\n", stream.ticket);
@@ -848,7 +928,8 @@ impl Session {
             self.stop_stream("replaced").await;
         }
         let audio = self.config.audio.enabled;
-        match start_stream("meshcast", &req.quality, req.fps, audio, control).await {
+        let codec = self.config.video.codec.clone();
+        match start_stream("meshcast", &req.quality, req.fps, audio, control, &codec).await {
             Ok(stream) => {
                 tracing::info!("Streaming ({} chars ticket)", stream.ticket.len());
                 self.send_to(
@@ -1515,8 +1596,15 @@ fn cmd_watch(raw: String, rt: &tokio::runtime::Runtime) -> Result<()> {
         .context("Failed to subscribe to stream")?;
 
         let audio_backend = AudioBackend::default();
+        // Prefer hardware decode; iroh-live falls back to software internally.
+        // Force software with MESHCAST_SW_DECODE=1 if a GPU misbehaves.
+        let backend = if std::env::var_os("MESHCAST_SW_DECODE").is_some() {
+            DecoderBackend::Software
+        } else {
+            DecoderBackend::Auto
+        };
         let playback_config = PlaybackConfig {
-            backend: DecoderBackend::Software,
+            backend,
             ..Default::default()
         };
         let tracks = sub
@@ -1632,7 +1720,13 @@ impl eframe::App for WatchApp {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         use eframe::egui;
 
-        ctx.request_repaint_after(Duration::from_millis(16));
+        // While live, repaint fast enough to display the stream; once it's ended
+        // there's nothing to draw, so stop spinning the CPU/GPU at 60 Hz.
+        ctx.request_repaint_after(Duration::from_millis(if self.stream_ended {
+            500
+        } else {
+            16
+        }));
 
         // Detect stream end
         if !self.stream_ended && self.broadcast.shutdown_token().is_cancelled() {
@@ -1912,11 +2006,15 @@ mod viewer {
             if !self.active() {
                 return;
             }
-            let events = ctx.input(|i| i.events.clone());
-            let mods = ctx.input(|i| i.modifiers);
+            let (events, mods) = ctx.input(|i| (i.events.clone(), i.modifiers));
             let Some(client) = self.client.clone() else {
                 return;
             };
+            // winit can deliver many PointerMoved per frame (1000 Hz mice); only
+            // the final position matters, so forward just the last one.
+            let last_move = events
+                .iter()
+                .rposition(|e| matches!(e, egui::Event::PointerMoved(_)));
 
             // Hotkeys are handled even when paused.
             for ev in &events {
@@ -1971,10 +2069,10 @@ mod viewer {
                 Some((x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)))
             };
 
-            for ev in events {
+            for (i, ev) in events.iter().cloned().enumerate() {
                 match ev {
                     egui::Event::PointerMoved(pos) => {
-                        if video_rect.contains(pos) {
+                        if Some(i) == last_move && video_rect.contains(pos) {
                             if let Some((x, y)) = norm(pos) {
                                 client.send(ControlMsg::PointerMove { x, y });
                             }

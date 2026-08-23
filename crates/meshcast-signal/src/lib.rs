@@ -485,7 +485,8 @@ fn default_fps() -> u32 {
     DEFAULT_FPS
 }
 fn default_codec() -> String {
-    "h264".into()
+    // "auto" = prefer hardware (VAAPI/VideoToolbox) when usable, else openh264.
+    "auto".into()
 }
 
 impl Default for VideoConfig {

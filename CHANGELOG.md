@@ -4,7 +4,16 @@ All notable changes to Meshcast. Format follows [Keep a Changelog](https://keepa
 
 ## [Unreleased]
 
-Hardening round 1 (see `docs/HARDENING-PLAN.md`, Batch A).
+Hardening rounds 1–3 (see `docs/HARDENING-PLAN.md`, batches A–C).
+
+### Performance
+- Hardware H.264 encoding (VAAPI on Linux, VideoToolbox on macOS) when a usable device is present, probed with a graceful fall back to software openh264. New `video.codec` setting: `auto` (default), `h264`, `h264-vaapi`, `h264-vtb`. The encoder in use is logged.
+- Fixed: a 60 fps stream *without* remote control was actually captured at 30 fps (`ScreenCapturer::new()` pinned 30) — capture now uses the requested rate.
+- Viewer decode defaults to `Auto` (hardware where available; `MESHCAST_SW_DECODE=1` forces software).
+- Remote control: the viewer coalesces pointer moves to one per frame and the streamer collapses queued moves, cutting the D-Bus/portal round trips under a fast mouse from ~1000/s to tens/s.
+- The viewer window stops repainting at 60 Hz once the stream has ended.
+- `docs/DESIGN.md` §6 bandwidth table corrected to the real bitrate formula (720p30 ≈ 2.5, 1080p60 ≈ 7–8 Mbit/s per viewer).
+
 
 ### Fixed
 - **Daemon re-joins the bot** after a bot restart, a network partition, or starting while the bot is down (iroh-gossip never retries bootstrap on its own); ended subscriptions are re-subscribed with backoff. Signals emitted while the bot is unreachable are queued and flushed on reconnect instead of being silently dropped.

@@ -182,11 +182,18 @@ async fn inject_loop(
     let mut held = HeldState::default();
     let mut scroll = ScrollAccumulator::default();
     loop {
-        let cmd = tokio::select! {
+        let mut cmd = tokio::select! {
             biased;
             _ = &mut shutdown => break,
             cmd = rx.recv() => match cmd { Some(c) => c, None => break },
         };
+        // Collapse a burst of pointer moves to the most recent — one D-Bus
+        // round trip instead of dozens.
+        if matches!(cmd, InjectCmd::Move { .. }) {
+            while let Ok(next @ InjectCmd::Move { .. }) = rx.try_recv() {
+                cmd = next;
+            }
+        }
         let res: ashpd::Result<()> = match cmd {
             InjectCmd::Move { x, y } => {
                 rd.notify_pointer_motion_absolute(
