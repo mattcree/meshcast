@@ -4,7 +4,9 @@ All notable changes to Meshcast. Format follows [Keep a Changelog](https://keepa
 
 ## [Unreleased]
 
-Hardening rounds 1–3 (see `docs/HARDENING-PLAN.md`, batches A–C).
+## [0.7.0] - 2026-08-23
+
+Production-hardening release: a six-lens review (security, reliability, operability, performance, UX, code quality) drove batches A–D plus supply-chain fixes — see `docs/HARDENING-PLAN.md`. Highlights: the daemon now re-joins the bot after any disconnect (was "Waiting for bot…" forever), the pairing PIN oracle and reusable control token are closed, streams use hardware H.264 when available, there are real log files, and the stream card / consent dialog are much clearer. Pairing needs both sides ≥ 0.5; steady-state signalling stays compatible one minor version back.
 
 ### Product / UX
 - Stream card is now two rows: **Watch** / **Request control** / **Open in app** for viewers, **End stream** / **Revoke control** for the streamer — Watch is no longer sitting next to a Stop that scolds most clickers. "Stop" is "End stream" everywhere.
@@ -114,7 +116,8 @@ Hardening and "ready to install" release. Bot and app from this version remain c
 ## [0.1.0] - 2026-04-06
 - First working end-to-end: bot `/link` + `/stream`, gossip signalling, egui viewer, GitHub Releases.
 
-[Unreleased]: https://github.com/mattcree/meshcast/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/mattcree/meshcast/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/mattcree/meshcast/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/mattcree/meshcast/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mattcree/meshcast/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mattcree/meshcast/compare/v0.3.1...v0.4.0
