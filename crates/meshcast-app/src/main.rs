@@ -29,12 +29,7 @@ const MUTED: egui::Color32 = egui::Color32::from_rgb(148, 155, 164);
 const LIGHT: egui::Color32 = egui::Color32::from_rgb(185, 187, 190);
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "meshcast_app=info".into()),
-        )
-        .init();
+    meshcast_signal::telemetry::init("app");
 
     #[cfg(unix)]
     install_sigusr1_handler();
@@ -192,11 +187,20 @@ impl eframe::App for MeshcastApp {
         egui::CentralPanel::default()
             .frame(panel_frame)
             .show(ctx, |ui| {
-                ui.heading(
-                    egui::RichText::new("Meshcast")
-                        .color(egui::Color32::WHITE)
-                        .strong(),
-                );
+                ui.horizontal(|ui| {
+                    ui.heading(
+                        egui::RichText::new("Meshcast")
+                            .color(egui::Color32::WHITE)
+                            .strong(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("v{}", meshcast_signal::VERSION))
+                                .small()
+                                .color(MUTED),
+                        );
+                    });
+                });
                 ui.add_space(4.0);
 
                 // Status pill

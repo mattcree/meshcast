@@ -29,6 +29,12 @@ pub use iroh_gossip::proto::{DeliveryScope, TopicId};
 pub mod control;
 pub mod ipc;
 pub mod process;
+pub mod telemetry;
+
+pub use telemetry::VERSION;
+
+/// Protocol capabilities this build understands (sent in [`Signal::Hello`]).
+pub const CAPABILITIES: &[&str] = &["control"];
 
 // ---------------------------------------------------------------------------
 // Gossip protocol
@@ -99,6 +105,13 @@ pub enum Signal {
     ControlAvailable {
         available: bool,
     },
+    /// Both directions on `NeighborUp`: announce version + capabilities so the
+    /// peer can adapt (e.g. hide "Request control" for apps that don't support
+    /// it) instead of silently dropping unknown signals.
+    Hello {
+        version: String,
+        features: Vec<String>,
+    },
 }
 
 impl Signal {
@@ -121,6 +134,7 @@ impl Signal {
             Signal::ControlRevoked => "ControlRevoked",
             Signal::RevokeControl => "RevokeControl",
             Signal::ControlAvailable { .. } => "ControlAvailable",
+            Signal::Hello { .. } => "Hello",
         }
     }
 
@@ -238,6 +252,15 @@ pub struct DaemonState {
     /// Display name of the viewer currently controlling, if any.
     #[serde(default)]
     pub controller: Option<String>,
+    /// Unix seconds when `error` was set (so the app can age it out).
+    #[serde(default)]
+    pub error_at: Option<u64>,
+    /// Version reported by the bot on the primary link, if seen.
+    #[serde(default)]
+    pub bot_version: Option<String>,
+    /// This build's version (so the app footer/status don't need their own).
+    #[serde(default)]
+    pub version: String,
 }
 
 /// A remote-control request awaiting the streamer's decision.
@@ -614,7 +637,13 @@ impl AppConfig {
     pub fn load_sync() -> Result<Self> {
         let path = Self::config_path();
         match std::fs::read_to_string(&path) {
-            Ok(data) => Self::from_toml(&data),
+            Ok(data) => Self::from_toml(&data).inspect_err(|e| {
+                // Don't silently fall back to defaults over a hand-edited file
+                // (the next save would wipe the links): back it up and warn.
+                let backup = path.with_extension(format!("toml.broken-{}", std::process::id()));
+                let _ = std::fs::rename(&path, &backup);
+                tracing::error!("Config unreadable ({e}); backed up to {}", backup.display());
+            }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).context("Failed to read config"),
         }
@@ -883,6 +912,17 @@ mod tests {
                 .unwrap()
                 .as_ref(),
             &[15, 1]
+        );
+        // Hello = variant 16, then empty string (len 0) + empty vec (len 0).
+        assert_eq!(
+            Signal::Hello {
+                version: String::new(),
+                features: Vec::new()
+            }
+            .encode()
+            .unwrap()
+            .as_ref(),
+            &[16, 0, 0]
         );
         // PairSignal indices.
         assert_eq!(

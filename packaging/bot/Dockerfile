@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && useradd --system --create-home --home-dir /data --shell /usr/sbin/nologin meshcast
 COPY --from=build /src/target/release/meshcast-bot /usr/local/bin/meshcast-bot
 ENV MESHCAST_BOT_STATE_DIR=/data \
-    RUST_LOG=meshcast_bot=info,iroh=warn
+    RUST_LOG=warn,meshcast_bot=info,meshcast_signal=info
 USER meshcast
 VOLUME ["/data"]
 ENTRYPOINT ["/usr/local/bin/meshcast-bot"]

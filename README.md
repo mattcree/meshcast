@@ -142,12 +142,25 @@ meshcast unlink [--name "My Server"]
 
 Viewers don't need anything besides the app; decoding is software H.264 and rendering is wgpu.
 
+### Linux runtime requirements
+
+Prebuilt Linux binaries are built on Ubuntu 24.04, so they need **glibc ≥ 2.39** (Ubuntu 24.04+, Fedora 40+, Debian 13+) and these shared libraries at runtime:
+
+```bash
+# Fedora / Bluefin
+sudo dnf install pipewire-libs libva alsa-lib libdrm mesa-libgbm
+# Debian / Ubuntu
+sudo apt install libpipewire-0.3-0 libva2 libva-drm2 libasound2 libdrm2 libgbm1
+```
+
+`install.sh` runs `meshcast --version` after installing and tells you if a library is missing. On an older distro, build from source instead (see [Building](#building-from-source)).
+
 ## Troubleshooting
 
 - **"Your Meshcast app didn't respond"** — the daemon isn't running or isn't connected. Open the Meshcast window: the status pill should say *Connected*. If it says *Daemon not running*, click *Start daemon*; if *Waiting for bot…*, the bot is down or unreachable.
 - **Tray icon missing on GNOME** — install the AppIndicator extension. The app and daemon work without the tray.
 - **Watch does nothing** — you need to be linked (`/link`). The bot's reply tells you what's wrong; the daemon also shows the error in the window.
-- **Logs** — run `meshcast daemon` in a terminal to see them (`RUST_LOG=debug` for more). Bot: `journalctl -u meshcast-bot -f` (or `--user`).
+- **Logs** — Meshcast writes log files even when launched from the tray: `meshcast status` prints their location (`~/.local/state/meshcast/` on Linux, `~/Library/Logs/meshcast/` on macOS, `%LOCALAPPDATA%\meshcast\logs` on Windows). For a live view, run `meshcast daemon` in a terminal (`MESHCAST_LOG=debug` for more). Bot: `journalctl -u meshcast-bot -f` (or `--user`).
 - **Choppy video** — drop to 720p or 30 fps in `/stream`; each viewer costs roughly the stream's bitrate in upload (≈5–10 Mbit/s at 1080p).
 
 ## Building from source
@@ -168,6 +181,25 @@ cargo build --release --workspace
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev loop, lint/test commands and the release process.
+
+## Upgrading
+
+Re-run the same installer — it replaces the binaries atomically and restarts the background service:
+
+```bash
+# Desktop app (Linux/macOS)
+curl -fsSL https://raw.githubusercontent.com/mattcree/meshcast/main/scripts/install.sh | bash
+#   pin/rollback:  … | bash -s -- --version v0.6.0
+#   (refuses while you're live-streaming unless MESHCAST_FORCE=1)
+
+# Windows: re-run the install.ps1 one-liner
+
+# Bot
+curl -fsSL https://raw.githubusercontent.com/mattcree/meshcast/main/scripts/deploy-bot.sh | bash -s -- --update
+#   or:  docker compose pull && docker compose up -d
+```
+
+Pairing needs both sides on ≥ 0.5; steady-state signalling stays compatible across one minor version. `meshcast status` shows your version and the bot's.
 
 ## Documentation
 

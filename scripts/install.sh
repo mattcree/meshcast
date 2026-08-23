@@ -116,6 +116,13 @@ if [ "$OS" = "Darwin" ] && [ -d "$HOME/Library/Application Support/meshcast" ]; 
 else
     CONFIG_DIR="${MESHCAST_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/meshcast}"
 fi
+# Refuse to clobber a live stream unless forced.
+if [ "${MESHCAST_FORCE:-0}" != 1 ] && grep -q '"streaming":true' "$CONFIG_DIR/.tray-state" 2>/dev/null; then
+    die "Meshcast is currently live-streaming. Stop the stream first, or re-run with MESHCAST_FORCE=1."
+fi
+DAEMON_WAS_RUNNING=0
+[ -f "$CONFIG_DIR/.daemon-pid" ] && kill -0 "$(cat "$CONFIG_DIR/.daemon-pid" 2>/dev/null || echo 0)" 2>/dev/null && DAEMON_WAS_RUNNING=1
+OLD_VERSION="$(cat "$INSTALL_DIR/VERSION" 2>/dev/null || echo none)"
 pkill -f "meshcast-tray.py" 2>/dev/null || true
 for pidfile in .app-pid .daemon-pid; do
     if [ -f "$CONFIG_DIR/$pidfile" ]; then
@@ -145,6 +152,30 @@ done
 ln -sf "$INSTALL_DIR/meshcast" "$BIN_DIR/meshcast"
 ln -sf "$INSTALL_DIR/meshcast-app" "$BIN_DIR/meshcast-app"
 
+# Smoke test: if the binary can't even print its version, the machine is missing
+# a runtime dependency (glibc too old, or a shared library). Fail here with a
+# real message instead of silently "installed" and dead on first launch.
+NEW_VERSION="$("$INSTALL_DIR/meshcast" --version 2>/dev/null | awk '{print $2}')"
+if [ -z "$NEW_VERSION" ]; then
+    ERR="$("$INSTALL_DIR/meshcast" --version 2>&1 || true)"
+    if [ "$OS" = "Linux" ]; then
+        die "The Meshcast binary won't run on this system:
+    $ERR
+Linux builds need glibc >= 2.39 (Ubuntu 24.04+, Fedora 40+) and these runtime libraries:
+    Fedora:  sudo dnf install pipewire-libs libva alsa-lib libdrm mesa-libgbm
+    Debian:  sudo apt install libpipewire-0.3-0 libva2 libva-drm2 libasound2 libdrm2 libgbm1
+See the README 'Platform support' section."
+    else
+        die "The Meshcast binary won't run on this system: $ERR"
+    fi
+fi
+printf '%s\n' "$NEW_VERSION" > "$INSTALL_DIR/VERSION"
+if [ "$OLD_VERSION" != none ] && [ "$OLD_VERSION" != "$NEW_VERSION" ]; then
+    info "Upgraded $OLD_VERSION -> $NEW_VERSION"
+else
+    info "Installed $NEW_VERSION"
+fi
+
 if [ "$OS" = "Darwin" ]; then
     xattr -dr com.apple.quarantine "$INSTALL_DIR" 2>/dev/null || true
 fi
@@ -153,9 +184,17 @@ fi
 
 if [ "$OS" = "Linux" ]; then
     mkdir -p "$APPS_DIR"
-    render() { sed "s|@INSTALL_DIR@|$INSTALL_DIR|g" "$1" > "$2"; }
+        render() { sed "s|@INSTALL_DIR@|$INSTALL_DIR|g" "$1" > "$2"; }
+    TRAY_OK=1
+    python3 -c 'import gi; gi.require_version("Gtk","3.0")' 2>/dev/null || TRAY_OK=0
     if [ -f "$SRC_DIR/meshcast.desktop" ]; then
-        render "$SRC_DIR/meshcast.desktop" "$APPS_DIR/meshcast.desktop"
+        if [ "$TRAY_OK" = 1 ]; then
+            render "$SRC_DIR/meshcast.desktop" "$APPS_DIR/meshcast.desktop"
+        else
+            # No GTK tray available: launch the window directly from the app menu.
+            sed "s|@INSTALL_DIR@|$INSTALL_DIR|g; s|/meshcast-tray.py --show|/meshcast-app|" \
+                "$SRC_DIR/meshcast.desktop" > "$APPS_DIR/meshcast.desktop"
+        fi
         render "$SRC_DIR/meshcast-watch.desktop" "$APPS_DIR/meshcast-watch.desktop"
         if [ "$AUTOSTART" = 1 ]; then
             mkdir -p "$AUTOSTART_DIR"
@@ -205,6 +244,13 @@ echo
 info "Meshcast installed."
 echo "  Next: in Discord type /link, then paste the code into the Meshcast window."
 echo
+
+# If a daemon was running before the upgrade, bring one back even with --no-launch
+# (that flag means "don't open the window", not "leave me signalling-dead").
+if [ "$DAEMON_WAS_RUNNING" = 1 ] && [ "$LAUNCH" = 0 ]; then
+    nohup "$INSTALL_DIR/meshcast" daemon >/dev/null 2>&1 &
+    info "Restarted the background service"
+fi
 
 if [ "$LAUNCH" = 1 ]; then
     if [ "$OS" = "Linux" ] && { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; }; then

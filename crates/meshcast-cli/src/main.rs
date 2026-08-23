@@ -117,14 +117,16 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "meshcast=info,iroh_live=info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+    // `watch` is a separate short-lived window; log it apart from the daemon.
+    let component = if matches!(cli.command, Commands::Watch { .. }) {
+        "watch"
+    } else if matches!(cli.command, Commands::Daemon) {
+        "daemon"
+    } else {
+        "cli"
+    };
+    meshcast_signal::telemetry::init(component);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -452,7 +454,15 @@ fn cmd_status() -> Result<()> {
     let config = AppConfig::load_sync()?;
     let daemon_running = process::pid_file_alive(&AppConfig::daemon_pid_path());
     let state = ipc::read_state();
+    println!("Meshcast {}", meshcast_signal::VERSION);
     println!("Config:  {}", AppConfig::config_path().display());
+    println!(
+        "Logs:    {}",
+        meshcast_signal::telemetry::log_path("daemon").display()
+    );
+    if let Some(v) = &state.bot_version {
+        println!("Bot ver: {v}");
+    }
     println!(
         "Daemon:  {}",
         if daemon_running {
@@ -677,6 +687,7 @@ struct Session {
 
 impl Session {
     fn publish_state(&mut self) {
+        self.state.version = meshcast_signal::VERSION.to_string();
         self.state.control_allowed = self
             .active
             .as_ref()
@@ -1010,6 +1021,12 @@ impl Session {
                 }
             }
             Signal::Ping => self.send_to(idx, Signal::Pong).await,
+            Signal::Hello { version, .. } => {
+                if idx == 0 {
+                    self.state.bot_version = Some(version);
+                    self.publish_state();
+                }
+            }
             Signal::ControlRequest { request_id, viewer } => {
                 self.on_control_request(idx, request_id, viewer).await;
             }
@@ -1388,10 +1405,23 @@ async fn run_session(shutdown: impl std::future::Future<Output = ()>) -> Result<
                                         Ok(Event::NeighborUp(id)) => {
                         if let Some(link) = session.links.get_mut(idx) {
                             tracing::info!(link = %link.name, peer = %id.fmt_short(), "Bot connected");
-                            link.connected = true;
+                                                        link.connected = true;
                             link.join_backoff = Duration::from_secs(5);
                             link.flush_outbox().await;
                         }
+                        // Announce ourselves so the bot can adapt to our version.
+                        session
+                            .send_to(
+                                idx,
+                                Signal::Hello {
+                                    version: meshcast_signal::VERSION.to_string(),
+                                    features: meshcast_signal::CAPABILITIES
+                                        .iter()
+                                        .map(|s| s.to_string())
+                                        .collect(),
+                                },
+                            )
+                            .await;
                         session.publish_state();
                     }
                     Ok(Event::NeighborDown(id)) => {

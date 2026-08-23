@@ -22,7 +22,6 @@ moq-media = { workspace = true }
 moq-media-egui = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Remote control: input injection backends.
 [target.'cfg(target_os = "linux")'.dependencies]

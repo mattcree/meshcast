@@ -4090,7 +4090,6 @@ dependencies = [
  "libc",
  "meshcast-signal",
  "tracing",
- "tracing-subscriber",
  "tray-icon",
  "wgpu",
 ]
@@ -4109,7 +4108,6 @@ dependencies = [
  "rand 0.8.5",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -4129,7 +4127,6 @@ dependencies = [
  "moq-media-egui",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -4151,6 +4148,7 @@ dependencies = [
  "tokio",
  "toml 0.8.2",
  "tracing",
+ "tracing-subscriber",
  "windows-sys 0.59.0",
 ]
 

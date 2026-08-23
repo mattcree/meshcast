@@ -1331,12 +1331,11 @@ async fn mark_stream_ended(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "meshcast_bot=info,iroh=warn".into()),
-        )
-        .init();
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("meshcast-bot {}", meshcast_signal::VERSION);
+        return Ok(());
+    }
+    meshcast_signal::telemetry::init("bot");
 
     let token = std::env::var("DISCORD_TOKEN")
         .ok()
@@ -1411,12 +1410,31 @@ async fn main() -> anyhow::Result<()> {
         let streams = streams.clone();
         let pending_starts = pending_starts.clone();
         let links = links.clone();
+        let links_bg = links.clone();
         let http = serenity::Http::new(&token);
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok((user_id, Signal::StreamStopped)) => {
                         mark_stream_ended(&http, &streams, user_id).await;
+                    }
+                    Ok((user_id, Signal::Hello { version, .. })) => {
+                        tracing::info!(user = %user_id, "App version {version}");
+                        // Reply so the app can show our version too.
+                        let sender = lock(&links_bg).get(&user_id).map(|l| l.sender.clone());
+                        if let (Some(s), Ok(bytes)) = (
+                            sender,
+                            Signal::Hello {
+                                version: meshcast_signal::VERSION.to_string(),
+                                features: meshcast_signal::CAPABILITIES
+                                    .iter()
+                                    .map(|x| x.to_string())
+                                    .collect(),
+                            }
+                            .encode(),
+                        ) {
+                            let _ = s.broadcast_neighbors(bytes).await;
+                        }
                     }
                     Ok((user_id, Signal::ControlRevoked)) => {
                         clear_controller(&http, &streams, user_id).await;
@@ -1464,7 +1482,11 @@ async fn main() -> anyhow::Result<()> {
         .setup(move |ctx, ready, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                tracing::info!("Bot is ready as {}", ready.user.name);
+                tracing::info!(
+                    "Bot {} ready as {}",
+                    meshcast_signal::VERSION,
+                    ready.user.name
+                );
                 Ok(Data {
                     signal_node,
                     links,

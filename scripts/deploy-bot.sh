@@ -106,7 +106,12 @@ fi
 if [ "$UPDATE" = 1 ] && [ -z "$TOKEN" ]; then
     [ -f "$ENV_FILE" ] || die "No existing token file at $ENV_FILE; pass the token."
 else
-    [ -n "$TOKEN" ] || die "Usage: $0 <DISCORD_TOKEN>   (or set DISCORD_TOKEN). Get one at https://discord.com/developers/applications — see docs/DISCORD-SETUP.md"
+        if [ -z "$TOKEN" ] && [ -r /dev/tty ]; then
+        printf 'Paste the Discord bot token (input hidden): ' >/dev/tty
+        read -rs TOKEN </dev/tty || true
+        printf '\n' >/dev/tty
+    fi
+    [ -n "$TOKEN" ] || die "No token given. Get one at https://discord.com/developers/applications — see docs/DISCORD-SETUP.md. (Avoid putting it on the command line; run interactively or set DISCORD_TOKEN.)"
     case "$TOKEN" in
         *" "*|*$'\t'*) die "Token contains whitespace — did you paste the whole thing?" ;;
     esac
@@ -224,7 +229,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=$ENV_FILE
-Environment=RUST_LOG=meshcast_bot=info,iroh=warn
+Environment=RUST_LOG=warn,meshcast_bot=info,meshcast_signal=info
 Environment=MESHCAST_BOT_STATE_DIR=$STATE_DIR
 ExecStart=$BIN_DIR/meshcast-bot
 Restart=always
@@ -249,12 +254,26 @@ fi
 "${SYSTEMCTL[@]}" enable meshcast-bot.service >/dev/null
 "${SYSTEMCTL[@]}" restart meshcast-bot.service
 
-sleep 2
-if "${SYSTEMCTL[@]}" is-active --quiet meshcast-bot.service; then
-    echo
-    info "meshcast-bot is running."
+# Wait for the gateway to actually come up (a bad token crash-loops silently).
+READY=0
+for _ in $(seq 1 15); do
+    if "${SYSTEMCTL[@]}" is-active --quiet meshcast-bot.service; then
+        if journalctl_out=$("${SYSTEMCTL[@]}" status meshcast-bot.service 2>/dev/null) && \
+           echo "$journalctl_out" | grep -q "ready as"; then
+            READY=1; break
+        fi
+    else
+        break
+    fi
+    sleep 1
+done
+echo
+if [ "$READY" = 1 ]; then
+    info "meshcast-bot is running and connected to Discord."
+elif "${SYSTEMCTL[@]}" is-active --quiet meshcast-bot.service; then
+    warn "meshcast-bot started but hasn't reported 'ready' yet — check the logs (below). A wrong token will crash-loop."
 else
-    warn "meshcast-bot is not running. Check the logs:"
+    warn "meshcast-bot is not running (a wrong token is the usual cause). Check the logs:"
 fi
 
 if [ "$SCOPE" = system ]; then
