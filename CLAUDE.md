@@ -18,7 +18,7 @@ crates/meshcast-app/      `meshcast-app`: egui window; tray module for macOS/Win
 scripts/                  install.sh / install.ps1 / uninstall.sh (desktop), deploy-bot.sh (server), meshcast-tray.py
 packaging/                linux/*.desktop templates, bot/{Dockerfile,docker-compose.yml}
 .github/workflows/        ci.yml (fmt/clippy/test + mac/win check), release.yml (archives, bot, image, checksums)
-docs/                     DESIGN.md, DISCORD-SETUP.md, REMOTE-CONTROL.md
+docs/                     DESIGN.md, DISCORD-SETUP.md, REMOTE-CONTROL.md, HARDENING-PLAN.md (review findings + execution plan)
 ```
 
 ## Commands

@@ -2,6 +2,8 @@
 
 Single source of truth for "what's next". Keep it short and current: when you pick something up, say so in the PR; when it ships, move it to `CHANGELOG.md`. Issues on GitHub are welcome too — link them here.
 
+> **2026-08-23:** a six-lens production-hardening review produced [docs/HARDENING-PLAN.md](docs/HARDENING-PLAN.md); that plan supersedes the priorities below until it is complete.
+
 Legend: **P1** needed for a smooth v1 experience · **P2** valuable · **P3** nice to have / research.
 
 ## Release readiness (v0.5.x)
